@@ -1,0 +1,2720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>FLE: Fast Local Experts</title>
+<meta name="description" content="An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU">
+<meta name="author" content="Max Bitzer (sirfyyn)">
+<style>
+/* FLE paper. Colours follow the films "Making Rhea Fast": night blue, moon ivory, FLE amber. System fonts only,
+   so the page makes no request to a third party until a film is played. */
+:root {
+  --bg: #FBF8F2; --surface: #F2EDE2; --rule: #DCD3C2; --ink: #161B27; --ink-2: #464D5E; --muted: #6B7182;
+  --accent: #8A5700; --accent-strong: #C48508; --code-bg: #EEE7D8; --quote-bg: #F5EFE3; --screen: #0D1320;
+  --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Noto Serif", Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--serif); }
+h1, h2, h3, h4 { font-family: var(--sans); color: var(--ink); line-height: 1.2; text-wrap: balance; }
+.num { font-family: var(--mono); font-weight: 500; font-size: .8em; color: var(--accent); margin-right: .3em; }
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; overflow-wrap: anywhere; }
+a.ref { text-decoration: none; border-bottom: 1px dotted currentColor; }
+code { font-family: var(--mono); font-size: .85em; background: var(--code-bg); padding: .06em .3em; border-radius: 4px;
+  overflow-wrap: anywhere; }
+blockquote { margin: 1.4em 0; padding: .7em 1.1em; border-left: 3px solid var(--accent-strong); background: var(--quote-bg);
+  color: var(--ink-2); border-radius: 0 6px 6px 0; }
+blockquote p { margin: .35em 0; }
+table { border-collapse: collapse; width: 100%; font-family: var(--sans); font-variant-numeric: tabular-nums; }
+th, td { text-align: left; vertical-align: top; border-bottom: 1px solid var(--rule); }
+th { background: var(--surface); font-weight: 600; }
+tbody tr:last-child td { border-bottom: 0; }
+td code, th code { font-size: .92em; }
+.masthead .eyebrow { display: flex; align-items: center; gap: 10px; margin: 0; font: 500 .7rem/1 var(--mono);
+  letter-spacing: .14em; text-transform: uppercase; color: var(--muted); }
+.badge { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 6px; background: var(--ink);
+  color: var(--bg); font: 700 .8rem/1 var(--mono); letter-spacing: 0; text-transform: none; }
+.masthead h1 { margin: .45em 0 .1em; letter-spacing: -.02em; line-height: 1.04; }
+.masthead .subtitle { margin: 0 0 1em; font-family: var(--sans); color: var(--ink-2); text-wrap: balance; }
+.front > p:first-child { font: 600 1rem/1.4 var(--sans); margin: 0 0 .4em; }
+.front > p:nth-child(2) { color: var(--ink-2); }
+footer { color: var(--muted); font-family: var(--sans); border-top: 1px solid var(--rule); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #0D1320; --surface: #131B2B; --rule: #26324A; --ink: #EDE7D9; --ink-2: #AEB4C2;
+    --muted: #7A8396; --accent: #E9A531; --accent-strong: #C48508; --code-bg: #18223A; --quote-bg: #111A2B;
+    color-scheme: dark; }
+}
+:root[data-theme="dark"] { --bg: #0D1320; --surface: #131B2B; --rule: #26324A; --ink: #EDE7D9; --ink-2: #AEB4C2;
+  --muted: #7A8396; --accent: #E9A531; --accent-strong: #C48508; --code-bg: #18223A; --quote-bg: #111A2B;
+  color-scheme: dark; }
+body { font-size: 1.0625rem; line-height: 1.62; }
+.skip { position: absolute; left: -999px; top: 8px; z-index: 10; padding: .5em .8em; background: var(--ink); color: var(--bg);
+  border-radius: 6px; font-family: var(--sans); }
+.skip:focus { left: 12px; }
+.page { display: grid; grid-template-columns: minmax(0, 1fr); max-width: 1160px; margin: 0 auto; padding-inline: 20px; }
+main { min-width: 0; max-width: 760px; width: 100%; margin: 0 auto; padding-block: 36px 72px; }
+.masthead { padding-bottom: 22px; border-bottom: 1px solid var(--rule); }
+.masthead h1 { font-size: clamp(2.1rem, 6vw, 3.3rem); }
+.masthead .subtitle { font-size: clamp(1.1rem, 2.6vw, 1.38rem); line-height: 1.35; }
+.front > p:nth-child(2) { font-size: .92rem; }
+.front blockquote { font-size: .9rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 1.3em 0 .4em; }
+.actions a { display: inline-flex; align-items: center; min-height: 36px; padding: 0 .95em; border: 1px solid var(--rule);
+  border-radius: 999px; background: var(--surface); color: var(--ink); font: 500 .85rem/1 var(--sans); text-decoration: none; }
+.actions a:hover { border-color: var(--accent-strong); }
+.actions a.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+h2 { font-size: 1.5rem; letter-spacing: -.01em; margin: 2.4em 0 .7em; padding-top: 1em; border-top: 1px solid var(--rule); }
+article > h2:first-child { border-top: 0; margin-top: 1.2em; padding-top: 0; }
+h3 { font-size: 1.16rem; margin: 2em 0 .5em; }
+h2, h3 { scroll-margin-top: 16px; }
+p, li { text-wrap: pretty; }
+li + li { margin-top: .35em; }
+.table-wrap { overflow-x: auto; margin: 1.4em 0; border: 1px solid var(--rule); border-radius: 8px; max-width: 100%; }
+.table-wrap:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; }
+table { font-size: .8rem; line-height: 1.45; }
+th, td { padding: .5em .75em; }
+figure.film { margin: 1.5em 0 2em; }
+.screen { aspect-ratio: 16 / 9; max-width: 100%; border-radius: 8px; overflow: hidden; background: var(--screen);
+  box-shadow: 0 0 0 1px var(--rule); }
+.screen video { display: block; width: 100%; height: 100%; background: var(--screen); }
+figure.film figcaption { display: grid; gap: .3em; margin-top: .65em; font: .86rem/1.45 var(--sans); color: var(--ink-2); }
+.film-head { font: 600 .7rem/1.3 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--accent); }
+.film-links { display: flex; flex-wrap: wrap; gap: .2em 1em; }
+.toc-side { display: none; }
+.toc-side ol, .toc-top ol { list-style: none; margin: 0; padding: 0; }
+.toc-side a, .toc-top a { display: flex; gap: .55em; padding: .3em .55em; color: var(--ink-2); text-decoration: none;
+  border-left: 2px solid transparent; font: .82rem/1.35 var(--sans); }
+.toc-side a:hover, .toc-top a:hover { color: var(--ink); }
+.toc-side a.active { color: var(--ink); border-left-color: var(--accent-strong); background: var(--surface); }
+li.l3 a { padding-left: 1.5em; font-size: .78rem; }
+.toc-num { font-family: var(--mono); color: var(--muted); min-width: 2.1em; flex: none; }
+.toc-label { margin: 0 0 .8em .55em; font: 600 .68rem/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+  color: var(--muted); }
+.toc-top { margin-top: 1em; border: 1px solid var(--rule); border-radius: 8px; padding: .55em .8em; background: var(--surface); }
+.toc-top summary { cursor: pointer; font: 600 .85rem/1.6 var(--sans); }
+.toc-top ol { margin-top: .4em; }
+footer { margin-top: 4em; padding-top: 1.1em; font-size: .8rem; line-height: 1.5; }
+@media (min-width: 1100px) {
+  .page { grid-template-columns: 236px minmax(0, 760px); gap: 52px; justify-content: center; }
+  .toc-side { display: block; position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto;
+    padding-block: 40px; }
+  .toc-top { display: none; }
+  main { margin: 0; }
+}
+@media (max-width: 520px) {
+  body { font-size: 1rem; }
+  h2 { font-size: 1.3rem; }
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#text">Skip to the text</a>
+<div class="page">
+<nav class="toc-side" aria-label="Contents"><p class="toc-label">Contents</p>
+<ol>
+<li class="l2"><a href="#abstract"><span class="toc-num"></span><span>Abstract</span></a></li>
+<li class="l2"><a href="#s1"><span class="toc-num">1</span><span>Introduction</span></a></li>
+<li class="l2"><a href="#s2"><span class="toc-num">2</span><span>Setup and method</span></a></li>
+<li class="l3"><a href="#s2-1"><span class="toc-num">2.1</span><span>Hardware</span></a></li>
+<li class="l3"><a href="#s2-2"><span class="toc-num">2.2</span><span>Model</span></a></li>
+<li class="l3"><a href="#s2-3"><span class="toc-num">2.3</span><span>Measuring quality</span></a></li>
+<li class="l3"><a href="#s2-4"><span class="toc-num">2.4</span><span>Measuring speed: paired brackets</span></a></li>
+<li class="l2"><a href="#s3"><span class="toc-num">3</span><span>Quantization: the FLE-IQ3_M hybrid</span></a></li>
+<li class="l2"><a href="#s4"><span class="toc-num">4</span><span>Engine</span></a></li>
+<li class="l3"><a href="#s4-1"><span class="toc-num">4.1</span><span>Expert cache on the GPU</span></a></li>
+<li class="l3"><a href="#s4-2"><span class="toc-num">4.2</span><span>Overlap and fusion</span></a></li>
+<li class="l3"><a href="#s4-3"><span class="toc-num">4.3</span><span>Speculative decoding with the MTP head, and a re-training that did not generalize</span></a></li>
+<li class="l3"><a href="#s4-4"><span class="toc-num">4.4</span><span>Where the time goes</span></a></li>
+<li class="l3"><a href="#s4-5"><span class="toc-num">4.5</span><span>Prefill and prompt cache</span></a></li>
+<li class="l3"><a href="#s4-6"><span class="toc-num">4.6</span><span>Final configuration: threads, pinned experts, slot release, byte budget, ubatch lending</span></a></li>
+<li class="l2"><a href="#s5"><span class="toc-num">5</span><span>Results</span></a></li>
+<li class="l3"><a href="#s5-1"><span class="toc-num">5.1</span><span>Against upstream llama.cpp</span></a></li>
+<li class="l3"><a href="#s5-2"><span class="toc-num">5.2</span><span>Against the previous production</span></a></li>
+<li class="l3"><a href="#s5-3"><span class="toc-num">5.3</span><span>Against Strata</span></a></li>
+<li class="l3"><a href="#s5-4"><span class="toc-num">5.4</span><span>Standard benchmarks</span></a></li>
+<li class="l2"><a href="#s6"><span class="toc-num">6</span><span>Negative results</span></a></li>
+<li class="l2"><a href="#s7"><span class="toc-num">7</span><span>Comparison with public quantizations and engines</span></a></li>
+<li class="l2"><a href="#s8"><span class="toc-num">8</span><span>Related work</span></a></li>
+<li class="l2"><a href="#s9"><span class="toc-num">9</span><span>Limitations and reproducibility</span></a></li>
+<li class="l2"><a href="#appendix-a"><span class="toc-num">A</span><span>Evidence table</span></a></li>
+<li class="l2"><a href="#appendix-b"><span class="toc-num">B</span><span>Supplementary films</span></a></li>
+<li class="l2"><a href="#appendix-c"><span class="toc-num">C</span><span>All paired brackets</span></a></li>
+</ol>
+</nav>
+<main id="text">
+<header class="masthead">
+<p class="eyebrow"><span class="badge" aria-hidden="true">sf</span>Technical report · FLE · Qwen3.8-Flash-Next</p>
+<h1>FLE: Fast Local Experts</h1>
+<p class="subtitle">An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU</p>
+<div class="front">
+<p>Max Bitzer (sirfyyn)</p>
+<p><em>AI assistance: engine patches, measurement scripts and this text were written together with Claude (Anthropic,
+Claude Code). arXiv does not accept an AI system as an author; the author takes responsibility for every claim and number.</em></p>
+<blockquote>
+<p>Version 1.0, 2026-10-09 (final configuration <code>p49-ring</code>; final measurement series of 2026-10-06: B1e against
+upstream, B3e1–B3e5 all quantizations, S against Strata; expert pruning and MKQA knowledge probe of 2026-10-08;
+FLE-IQ3_M-REAP448 speed, bracket B3e6, of 2026-10-09). Rules for this text: every number is a measurement on our
+own setup, paired inside one measurement bracket where speed is concerned, with raw data, script and build named in
+the evidence table (<a class="ref" href="#appendix-a">Appendix A</a>); every paired bracket is listed in <a class="ref" href="#appendix-c">Appendix C</a>. Estimates and readings that were not
+measured are marked as such.</p>
+</blockquote>
+</div>
+<nav class="actions" aria-label="Downloads and links"><a class="primary" href="fle-paper.pdf">PDF</a><a href="#film-complete">Films (6:59)</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF">Model files</a><a href="https://github.com/sirfyyn/FastLocalExperts">Engine source</a></nav>
+<details class="toc-top"><summary>Contents</summary>
+<ol>
+<li class="l2"><a href="#abstract"><span class="toc-num"></span><span>Abstract</span></a></li>
+<li class="l2"><a href="#s1"><span class="toc-num">1</span><span>Introduction</span></a></li>
+<li class="l2"><a href="#s2"><span class="toc-num">2</span><span>Setup and method</span></a></li>
+<li class="l3"><a href="#s2-1"><span class="toc-num">2.1</span><span>Hardware</span></a></li>
+<li class="l3"><a href="#s2-2"><span class="toc-num">2.2</span><span>Model</span></a></li>
+<li class="l3"><a href="#s2-3"><span class="toc-num">2.3</span><span>Measuring quality</span></a></li>
+<li class="l3"><a href="#s2-4"><span class="toc-num">2.4</span><span>Measuring speed: paired brackets</span></a></li>
+<li class="l2"><a href="#s3"><span class="toc-num">3</span><span>Quantization: the FLE-IQ3_M hybrid</span></a></li>
+<li class="l2"><a href="#s4"><span class="toc-num">4</span><span>Engine</span></a></li>
+<li class="l3"><a href="#s4-1"><span class="toc-num">4.1</span><span>Expert cache on the GPU</span></a></li>
+<li class="l3"><a href="#s4-2"><span class="toc-num">4.2</span><span>Overlap and fusion</span></a></li>
+<li class="l3"><a href="#s4-3"><span class="toc-num">4.3</span><span>Speculative decoding with the MTP head, and a re-training that did not generalize</span></a></li>
+<li class="l3"><a href="#s4-4"><span class="toc-num">4.4</span><span>Where the time goes</span></a></li>
+<li class="l3"><a href="#s4-5"><span class="toc-num">4.5</span><span>Prefill and prompt cache</span></a></li>
+<li class="l3"><a href="#s4-6"><span class="toc-num">4.6</span><span>Final configuration: threads, pinned experts, slot release, byte budget, ubatch lending</span></a></li>
+<li class="l2"><a href="#s5"><span class="toc-num">5</span><span>Results</span></a></li>
+<li class="l3"><a href="#s5-1"><span class="toc-num">5.1</span><span>Against upstream llama.cpp</span></a></li>
+<li class="l3"><a href="#s5-2"><span class="toc-num">5.2</span><span>Against the previous production</span></a></li>
+<li class="l3"><a href="#s5-3"><span class="toc-num">5.3</span><span>Against Strata</span></a></li>
+<li class="l3"><a href="#s5-4"><span class="toc-num">5.4</span><span>Standard benchmarks</span></a></li>
+<li class="l2"><a href="#s6"><span class="toc-num">6</span><span>Negative results</span></a></li>
+<li class="l2"><a href="#s7"><span class="toc-num">7</span><span>Comparison with public quantizations and engines</span></a></li>
+<li class="l2"><a href="#s8"><span class="toc-num">8</span><span>Related work</span></a></li>
+<li class="l2"><a href="#s9"><span class="toc-num">9</span><span>Limitations and reproducibility</span></a></li>
+<li class="l2"><a href="#appendix-a"><span class="toc-num">A</span><span>Evidence table</span></a></li>
+<li class="l2"><a href="#appendix-b"><span class="toc-num">B</span><span>Supplementary films</span></a></li>
+<li class="l2"><a href="#appendix-c"><span class="toc-num">C</span><span>All paired brackets</span></a></li>
+</ol>
+</details>
+</header>
+<article>
+<h2 id="abstract">Abstract</h2>
+<p>We run Qwen3.8-Flash-Next, a 512-expert Mixture-of-Experts (MoE) language model, on a single workstation with
+one 32 GB GPU, 120 GB of system RAM and 16 CPU cores. Two pieces make this practical. First, <strong>FLE-IQ3_M</strong> (internally G3), a hybrid
+quantization that combines the Unsloth UD-IQ4_XS release with expert layers from ISTA-DASLab's GSQ-RCO
+release: 88.87 GB instead of 93.68 GB, with a KL divergence against BF16 that stays within the measurement
+noise on three texts, one of them held out. Second, <strong>FLE</strong>, a fork of llama.cpp that borrows ideas and some code from ik_llama.cpp, FreeToken,
+KTransformers and Strata (<a class="ref" href="#s8">Section 8</a>): a GPU expert cache with
+frequency-gated admission and oldest-first eviction, overlap of GPU cache hits with CPU work on cache misses,
+fused CUDA kernels, and speculative decoding with the model's own multi-token-prediction (MTP) head, its experts
+requantized to IQ4_NL. Against current upstream llama.cpp (commit <code>a8c9a4e7c</code>, newer than FLE's base), with the same FLE-IQ3_M file, the
+same card and the same 16 threads (no expert cache, no MTP), the final FLE configuration decodes <strong>2.49 times as
+fast</strong> as upstream with micro-batch 1024 (−59.9 % [95 % CI −61.2 .. −58.5] for upstream in a paired bracket, B1e)
+and 2.78 times as fast as upstream with micro-batch 4096 (−64.0 % [−65.2 .. −62.9]); FLE runs at about 100 tokens/s
+on these prompts. Prefill is where FLE still loses: upstream with micro-batch 4096 processes 4k and 8.6k prompts 24 %
+and 12 % faster, and Strata, the closest public engine, 2.3 to 2.7 times as fast, while FLE decodes 23 % faster
+than Strata. Against our own previous production setup (stock build with Unsloth UD-IQ4_XS, ~56 tokens/s) FLE was
++58.5 % faster [+55.8 .. +61.6] already before the last steps (bracket END2).
+On three benchmarks from Qwen's model card, one run each, FLE-IQ3_M on FLE is level with the card on IFBench
+(80.3 strict / 83.0 loose against 81.3) and GPQA Diamond (88.9 against 91.7, inside the 95 % interval) and
+below it on LiveCodeBench v6 (85.5 against 91.9, outside the interval; 10 of the 19 failures are answers cut
+off at the 81,920-token limit).
+Besides FLE-IQ3_M we release two smaller hybrids and FLE-IQ3_M-REAP448, with 64 of 512 experts per layer pruned by
+REAP; a 400-question MKQA knowledge probe shows that KLD on a few texts understates what pruning removes (at 384
+experts per layer the KLD rose moderately, while correct answers fell by 5.8 / 11.8 points in German / English).
+We report the negative results as well: expert prefetching by pre-gating, n-gram drafting, low-rank kernels
+and fully self-made quantizations all lost in our measurements, and so did copying part of the cache misses over
+PCIe as Strata does (−4.5 %) and a rebase of the fork onto current upstream (−5.7 %). A re-trained MTP head
+(recursive self-distillation) gained +4.54 % only on the tasks its training corpus contained; on 16 unseen tasks the
+untrained head was +2.95 % [+1.96 .. +3.93] faster than it, so the release ships the untrained head. The speed
+numbers above were measured with the re-trained head c2 (<a class="ref" href="#s4-3">Section 4.3</a>).</p>
+<h2 id="s1"><span class="num">1</span> Introduction</h2>
+<p>Large MoE models activate only a few experts per token, so most of their weights are idle at any moment. On a
+workstation this invites a split: keep what every token needs on the GPU and leave the rarely used experts in
+system RAM. The split is easy to state and hard to make fast. A token that needs an expert which is not on the
+GPU waits for the CPU (or for a PCIe transfer), and with ten active experts out of 512 per layer, such misses
+happen in almost every layer of almost every token.</p>
+<p>This report describes how we made that split fast for one concrete model on one concrete machine, and how we
+checked every step. It is not a general system. It is a measured account of what worked, what did not, and by
+how much, written so that someone with similar hardware can reproduce it.</p>
+<p>Contributions:</p>
+<ol>
+<li><strong>FLE-IQ3_M</strong>, a hybrid quantization of Qwen3.8-Flash-Next that is 4.81 GB smaller than Unsloth UD-IQ4_XS at the
+same measured quality (<a class="ref" href="#s3">Section 3</a>).</li>
+<li><strong>An expert cache inside llama.cpp</strong> with admission and eviction policies, and overlap of GPU hits with CPU
+misses (<a class="ref" href="#s4-1">Sections 4.1</a>–4.2).</li>
+<li><strong>The model's MTP head in llama.cpp</strong>, its experts requantized to IQ4_NL, with a reduced draft vocabulary, and a
+negative result: re-training the head by recursive self-distillation on the model's own outputs did not
+generalize to unseen tasks (<a class="ref" href="#s4-3">Section 4.3</a>).</li>
+<li><strong>A measurement method</strong> for speed on a noisy single machine: paired brackets (reference before, candidates,
+reference after) with drift limits and bootstrap intervals (<a class="ref" href="#s2-3">Section 2.3</a>).</li>
+<li><strong>Negative results</strong> with the same rigor, including a pre-gating prefetcher that a simulation predicted to be
+the largest lever and that measured −10 % to −27 % (<a class="ref" href="#s6">Section 6</a>).</li>
+</ol>
+<h2 id="s2"><span class="num">2</span> Setup and method</h2>
+<h3 id="s2-1"><span class="num">2.1</span> Hardware</h3>
+<figure class="film" id="film-8">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-8.jpg" aria-label="Film 8: Why we do this"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.mp4">making-rhea-fast-8.mp4</a></video></div>
+<figcaption><span class="film-head">Film 8/8 · Why we do this · 0:58</span><span class="film-text">Retells <a class="ref" href="#s2-1">Section 2.1</a>, the release.</span><span class="film-links"><a href="https://youtu.be/2ZznZt1iCUw">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.mp4">MP4, 4.3 MB</a></span></figcaption>
+</figure>
+<p>One workstation (&quot;Titan&quot;): AMD Ryzen 9 9950X3D (16 cores, 32 threads), 120 GB DDR5 RAM, NVIDIA RTX PRO 4500
+Blackwell (32 GB) as the only GPU used for inference; a second GPU (RTX PRO 2000, 16 GB) took the early KLD
+measurements. Linux kernel 7.0, NVIDIA driver 610.43. The CPU experts run on cores 0–15 (one thread per physical
+core). In the final configuration the expert weights live in a pinned host buffer (<code>--load-mode none</code>) instead
+of a memory-mapped file in the page cache (<a class="ref" href="#s4-6">Section 4.6</a>).</p>
+<h3 id="s2-2"><span class="num">2.2</span> Model</h3>
+<p>Qwen3.8-Flash-Next [Qwen Team, arXiv:2608.30320] is a sparse MoE model with 125 B parameters, 6 B of them active per
+token, plus 51 B parameters of n-gram embedding tables that Qwen keeps off the accelerator. Its 48 layers repeat three
+Gated DeltaNet (GDN) layers followed by one Qwen Sparse Attention (QSA) layer, and every layer has a MoE block with 512
+routed experts, 10 active per token, and one shared expert. The residual stream is widened to four branches and read
+and written through Qwen's Gated Residual, a member of the hyper-connection family [Zhu et al., arXiv:2409.19606]; the
+configuration and our kernels call it hyper-connections (<code>hc_count</code> 4). A one-layer MTP module ships with the weights.
+The n-gram embedding (Qwen's term; <code>ple_*</code> keys in the Hugging Face configuration and tensor <code>per_layer_token_embd</code> in
+the GGUF, hence &quot;PLE table&quot; below) is a single hashed bigram/trigram lookup at the second decoder layer, stored as 16
+sub-tables of about 20 M rows with 160 values each, 51.2 B weights in total.</p>
+<h3 id="s2-3"><span class="num">2.3</span> Measuring quality</h3>
+<p>Quality is the mean KL divergence (KLD) of the quantized model's next-token distribution against BF16, plus top-1
+agreement, following the argument that equal accuracy can hide many flipped answers, so that a distance metric such as
+KL divergence should be reported as well [Dutta et al., arXiv:2407.09141].</p>
+<p><strong>Development texts (F, E, V).</strong> FLE-IQ3_M was selected on three internal texts: F (used for selecting layers), E (check),
+V (held out until the end). Acceptance criterion, fixed in advance: mean KLD on F and E at most two combined
+standard errors above the reference (≈ +0.0078), top-1 at most 0.5 percentage points worse; V must confirm. F and
+V contain internal material and are not published; they remain an internal cross-check.</p>
+<p><strong>Public texts (E, W, K) for the comparison.</strong> All numbers in <a class="ref" href="#s7">Section 7</a> use three texts anyone can rebuild with
+<code>scripts/fle/bench/b6_texte.py</code> (sources and SHA-256 in <code>quellen.json</code>): E, the Python language reference (pydoc
+topics, PSF license, 63 KB); W, four German Wikipedia articles at fixed revisions (quantization in signal
+processing, floating-point number, main memory, graphics processor; CC BY-SA 4.0, 81 KB); K, seven files of the
+German Kubernetes documentation (<code>content/de/docs/concepts</code> at commit <code>4472af456106</code>; CC BY 4.0, 47 KB).</p>
+<p><strong>Neutral meter.</strong> KLD for the comparison is computed with upstream <code>llama-perplexity</code> at commit <code>a8c9a4e7c</code>
+without any FLE patch, so that no quantization is measured with our own kernels: <code>-c 2048 -b 2048 -ub 2048 -t 16 -ngl 99 -cmoe -fit off</code> with <code>LLAMA_ATTN_ROT_DISABLE=1</code>, GPU0, cores 0–15, inference server stopped. The BF16 reference
+(354 GB GGUF, converted from the release) is computed with the same build and settings; one pass over 2048 tokens takes
+95 s. As a check of the meter, FLE-IQ3_M on the internal texts gives F 0.1505 / E 0.0516 / V 0.0929 with the neutral
+build against 0.1475 / 0.0511 / 0.0905 with our own build. This check ran earlier, on GPU1 with 8 threads, and reused
+the BF16 reference logits computed with our own build, so it tests the quantized side only.</p>
+<p>Noise floor. The same file, text and build reproduce bit-exactly, but this model amplifies any change in
+computation order because expert selection flips: two runs of FLE-IQ3_M on GPU0 and GPU1 (16 and 8 threads, builds
+a few days apart) give 0.0905 and 0.0975 on text V; switching all CUDA fusions off (<code>GGML_CUDA_DISABLE_FUSION=1</code>)
+changes V by −0.0025; and the logits at micro-batch 2048 measured against those at micro-batch 4096 (context 4096)
+differ by a KLD of 0.062 (top-1 agreement 92.7 %). We therefore compare KLD only on the same card, build and
+settings, and treat differences below ~0.01 on a single text as no finding.</p>
+<p><strong>Knowledge probe (MKQA).</strong> KLD on three short texts can miss knowledge that a change removes, which matters for
+expert pruning. The pruned files are therefore also asked 400 factual questions from MKQA [Longpre et al.,
+arXiv:2007.15207] (open-domain export <code>nthakur/mkqa-open-domain</code>, answerable questions only), the same questions in
+German and in English. The system prompt asks for the answer only, or exactly &quot;I don't know&quot;; sampling as on Qwen's
+card (temperature 1.0, top-p 0.95, top-k 20, min-p 0), thinking off, up to 256 tokens, one seed per question shared by
+all files (paired). An answer is correct when one of MKQA's German or English answer aliases appears in it after
+lower-casing and removing accents and punctuation; abstentions count as not correct. Differences are paired
+bootstrap intervals (2,000 draws). Server: the production FLE build (patch 51), experts on the CPU, no MTP.</p>
+<h3 id="s2-4"><span class="num">2.4</span> Measuring speed: paired brackets</h3>
+<figure class="film" id="film-2">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-2.jpg" aria-label="Film 2: The bracket"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-2.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-2.mp4">making-rhea-fast-2.mp4</a></video></div>
+<figcaption><span class="film-head">Film 2/8 · The bracket · 0:34</span><span class="film-text">Retells <a class="ref" href="#s2-4">Section 2.4</a>, the 47 brackets of 2026-10-03 to 08 and the two void ones (NM2, B3m1).</span><span class="film-links"><a href="https://youtu.be/Bf6UE6DU2b4">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-2.mp4">MP4, 3.0 MB</a></span></figcaption>
+</figure>
+<p>Decode speed on this machine drifts by several percent over a day. Every speed claim in this report comes from a
+<strong>bracket</strong>: reference run, candidate runs, reference run again, all on the same prompts and server settings;
+the bracket is valid only if the two reference runs differ by at most 5 %. Candidates are compared with the
+reference per request (paired) and summarized with a bootstrap 95 % interval (<code>m2_gepaart.py</code>). Numbers from
+different brackets are never compared directly. The standard prompt set has 24 requests (code 9, math 6,
+physics 3, prose 6). Where a result comes from alternating arms (B A B A) without this pairing, it is marked as
+such.</p>
+<h2 id="s3"><span class="num">3</span> Quantization: the FLE-IQ3_M hybrid</h2>
+<p>Start from Unsloth UD-IQ4_XS (93.68 GB file, 64.87 GB resident without the PLE table). Replace the expert tensors of
+34 of the 48 MoE layers with the corresponding tensors from ISTA-DASLab's GSQ-RCO GGUFs (IQ3_S / IQ3_XXS) [GSQ
+arXiv:2604.18556, RCO arXiv:2605.00649]. Result: 88.87 GB file, 60.06 GB resident. KLD against BF16, relative to
+UD-IQ4_XS, as used for the acceptance decision: F −0.0079, E +0.0031, V +0.0005, top-1 +0.11 / +0.08 / +0.81 pp, so
+FLE-IQ3_M passes. These values were measured in decode mode, the way the files run in production (our build, GPU0,
+micro-batch 4; FLE-IQ3_M with 173 cache slots, the cache bias and the cache policy of <a class="ref" href="#s4-1">Section 4.1</a>, UD-IQ4_XS with
+160 slots and no bias). The files alone pass as well: −0.0077 / +0.0029 / −0.0026 with our build at micro-batch 2048,
+and −0.0035 / +0.0038 / +0.0011 with the neutral meter (<a class="ref" href="#s2-3">Section 2.3</a>).</p>
+<p>What did not pass: our own full quantizations (KLD on F 0.259–0.269 against 0.155 for Unsloth), Q5_0 dense weights
+(F +0.024 against Unsloth, z = +5.8, top-1 −1.63 pp), fewer active experts (k = 8: +0.054 and +0.084 on F, depending
+on how the router weights are renormalized), a cache bias of 0.002 together with the cache policy (top-1 on F
+−0.54 pp), and the larger hybrids G4 (35 donor layers, 0.8 GB smaller than FLE-IQ3_M; top-1 on F −0.51 pp, just
+over the limit) and G6 (40 donor layers, 2.2 GB smaller; KLD on F and E more than two standard errors above the
+reference, top-1 on F −0.93 pp).</p>
+<p>Positioning: FLE-IQ3_M is smaller than UD-IQ4_XS, not smaller than pure ISTA quants; the claim is &quot;IQ4_XS quality at
+less size&quot;, and ISTA is the donor of most expert layers.</p>
+<p><strong>Layer selection.</strong> For every candidate donor and every MoE layer we predict the damage of swapping that layer's
+expert tensors as the relative output error err = |y_Q − y_BF16|² / |y_BF16|², measured on captured layer inputs
+(<code>quant_sensitivity.py</code>, 4096 tokens). The file is assembled from whole expert layers (gate, up and down
+together) with <code>gguf_splice.py</code>; everything else comes from the base file.</p>
+<p><strong>Smaller stages (FLE-IQ3_XXS, FLE-IQ2_M).</strong> To give a curve of size against KLD against speed instead of a single point,
+we build more hybrids with the same tools (two of three planned classes are buildable, see below). The selection is a knapsack: for a fixed target size it picks
+per layer the donor with the smallest predicted error (dynamic programming over 16 MB steps,
+<code>tools/fle-hybrid/fle_select.py</code> in the engine repository, with <code>gguf_splice.py</code> and <code>gguf_provenance.py</code>). FLE-IQ3_M
+itself was chosen the other way round, as the largest saving under an error bound. Recomputing it with the knapsack at
+its size of 88.87 GB keeps 44 of the 48 layers on the same source: one base layer moves to ISTA IQ3_S and three ISTA
+IQ3_S layers move to ISTA IQ3_XXS, which gives 35 instead of 34 donor layers and 88.51 GB.</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Target / built size</th>
+<th>Base (layers kept)</th>
+<th>Donor layers chosen</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FLE-IQ2_M</td>
+<td>72 / 71.62 GB</td>
+<td>ISTA IQ2_XS (24)</td>
+<td>ISTA IQ3_XXS (18), Unsloth UD-Q2_K_XL (6)</td>
+</tr>
+<tr>
+<td>FLE-IQ3_XXS</td>
+<td>80 / 79.48 GB</td>
+<td>ISTA IQ3_XXS (18)</td>
+<td>ISTA IQ3_S (20), Unsloth UD-IQ3_XXS (10); UD-IQ4_XS offered, not chosen</td>
+</tr>
+<tr>
+<td>FLE-IQ3_M (Q4 class)</td>
+<td>— / 88.87 GB</td>
+<td>Unsloth UD-IQ4_XS (14)</td>
+<td>ISTA IQ3_S (28), ISTA IQ3_XXS (6)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The per-layer lists are in the model card and in <code>FLE-Q2.auswahl.json</code> / <code>FLE-Q3.auswahl.json</code> (the selection files keep
+the build names Q2 and Q3 of FLE-IQ2_M and FLE-IQ3_XXS).</p>
+<p><strong>Names and bit allocation.</strong> The files are named after the expert bit width, as Unsloth names its &quot;UD&quot; mixtures;
+<code>FLE-</code> marks the mixture and is not a standard llama.cpp file type (<code>ftype</code>). During development the three files were
+called G3 (the third hybrid candidate), Q3 and Q2, which sounded like the K-quant types Q3_K and Q2_K; the Q4 class of
+the table above is FLE-IQ3_M. The file average is higher than the expert width because the PLE table
+(<code>per_layer_token_embd</code>, 28.8 GB in FLE-IQ3_M, 29 % of the parameters, about 4.5 bits per weight in every file) is
+stored at fixed precision. Bits per weight, measured from the GGUF headers on 2026-10-09 (176.94 B parameters including
+the 51.2 B PLE table, 125.7 B without; Qwen reports 125 B + 51 B):</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>File</th>
+<th>Total bpw</th>
+<th>Experts</th>
+<th>PLE table</th>
+<th>Attention / shared expert / norms</th>
+<th>Embeddings / output</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FLE-IQ3_M</td>
+<td>4.02</td>
+<td>3.62</td>
+<td>4.50</td>
+<td>9.05</td>
+<td>7.54</td>
+</tr>
+<tr>
+<td>FLE-IQ3_XXS</td>
+<td>3.59</td>
+<td>3.08</td>
+<td>4.51</td>
+<td>7.32</td>
+<td>4.53</td>
+</tr>
+<tr>
+<td>FLE-IQ2_M</td>
+<td>3.24</td>
+<td>2.59</td>
+<td>4.51</td>
+<td>6.61</td>
+<td>4.31</td>
+</tr>
+<tr>
+<td>FLE-IQ3_M-REAP448</td>
+<td>4.05</td>
+<td>3.62</td>
+<td>4.50</td>
+<td>9.00</td>
+<td>7.54</td>
+</tr>
+</tbody>
+</table></div>
+<p>FLE-IQ3_M-REAP448 (161.84 B parameters, 64 of 512 experts per layer pruned) is FLE-IQ3_M with REAP-pruned experts.</p>
+<p><strong>Expert pruning (FLE-IQ3_M-REAP448).</strong> REAP [Lasby et al., arXiv:2510.13999] ranks the experts of each layer by
+their mean router-weighted output norm over the tokens routed to them. We compute it with <code>llama-fle-reap</code> over a
+calibration text of 256 × 2,048 tokens (FLE-IQ3_M's own answers to public prompts: 45 % German conversation, 25 % code
+and tool calls, 18 % English conversation, 12 % math; the KLD texts and the probe questions are not in it) and remove
+the lowest-ranked experts per layer by byte copy of the kept expert slices and router rows (<code>reap_prune.py</code>, no
+re-quantization). At 384 of 512 experts we compared REAP with the gate-free mean activation norm MAN [Liu et al.,
+arXiv:2606.15716]; the winner on German MKQA was then built with 448 experts. KLD with the neutral meter (Section
+2.3), MKQA as described there, all measured 2026-10-08:</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>File</th>
+<th>Size (GB)</th>
+<th>KLD E / W / K</th>
+<th>MKQA correct DE / EN</th>
+<th>vs FLE-IQ3_M, DE / EN (points, paired 95 %)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FLE-IQ3_M</td>
+<td>88.87</td>
+<td>0.051 / 0.050 / 0.129</td>
+<td>23.2 / 33.0 %</td>
+<td>—</td>
+</tr>
+<tr>
+<td>FLE-IQ3_XXS</td>
+<td>79.48</td>
+<td>0.090 / 0.093 / 0.227</td>
+<td>21.5 / 30.8 %</td>
+<td>−1.8 [−4.2 .. +0.5] / −2.2 [−5.0 .. +0.2]</td>
+</tr>
+<tr>
+<td>REAP, 448 experts (FLE-IQ3_M-REAP448)</td>
+<td>82.00</td>
+<td>0.080 / 0.086 / 0.185</td>
+<td>21.5 / 29.8 %</td>
+<td>−1.8 [−4.5 .. +0.8] / −3.2 [−6.5 .. +0.0]</td>
+</tr>
+<tr>
+<td>REAP, 384 experts</td>
+<td>75.13</td>
+<td>0.135 / 0.132 / 0.261</td>
+<td>17.5 / 21.2 %</td>
+<td>−5.8 [−9.2 .. −2.5] / −11.8 [−16.0 .. −7.8]</td>
+</tr>
+<tr>
+<td>MAN, 384 experts</td>
+<td>75.13</td>
+<td>0.167 / 0.165 / 0.325</td>
+<td>11.2 / 15.5 %</td>
+<td>−12.0 [−15.8 .. −8.5] / −17.5 [−21.8 .. −13.2]</td>
+</tr>
+</tbody>
+</table></div>
+<p>The 384-expert REAP file is the instructive row: its KLD is only somewhat above FLE-IQ3_XXS, but its loss of correct
+answers is three to five times as large. A few short texts do not exercise the facts that rarely routed experts
+carry. At 448 experts the loss is about that of FLE-IQ3_XXS. REAP beat MAN clearly at equal size, although Liu et al.
+recommend MAN for task-agnostic pruning; this is one model and one probe. On the calibration text the 448 kept
+experts receive 96.1 % of the summed router weight on average (lowest layer 90.5 %). All five files repeated an
+invented rare full name correctly in 60 of 60 short messages per language. The absolute MKQA rates are low because
+the questions come from Natural Questions (many US-specific) and the model abstains often (FLE-IQ3_M: 91 of 400
+German, 21 of 400 English answers). Speed: at the same cache budget FLE-IQ3_M-REAP448 decodes as fast as FLE-IQ3_M
+(+0.71 % [−0.32 .. +1.75], bracket B3e6, <a class="ref" href="#s7">Section 7</a>). With a warm profile its hit rate in the first 512 steps is the
+same (93.8 % against 93.7 %), as expected if the removed experts are the ones that rarely reach the cache; the
+smaller file saves 6.9 GB of RAM, not time.</p>
+<p>ISTA Q2_0 is not used as a base because llama.cpp has no fast CPU kernel for it; it appears only as a comparison.</p>
+<p><strong>No 1-bit class from public files.</strong> A planned FLE-Q1 at 63 GB cannot be built from the public releases. Every
+low-bit file carries the same non-expert part of about 32.6 GB, of which 28.8 GB is the PLE table
+(<code>per_layer_token_embd</code>); and Unsloth's UD-IQ1_M keeps many layers at higher precision, so its experts
+(41.9 GB) are larger than those of ISTA IQ2_XS (35.5 GB):</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>File</th>
+<th>Experts</th>
+<th>Rest</th>
+<th>of which <code>per_layer_token_embd</code></th>
+<th>Total</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ISTA IQ2_XS</td>
+<td>35.5 GB</td>
+<td>32.6 GB</td>
+<td>28.8 GB</td>
+<td>68.0 GB</td>
+</tr>
+<tr>
+<td>Unsloth UD-IQ1_M</td>
+<td>41.9 GB</td>
+<td>32.7 GB</td>
+<td>28.8 GB</td>
+<td>74.5 GB</td>
+</tr>
+<tr>
+<td>ISTA Q2_0</td>
+<td>34.0 GB</td>
+<td>32.4 GB</td>
+<td>28.8 GB</td>
+<td>66.4 GB</td>
+</tr>
+</tbody>
+</table></div>
+<p>The smallest hybrid these sources allow is about 66.6 GB, barely below IQ2_XS and with the worse Q2_0 experts. A
+lower-precision <code>per_layer_token_embd</code> does not help within the GGUF formats either: the table has rows of only 160
+values (shape [160, 320 001 536], stored as IQ4_NL in every release), so only types with blocks of 32 fit. K-quants,
+IQ2/IQ3 (blocks of 256) and the new Q2_0/Q1_0 (blocks of 64/128) cannot store it; the smallest fitting type, MXFP4 at
+4.25 bits, would save 1.6 GB. Going lower would need a custom type, and the file would no longer load in upstream
+llama.cpp. The ≈ 33 GB of non-expert weights are therefore a floor set by the format.
+The predictor gives a summed error of 3.19 for FLE-IQ3_XXS against 4.95 for its base ISTA IQ3_XXS alone, and 5.90 for
+FLE-IQ2_M against 7.36 for ISTA IQ2_XS (predictions). Measured (<a class="ref" href="#s7">Section 7</a>): FLE-IQ3_XXS matches Unsloth UD-IQ3_XXS
+(KLD 0.090 / 0.093 / 0.227 against 0.091 / 0.091 / 0.229) at 2.5 GB less, and FLE-IQ2_M is clearly better than the
+larger Unsloth UD-IQ1_M (0.160 / 0.163 / 0.339 against 0.189 / 0.186 / 0.413). Against the ISTA files both stages
+lie about on the line between IQ2_XS, IQ3_XXS and IQ3_S: they add size steps, not a better size–quality curve.
+Speed of the stages at the same cache budget (<a class="ref" href="#s7">Section 7</a>, bracket B3e5): FLE-IQ3_XXS −0.69 % [−2.07 .. +0.57] and
+FLE-IQ2_M +11.60 % [+9.78 .. +13.39] against FLE-IQ3_M.</p>
+<h2 id="s4"><span class="num">4</span> Engine</h2>
+<h3 id="s4-1"><span class="num">4.1</span> Expert cache on the GPU</h3>
+<figure class="film" id="film-4">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-4.jpg" aria-label="Film 4: The expert cache"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.mp4">making-rhea-fast-4.mp4</a></video></div>
+<figcaption><span class="film-head">Film 4/8 · The expert cache · 0:59</span><span class="film-text">Retells <a class="ref" href="#s4-1">Sections 4.1</a> and 4.4, bracket V6b, warm start (CG).</span><span class="film-links"><a href="https://youtu.be/tY-tDv-9uzY">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.mp4">MP4, 14.0 MB</a></span></figcaption>
+</figure>
+<p>Every MoE layer whose experts stay in host memory (46 layers for FLE-IQ3_M; the memory fit decides the number) gets a
+cache of expert slots on the GPU, 173 per layer before the byte budget below. Admission is ranked: the misses of a step
+are sorted by an aged request count (counters halved every 2,000 observations per layer, <code>FLE_MOE_ADMIT_FREQ=2000</code>),
+and at most one expert per layer and step enters the cache. Eviction takes the least frequent of the 32 oldest
+entries (<code>FLE_MOE_EVICT_OLDEST=32</code>). A small router bias towards cached experts (0.001 in probability units) changes
+which experts are chosen, not their weights, and keeps the outputs within the KLD criterion (<a class="ref" href="#s3">Section 3</a>). Bracket HZ2
+(reference Unsloth UD-IQ4_XS; all arms with 160 slots per layer and n-max 1; reference drift +0.38 %): FLE-IQ3_M alone
++4.05 % [+2.92 .. +5.19], FLE-IQ3_M with bias and policy <strong>+12.15 %</strong> [+10.68 .. +13.57].</p>
+<p>The smaller FLE-IQ3_M file frees GPU memory, but only turning that memory into cache slots makes it faster. Bracket
+V6b (<a class="ref" href="#s4-4">Section 4.4</a>) measures the slope: 146 instead of 173 slots cost −4.39 %, 120 slots −10.04 %. An earlier bracket
+that compared slot counts against UD-IQ4_XS (HY) is not cited: its three candidate arms ran under memory pressure
+(cgroup memory-high events in all three, none in the reference arms), with half the output limit and 19 instead of
+24 paired requests (<a class="ref" href="#appendix-a">Appendix A</a>).</p>
+<p>The final build replaces the fixed slot count by a <strong>global byte budget</strong> (patch 44): the cache gets a number of
+bytes, the slots are distributed over all layers with host experts by a usage profile (118 to 248 slots per layer
+for FLE-IQ3_M in the final brackets B3e5 and B3e6, mean 174), and the profile is saved every 600 s and loaded at the next start (warm start). The effect is measured in
+<a class="ref" href="#s5-3">Section 5.3</a> (bracket CG): +1.49 % [+0.64 .. +2.41] with the profile, and a much smaller loss when memory gets tight.</p>
+<h3 id="s4-2"><span class="num">4.2</span> Overlap and fusion</h3>
+<p>GPU cache hits run while the CPU computes the misses (<code>FLE_MC_OVERLAP=2</code>), and the Gated Residual runs in fused CUDA
+kernels (<code>FLE_HC_FUSED=1</code>). Bracket ALL2 (reference FLE-IQ3_M at n-max 2 without both, 14.6 ms per token; drift
+−0.44 %; 24 paired requests):</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Candidate</th>
+<th>Speed vs reference</th>
+<th>95 % CI</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>combined build + overlap</td>
+<td>+15.93 %</td>
+<td>+14.60 .. +17.42</td>
+<td>76.8 %</td>
+</tr>
+<tr>
+<td>+ IQ4_NL MTP head</td>
+<td><strong>+19.46 %</strong></td>
+<td>+18.00 .. +21.03</td>
+<td>76.5 %</td>
+</tr>
+<tr>
+<td>+ Q4 MTP head</td>
+<td>+16.63 %</td>
+<td>+15.25 .. +18.14</td>
+<td>78.2 %</td>
+</tr>
+<tr>
+<td>+ IQ4_NL head, Q6_K dense weights</td>
+<td>+19.14 %</td>
+<td>+15.76 .. +22.14</td>
+<td>75.5 %</td>
+</tr>
+</tbody>
+</table></div>
+<p>The Q6_K variant passes the quality criterion but is not faster than the IQ4_NL head alone; it ran with 45 cache
+layers of 179 slots, the other arms with 46 of 173.</p>
+<h3 id="s4-3"><span class="num">4.3</span> Speculative decoding with the MTP head, and a re-training that did not generalize</h3>
+<figure class="film" id="film-5">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-5.jpg" aria-label="Film 5: Draft and verify"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4">making-rhea-fast-5.mp4</a></video></div>
+<figcaption><span class="film-head">Film 5/8 · Draft and verify · 1:00</span><span class="film-text">Retells <a class="ref" href="#s4-3">Sections 4.3</a> and 4.4; shows how the re-trained head c2 learned (made before brackets KTF/KTG; the release ships the untrained head because c2's gain held only on its training tasks, <a class="ref" href="#s4-3">Section 4.3</a>).</span><span class="film-links"><a href="https://youtu.be/smgBd6764m8">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4">MP4, 5.1 MB</a></span></figcaption>
+</figure>
+<p>Draft-and-verify [Leviathan et al., arXiv:2211.17192; Chen et al., arXiv:2302.01318] with the model's own MTP module
+[DeepSeek-AI, arXiv:2412.19437; Gloeckle et al., arXiv:2404.19737]. With the shipped head, the conditional acceptance
+derived from the tokens per cycle (<a class="ref" href="#s4-4">Section 4.4</a>) is about 0.86 / 0.78 / 0.78 for the first, second and third drafted
+token, and two drafted tokens (n-max 2) give the shortest time per token in that measurement. The bracket meant to
+confirm the choice directly (NM2) drifted by −5.88 % and is invalid (<a class="ref" href="#appendix-a">Appendix A</a>).</p>
+<p><strong>The released head</strong> is the untrained module: Unsloth's <code>MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf</code> (revision
+<code>eb2a07ecb33b</code>, 2026-09-01) with only the three expert tensors <code>blk.48.ffn_down_exps</code> / <code>ffn_gate_exps</code> /
+<code>ffn_up_exps</code> requantized from Q8_0 to IQ4_NL (relative error against the source on the first 8,192 rows
+0.0772 / 0.0785 / 0.0781); the other 29 of 32 tensors are unchanged (1,528,277,056 bytes). This is the IQ4_NL head of
+<a class="ref" href="#s4-2">Section 4.2</a>. A 32k draft vocabulary adds +4.14 % [+3.04 .. +5.24] (bracket VK, measured with head c2 below).</p>
+<p><strong>Re-training (method).</strong> We re-trained the head on the model's own answers (recursive self-distillation: the head
+is rolled out to depth 7 against the main model's top-32 logits). Recipe of head c2 (run lauf3): teacher and answer
+generator are the FLE-IQ3_M file; cross-entropy against the renormalized top-32 teacher logits at each of 7 rollout
+depths plus an L2 anchor (3e-3) to the shipped head; only the 25 non-expert tensors (88.9 M parameters) are trained;
+6,000 steps, sequence 1,024, AdamW, learning rate 3e-5 with cosine decay, bf16, 3.5 hours on one GPU. About 40 % of
+the prompt pool are the author's own assistant conversations (filtered for secrets, not published), the rest public
+datasets (OASST, SWE-Gym, SWE-Zero, UltraChat, GSM8K). The training corpus (m2) also contained FLE-IQ3_M's answers to
+exactly the 8 fixed tasks used for the KTC measurement.</p>
+<p><strong>Re-training (result): a negative result.</strong></p>
+<ul>
+<li><em>On the training tasks</em> (bracket KTC, 24 paired requests on the same 8 tasks): c2 +4.54 % [+2.67 .. +6.75] against
+the untrained head, acceptance 80.2 % vs 77.1 % (an earlier +4.92 % could not be reproduced from the raw data, head
+c3 gives +4.90 %). A larger run (lauf5: 1.7 times the sections plus a fourth capture set, 9,807 steps, trained from
+the shipped head) did not beat c2: +0.28 % [−0.73 .. +1.48] at n-max 2 (bracket KTE, 48 paired requests; acceptance
+79.9 % against 80.4 %). In hindsight the KTC gain is overfitting to the measurement tasks.</li>
+<li><em>On unseen tasks, first try</em> (bracket KTF: 16 tasks not in any corpus, 8 German and 8 English, code, math, prose,
+knowledge; 48 paired requests, reference c2 before/after): untrained head +1.61 % [+0.88 .. +2.36] against c2, head
+pub (re-trained on public prompts only) −0.11 % [−1.11 .. +0.86]; acceptance c2 71.35 %, untrained 72.40 %, pub
+71.73 %. Confounder: each arm had its own warm-start expert profile (c2's predicted 72 % hits, the others 80 %).</li>
+<li><em>On unseen tasks, clean repeat</em> (bracket KTG, 2026-10-09, same 48 requests, every arm starts from a copy of the same
+production profile with 79.1 % predicted hits; FLE-IQ3_M, n-max 2, bootstrap 95 %; reference c2 11.740 → 11.298 ms
+per token, drift −2.38 %): untrained head <strong>+2.95 %</strong> [+1.96 .. +3.93], pub −1.63 % [−2.35 .. −0.91]; acceptance
+untrained 71.00 %, pub 71.10 %, c2 70.91 %.</li>
+</ul>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>KTG, speed vs c2 (n = 6 each)</th>
+<th>de code</th>
+<th>de math</th>
+<th>de prose</th>
+<th>de knowledge</th>
+<th>en code</th>
+<th>en math</th>
+<th>en prose</th>
+<th>en knowledge</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>untrained (released)</td>
+<td>+2.7 %</td>
+<td>+2.1 %</td>
+<td>+1.6 %</td>
+<td>−0.5 %</td>
+<td>+3.9 %</td>
+<td>+5.1 %</td>
+<td>+5.1 %</td>
+<td>+3.7 %</td>
+</tr>
+<tr>
+<td>pub</td>
+<td>−1.5 %</td>
+<td>−2.0 %</td>
+<td>−1.8 %</td>
+<td>−3.8 %</td>
+<td>−2.7 %</td>
+<td>−2.5 %</td>
+<td>+1.6 %</td>
+<td>−0.3 %</td>
+</tr>
+</tbody>
+</table></div>
+<p>Acceptance is practically the same for all three heads, so the untrained head's lead is not explained by
+acceptance; its cause is not known. The gain of re-training held only on the tasks in its corpus. The release
+therefore ships the untrained head; c2 and pub are not published. Lesson: <strong>measurement tasks and training corpus
+must be disjoint.</strong> The final series (B1e, B3e, S), the benchmarks of <a class="ref" href="#s5-4">Section 5.4</a> and bracket VK were measured with
+c2 and are reported as measured; we do not extrapolate them to the released head.</p>
+<h3 id="s4-4"><span class="num">4.4</span> Where the time goes</h3>
+<p>Cycle model T(n) = T0 + c·M(n+1) + Σ DG_j (M = cache misses, DG = extra cost of the j-th drafted token), calibrated
+on single requests of the base build of 2026-09-30 (bracket NM: untrained head, fused Gated Residual and overlap not
+yet switched on): T0 = 22.6 ms, about 82 % of a single-token cycle of 27.4 ms. Measured cycles for n-max 1/2/3:
+27.4 / 34.6 / 42.8 ms for 1.86 / 2.53 / 3.06 tokens (n-max 3: 18 valid requests). Three parameters on three points
+describe these measurements but do not test the model. An Nsight Systems profile of the production build of 2026-10-04
+(before the final configuration; 15 s window, n-max 2, 77.3 tokens/s) shows the GPU busy 64.5 % of the time; the gaps
+split into launch 17.3 %, CPU after the GPU 7.6 %, CPU before 6.4 %, wake-up 2.0 % and GPU-internal 0.9 %. A gap
+between consecutive GPU operations averages 27 µs; a full GPU–CPU–GPU round trip averages 226 µs (median 55 µs).</p>
+<p>Sensitivity to cache misses, measured directly (bracket V6b, 2026-10-06; same build and 46 cache layers, only the
+slot count changes; reference drift +0.68 %): 173 slots give 30.3 misses per step (hit rate 91.2 %), 146 slots
+38.5 (+27 %) and 120 slots 52.3 (+72 %); speed −4.39 % [−5.43 .. −3.37] and −10.04 % [−10.74 .. −9.37]. Each
+percent more misses costs 0.14–0.16 % speed, less than the cycle model predicts; our reading is that the overlap,
+switched on after the model was calibrated, hides part of the CPU time. The slope is measured only towards more misses.</p>
+<h3 id="s4-5"><span class="num">4.5</span> Prefill and prompt cache</h3>
+<p>Lean prefill at micro-batch 1024 (patch 35), bracket P35Q against micro-batch 512 (drift −0.30 %):
+micro-batch 1024 alone costs decode speed, −19.01 % [−19.76 .. −18.26]; our reading (not measured separately) is that the larger compute
+buffer takes GPU memory from the expert cache. With the memory fit lowered from 19156 to 18806 MiB, decode is +2.26 %
+[+1.24 .. +3.29]. The same effect shows in END2: the 1024 candidate without fit lost −20.36 %. Prefill of an 8.6k
+prompt: about 425 instead of about 280 tokens/s (two cold runs per arm, 2026-10-03; the final configuration reaches
+about 1,250 tokens/s, <a class="ref" href="#s4-6">Section 4.6</a>). Prompt-cache protection for the interactive slot (patches 39/39b): a follow-up
+turn at 7.1k context took 2.4 s (516 tokens recomputed, the rest restored from the RAM cache); computing the same
+context from scratch took 17.5 s (single probe, 2026-10-03).</p>
+<h3 id="s4-6"><span class="num">4.6</span> Final configuration: threads, pinned experts, slot release, byte budget, ubatch lending</h3>
+<figure class="film" id="film-3">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-3.jpg" aria-label="Film 3: The staircase"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-3.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-3.mp4">making-rhea-fast-3.mp4</a></video></div>
+<figcaption><span class="film-head">Film 3/8 · The staircase · 1:03</span><span class="film-text">Retells <a class="ref" href="#s4-1">Sections 4.1</a> to 4.6, step by step.</span><span class="film-links"><a href="https://youtu.be/cEv8TZ9OZPA">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-3.mp4">MP4, 4.9 MB</a></span></figcaption>
+</figure>
+<p>Three steps after END2 lead to the intermediate configuration <code>p43-pin</code>; four more, taken over from Strata or found
+while measuring against it (<a class="ref" href="#s5-3">Section 5.3</a>), lead to the final configuration <code>p49-ring</code> that all final numbers use:</p>
+<ul>
+<li><strong>16 threads on cores 0–15</strong> instead of 8 on cores 0–7: +5.23 % [+3.64 .. +6.86] (bracket RB2, paired). The CPU
+computes the cache misses (≈ 6 % of expert calls at 94 % hits), so more cores shorten the critical path.</li>
+<li><strong>Slot release (patch 43):</strong> when a conversation switches slots, the time to first token falls by 202.5 ms
+(−25.6 %); outputs stay within GPU noise (alternating arms, not a paired bracket).</li>
+<li><strong>Pinned experts</strong> (<code>--load-mode none</code>, no patch): expert weights are read once into a pinned host buffer, so
+every host-to-device copy runs at pinned-memory speed. Against a warm production run (model fully in the page
+cache before every reference arm; alternating arms B A B A, medians, not a paired bracket): prefill of 1000
+words 446 → 852 tokens/s (+91 %), 3000 words 558 → 1037 tokens/s (+86 %); time to first token −309 ms for prompts
+of about 50 tokens and −613 ms for about 490; decode 77.4 → 84.5 tokens/s (+9.1 %). Cost: 54 GB of RAM are pinned
+and can no longer be reclaimed by the page cache (available memory after loading 47.5 instead of 100.5 GiB);
+loading takes 55 instead of 45 s. Greedy outputs of the longest task differed between all arms, also between arms
+of the same build (GPU noise). The decode gain is not decomposed and was not repeated in a paired bracket; our
+candidate explanation is that cache-miss copies also run from pinned memory.</li>
+<li><strong>Byte budget and warm start for the expert cache (patch 44):</strong> one budget of 17,035 MiB for all layers instead
+of a fixed slot count, planned from a saved usage profile; +1.49 % [+0.64 .. +2.41] (bracket CG, <a class="ref" href="#s5-3">Section 5.3</a>).</li>
+<li><strong>AVX2 dot product for Q2_0 (patch 45):</strong> matters only for files with Q2_0 tensors (<a class="ref" href="#s6">Section 6</a>, <a class="ref" href="#s7">Section 7</a>).</li>
+<li><strong>Ubatch lending (patch 48):</strong> decode runs with a 1,024-token micro-batch and the full cache; a prefill call of
+2,048 tokens or more lends whole expert-cache layers from the back for the larger compute buffer and gives them
+back afterwards (bracket W7: 15 layers and 5,033 MiB at micro-batch 4096, 2,327 slots refilled from pinned RAM in
+106 ms; in the final configuration, with the prefetch ring below, 19 layers, 6,409 MiB and 2,952 slots in 136 ms). Bracket W7
+(drift −0.26 %): prefill 1k / 4k / 8.6k ±0 / <strong>+30.0 %</strong> / <strong>+53.7 %</strong>; decode −0.25 % [−1.15 .. +0.66].</li>
+<li><strong>Prefetch ring (patch 49):</strong> while lending, a second CUDA stream copies the whole weights of the next expert
+splits into a ring of three staging buffers (450 MiB each, also lent from the cache), so the copy overlaps the
+computation and the per-layer synchronization on the routed ids disappears. Greedy answers of about 400 characters
+are identical to the build without it for prompts of 1k, 4k and 8.6k tokens. Bracket W49c (drift +0.35 %): prefill 4k <strong>+10.6 %</strong>, 8.6k <strong>+14.2 %</strong>
+on top of patch 48; decode −0.18 % [−0.91 .. +0.49]. An nsys timeline shows why not more: each layer has three
+weight splits, up and gate compute shorter than their copy takes at 57.5 GB/s, so about 0.64 s of copy without
+computation remain per 8.6k prompt; six buffers instead of three did not help (1,220 against 1,249 tokens/s at 8.6k).</li>
+</ul>
+<p>After the final measurement one correctness fix went into production (patch 50, a server change): a request that
+names a slot which is still busy was allowed to load its cached prompt into that slot before it was deferred, which
+replaced the running generation's state (upstream behaviour of <code>get_available_slot</code>; it corrupted our first
+benchmark runs, <a class="ref" href="#s5-4">Section 5.4</a>). The fix does not touch the computation; speed was not re-measured with it.</p>
+<h2 id="s5"><span class="num">5</span> Results</h2>
+<h3 id="s5-1"><span class="num">5.1</span> Against upstream llama.cpp</h3>
+<figure class="film" id="film-1">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-1.jpg" aria-label="Film 1: The race"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-1.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-1.mp4">making-rhea-fast-1.mp4</a></video></div>
+<figcaption><span class="film-head">Film 1/8 · The race · 0:33</span><span class="film-text">Retells <a class="ref" href="#s5-1">Section 5.1</a> (B1e), 5.2 (END2), 5.3.</span><span class="film-links"><a href="https://youtu.be/g4fWtuupwHo">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-1.mp4">MP4, 2.9 MB</a></span></figcaption>
+</figure>
+<p>Bracket B1e (2026-10-06, final measurement; 24 paired requests; reference drift +0.44 %). Reference: FLE in the
+final configuration (<code>p49-ring</code>: FLE-IQ3_M, expert cache with a 17,035 MiB byte budget and warm-start profile, overlap,
+re-trained MTP head c2 at n-max 2, 32k draft vocabulary, 16 threads, pinned experts, ubatch lending with prefetch
+ring). Measured with the internal head c2; the published untrained head was +2.95 % [+1.96 .. +3.93] faster than c2
+on unseen prompts (bracket KTG, <a class="ref" href="#s4-3">Section 4.3</a>). Candidates: upstream llama.cpp at commit <code>a8c9a4e7c</code> without any patch, a current upstream state that is newer
+than the FLE base <code>6a1a922d</code> (2026-09-05; FLE rebased onto <code>a8c9a4e7c</code> was 5.7 % slower, <a class="ref" href="#s6">Section 6</a>), with
+micro-batch 1024 and with micro-batch 4096; same FLE-IQ3_M file, same card, 16 threads, <code>--load-mode none</code>; without an
+expert cache upstream fills the GPU statically (fit target 1024 MiB: at micro-batch 1024 that is 18,195 MiB of experts
+and 5,362 MiB of dense weights on GPU0, at micro-batch 4096 only 9,458 MiB of experts).</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th></th>
+<th>Speed vs FLE</th>
+<th>95 % CI</th>
+<th>FLE is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FLE <code>p49-ring</code> (median 9.9–10.1 ms per token, about 100 tokens/s)</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td>upstream llama.cpp <code>a8c9a4e7c</code>, micro-batch 1024</td>
+<td><strong>−59.87 %</strong></td>
+<td>−61.24 .. −58.50</td>
+<td>2.49× as fast</td>
+</tr>
+<tr>
+<td>upstream llama.cpp <code>a8c9a4e7c</code>, micro-batch 4096</td>
+<td><strong>−64.01 %</strong></td>
+<td>−65.20 .. −62.86</td>
+<td>2.78× as fast</td>
+</tr>
+</tbody>
+</table></div>
+<p>The gap holds for every prompt type (micro-batch 1024: −59.0 % code, −63.6 % math, −58.6 % physics, −57.9 % prose).
+The FLE reference accepts 82–86 % of the drafted tokens.</p>
+<p>Prefill is the other side. Per arm in the same bracket (medians, not paired), tokens/s:</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Prompt</th>
+<th>FLE <code>p49-ring</code></th>
+<th>upstream, micro-batch 1024</th>
+<th>upstream, micro-batch 4096</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>~1k tokens</td>
+<td>416–442</td>
+<td>715</td>
+<td>517</td>
+</tr>
+<tr>
+<td>~4k tokens</td>
+<td>928–934</td>
+<td>900</td>
+<td>1,222</td>
+</tr>
+<tr>
+<td>~8.6k tokens</td>
+<td>1,248–1,256</td>
+<td>967</td>
+<td>1,416</td>
+</tr>
+</tbody>
+</table></div>
+<p>Time to first token for prompts of 20–192 tokens: FLE 0.71–1.03 s (one outlier of 1.41 s at 192 tokens in the first
+reference arm), upstream (micro-batch 1024) 0.64–0.92 s. FLE is
+24 % (4k) and 12 % (8.6k) behind upstream with micro-batch 4096 and about 40 % behind upstream with micro-batch 1024
+at 1k. Our reading, not measured: upstream keeps part of the experts statically on the GPU (9,458 MiB, 18 % of
+them, at micro-batch 4096) and needs no copies for those, while FLE copies nearly all experts through PCIe in every large micro-batch (<a class="ref" href="#s4-6">Section 4.6</a>); below 2,048 tokens
+FLE does not lend and takes the old path that copies all experts of a layer with the small compute buffer.</p>
+<p>The mainline arm runs without speculative decoding because it cannot use the public MTP files: upstream's MTP
+support for this model (#29761) takes the MTP block from the target GGUF or from an MTP-only GGUF that carries its
+own token embedding and output head, while Unsloth's &quot;shared&quot; head, the basis of the FLE head, has neither. That head
+fails to load (<code>token_embd.weight not found</code>); Unsloth's complete head loads but aborts at the first
+compute step (<code>GGML_ASSERT(buffer)</code> in <code>process_ubatch</code>), on the 16 GB card as well as on the 32 GB card with the
+head on the GPU, so it is not a memory problem (<code>scripts/fle/bench/b1_mtp_probe.sh</code>). For a user of the public
+files, the arm without MTP is the realistic default.</p>
+<h3 id="s5-2"><span class="num">5.2</span> Against the previous production</h3>
+<p>End-to-end bracket END2 (24 paired requests; code 9, math 6, physics 3, prose 6; reference drift +1.44 %):</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th></th>
+<th>ms per token (median)</th>
+<th>Speed vs previous production</th>
+<th>95 % CI</th>
+<th>Acceptance</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>previous production (stock build, Unsloth UD-IQ4_XS)</td>
+<td>17.9</td>
+<td>—</td>
+<td>—</td>
+<td>76.5 %</td>
+</tr>
+<tr>
+<td>FLE (FLE-IQ3_M, cache policy, overlap, IQ4_NL MTP head, n-max 2)</td>
+<td>11.3</td>
+<td><strong>+58.53 %</strong></td>
+<td>+55.83 .. +61.58</td>
+<td>77.0 %</td>
+</tr>
+<tr>
+<td>same, micro-batch 1024 without memory fit</td>
+<td>—</td>
+<td>−20.36 %</td>
+<td>−22.32 .. −18.36</td>
+<td>79.1 %</td>
+</tr>
+</tbody>
+</table></div>
+<p>Per category FLE gains +57.4 % (code), +58.1 % (math), +54.7 % (physics) and +62.6 % (prose).</p>
+<p><a class="ref" href="#appendix-c">Appendix C</a> lists every paired bracket this paper cites (date, reference, candidate, effect, 95 % CI, reference
+drift, n), generated from the paired evaluations by <code>scripts/fle/release/klammer_tabelle.py</code>.</p>
+<h3 id="s5-3"><span class="num">5.3</span> Against Strata</h3>
+<p>Strata 0.1.39 (Niko1221, MIT) is the closest public engine: it also keeps a GPU expert cache, computes misses on
+the CPU and drafts with the model's MTP head. Both engines ran FLE-IQ3_M on the same machine with the same tasks; FLE
+before and after the Strata arms. Strata ran with its own defaults (131,072 context, fp16 KV in RAM, one slot,
+20.9 GiB of expert cache); FLE keeps 262,144 context, q8 KV and two slots on the GPU and therefore has only 16.6 GiB
+(17,035 MiB) of cache. The comparison was run twice: first against <code>p43-pin</code> (2026-10-06 night, <code>scripts/fle/fusion/tore_kette.sh</code>),
+which started the takeover below, and again in the final measurement against <code>p49-ring</code> (comparison S, 2026-10-06
+17:01–17:13, Strata <code>--spec 4</code> on 16 cores, <code>scripts/fle/bench/end_kette.sh</code>). FLE drafted with the internal head c2
+in the final comparison (<a class="ref" href="#s4-3">Section 4.3</a>).</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th></th>
+<th>FLE <code>p43-pin</code></th>
+<th>FLE <code>p49-ring</code> (final)</th>
+<th>Strata 0.1.39</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>decode, tokens/s (mean of the four per-task medians)</td>
+<td>90.8 / 90.4 (before / after)</td>
+<td><strong>91.2 / 91.3</strong> (before / after)</td>
+<td>75.8 then, 74.0 in S (<code>--spec 4</code>)</td>
+</tr>
+<tr>
+<td>prefill 1,000 / 4,000 / 8,600 tokens, tokens/s</td>
+<td>447 / 653 / 716</td>
+<td>443 / 922–933 / 1,179–1,181</td>
+<td><strong>1,190 / 2,218 / 2,740</strong> then, <strong>1,183 / 2,239 / 2,673</strong> in S</td>
+</tr>
+<tr>
+<td>time to first token, prompts of 20–192 tokens</td>
+<td>0.69–1.03 s</td>
+<td>0.69–1.04 s</td>
+<td><strong>0.39–0.50 s</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>In the final comparison FLE decodes about 23 % faster; Strata prefills 2.7 (1k), 2.4 (4k) and 2.3 (8.6k) times as
+fast (before the takeover 2.7, 3.4 and 3.8 times) and answers short prompts 0.3–0.5 s earlier. The decode figures are
+unpaired means of the per-task medians, not a paired bracket. We took four Strata ideas as candidates and gated each by a
+measurement before building it:</p>
+<ul>
+<li><strong>Global byte budget for the expert cache with a warm-start profile</strong> (patch 44; Strata keeps a usage profile
+and fills the cache by rank). Bracket CG (24 paired requests, drift +0.28 %): budget alone +0.01 %
+[−0.49 .. +0.48], with the saved profile <strong>+1.49 %</strong> [+0.64 .. +2.41]; hit rate in the first 512 steps 93.7 %
+instead of 67.6 % cold. With 2.6 GB less budget (the memory a rebased build lost in <a class="ref" href="#s6">Section 6</a>) speed falls by only
+−3.26 % [−4.19 .. −2.32] instead of −47 %, because every layer shrinks a little instead of whole layers losing
+their cache. Adopted.</li>
+<li><strong>Doorbell window graph</strong> (Strata enqueues a whole verification window and lets the host signal each layer).
+Gate: Strata's fixed time per window must be clearly below ours. A regression of Strata's own window timings over
+the drafted tokens T gives 11.9 + 7.6·T ms, intercept 95 % 8.7–15.4 ms (bootstrap over 24 segments), against our
+fixed share of about 15.2 ms; the largest fixed item in Strata is itself a wait for the GPU. The doorbell
+hand-off costs 1.8 µs (P50, P99 2.0 µs; microbenchmark on the 16 GB card), so it is not the obstacle. Gate missed, not built (<a class="ref" href="#s6">Section 6</a>).</li>
+<li><strong>PCIe share of the misses</strong> (Strata copies 55 % of the missed experts to the GPU instead of computing them on the
+CPU). Gate: the speed must depend on the miss count. Bracket V6b with 173/146/120 slots: misses per step 30.3 /
+38.5 / 52.3, speed −4.39 % [−5.43 .. −3.37] and −10.04 % [−10.74 .. −9.37], i.e. 0.14 to 0.16 % speed per
+percent of misses. Gate passed; built as patch 47 (a ring of three slots per layer into which part of the missed
+experts is copied ahead of the GPU chain). It worked as designed, 31.7 % and 40.6 % of the non-cached experts were
+served through the ring, but decode lost: −4.46 % [−5.73 .. −3.32] and −4.47 % [−5.53 .. −3.46] (bracket PC,
+drift +2.37 %). The copies sit on the stream of the hit chain, so every layer waits for about 2 MB of weights,
+which costs more than the CPU saves. Our written forecast before the measurement was +3 .. +10 %, and +7 .. +9 %
+after bracket V6b. Not adopted (<a class="ref" href="#s6">Section 6</a>).</li>
+<li><strong>Larger micro-batches for long prompts</strong> (Strata borrows cache memory for prefill). Gate: the prefill gap
+above. Built as patches 48 and 49 (<a class="ref" href="#s4-6">Section 4.6</a>): prefill 4k and 8.6k +30.0 % and +53.7 % (bracket W7), then
++10.6 % and +14.2 % on top (bracket W49c), decode unchanged within the interval. Adopted.</li>
+</ul>
+<p>The doorbell window graph is the one idea that stays open (<a class="ref" href="#s6">Section 6</a>).</p>
+<h3 id="s5-4"><span class="num">5.4</span> Standard benchmarks</h3>
+<figure class="film" id="film-7">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-7.jpg" aria-label="Film 7: The rebench"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.mp4">making-rhea-fast-7.mp4</a></video></div>
+<figcaption><span class="film-head">Film 7/8 · The rebench · 0:58</span><span class="film-text">Retells <a class="ref" href="#s5-4">Section 5.4</a>.</span><span class="film-links"><a href="https://youtu.be/YNLKC_LNz44">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.mp4">MP4, 4.8 MB</a></span></figcaption>
+</figure>
+<p>To check that FLE-IQ3_M on FLE keeps the model's task quality, we run three benchmarks from Qwen's model card with the
+sampling of that card (temperature 1.0, top-p 0.95, top-k 20, min-p 0, no presence penalty, up to 81,920 new tokens,
+thinking on), against the production server (profile <code>p50-fix</code>): IFBench (prompt-level, card 81.3), GPQA Diamond
+(card 91.7) and LiveCodeBench v6 (card 91.9). One run per benchmark.</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Benchmark</th>
+<th>Tasks</th>
+<th>FLE-IQ3_M on FLE, % [Wilson 95 %]</th>
+<th>Qwen card, %</th>
+<th>Measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IFBench, prompt-level strict</td>
+<td>300</td>
+<td>80.3 [75.5 – 84.4]</td>
+<td>81.3 (strict or loose not stated)</td>
+<td>2026-10-07 12:25 – 19:49</td>
+</tr>
+<tr>
+<td>IFBench, prompt-level loose</td>
+<td>300</td>
+<td>83.0 [78.3 – 86.8]</td>
+<td>81.3 (strict or loose not stated)</td>
+<td>same run</td>
+</tr>
+<tr>
+<td>GPQA Diamond</td>
+<td>198</td>
+<td>88.9 [83.8 – 92.5]</td>
+<td>91.7</td>
+<td>2026-10-07 19:49 – 2026-10-08 06:44</td>
+</tr>
+<tr>
+<td>LiveCodeBench v6, 2025-02-01 to 2025-05-31</td>
+<td>131</td>
+<td>85.5 [78.5 – 90.5]</td>
+<td>91.9</td>
+<td>2026-10-08 06:46 – 21:02</td>
+</tr>
+</tbody>
+</table></div>
+<p>Source of the card values: the model card of Qwen3.8-Flash-Next (<a href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">https://huggingface.co/Qwen/Qwen3.8-Flash-Next</a>,
+revision <code>de4b8e4d43b917e7706784d8bb445c9af86a3540</code>, column &quot;Qwen3.8-Flash-Next&quot; of the language benchmark table, read
+2026-10-08). The card gives one number per benchmark and no number of runs; it states no output budget and no
+LiveCodeBench window. The intervals are Wilson 95 % intervals for a binomial proportion with the number of tasks as n;
+they describe the sampling of tasks only, not the run-to-run spread of one task at temperature 1.0, which we did not
+measure.</p>
+<p><strong>Method.</strong> All three ran through the production server (<code>llama-server</code>, port 18420, FLE-IQ3_M file, the internal
+re-trained MTP head c2, not the released untrained head (<a class="ref" href="#s4-3">Section 4.3</a>), two drafted tokens, 262,144 tokens of context
+shared by two slots, i.e. 131,072 per slot) with the build that contains patch 50 (profile <code>p50-fix</code>, in production since 2026-10-07 12:23). The harness (<code>scripts/fle/bench/rhea_gen.py</code>) sends each
+task once as a chat request with the card's thinking-mode sampling and a limit of 81,920 new tokens (an earlier Qwen
+recommendation for competition problems; the 262,144 reasoning tokens that the card's best-practice section recommends
+do not fit into a 131,072-token slot). Two requests ran in
+parallel; for LiveCodeBench, one from 2026-10-08 12:00 on. The harness ran on cores 16–31, the server on cores 0–15.
+Scoring: IFBench with the official evaluator of allenai/IFBench (strict and loose, prompt- and instruction-level);
+GPQA Diamond with our own runner in Qwen's answer format <code>&quot;answer&quot;: &quot;C&quot;</code> and the answer order of simple-evals;
+LiveCodeBench with the official <code>lcb_runner</code> (<code>release_v6</code>, prompt <code>format_prompt_generation</code>, code extraction
+<code>extract_code</code>, <code>codegen_metrics</code>, pass@1 from one sample). The LiveCodeBench window 2025-02-01 to 2025-05-31 is taken
+from Qwen's earlier model cards (Qwen3-2507), not from this card. Each stage began with a one-task smoke test. No
+answer was re-drawn or filtered. Requests that failed at transport level would be repeated by a second pass; that pass
+found nothing open in any of the three runs.</p>
+<p><strong>Invalid and truncated answers.</strong> An answer that reaches the token limit before its final answer counts as wrong and
+stays in the denominator. IFBench: none empty, none truncated. GPQA Diamond: six truncated answers. LiveCodeBench: ten
+truncated answers (details below).</p>
+<p>IFBench (300 tasks, one run, on the fixed server): all 300 answered, none empty, none at the
+length limit; output tokens median 4,427, mean 8,424, maximum 75,605. Instruction-level: strict 82.8 %, loose 85.2 %.
+Qwen's card does not say whether 81.3 is strict or loose; with a standard error of about 2.3 points for 300 tasks,
+both of our values are level with it.</p>
+<p>GPQA Diamond (198 questions, one run, Qwen's answer format <code>&quot;answer&quot;: &quot;C&quot;</code>): 176 of 198 correct, 88.9 % (Wilson 95 %
+interval 83.8–92.5), so the card's 91.7 lies inside the
+interval; the gap is 2.8 points against a standard error of about 2.2. Six answers have no letter: all six reached the
+81,920-token budget while still reasoning (all chemistry questions) and count as wrong. There were no empty answers
+and none from another conversation. If all six had been answered correctly the score would be 91.9 %. Output tokens:
+median 5,289, mean 15,191.</p>
+<p>LiveCodeBench v6 (131 problems from 2025-02-01 to 2025-05-31, one run): 112 of 131 solved, pass@1 85.5 % (Wilson 95 %
+interval 78.5–90.5). By difficulty: hard 72.1 % (44 of 61), medium 94.9 % (37 of 39), easy 100 % (31 of 31); the
+counts follow from the reported percentages and the total. The card's 91.9 lies outside the interval; the gap is 6.4
+points, about 2.1 standard errors (3.1). Of the 19 failed problems, 10 are truncations: the answer reached the
+81,920-token budget while still reasoning (<code>finish_reason = length</code>), so the final message is empty, no code is
+extracted and the problem fails. The other 9 produced code that failed the tests. Two more problems finished with
+80,241 and 81,272 tokens, just under the limit. Output tokens per problem: median 17,032, mean 26,839 (22,287 over the
+121 that finished), 3.5 million in total. If all ten truncated problems had been solved the score would be 122 of 131,
+93.1 %, above the card; so the budget could account for the whole gap, but we have not re-run with a larger budget and
+cannot say that it does. Unlike GPQA Diamond, where the card lies inside the interval, we therefore report
+LiveCodeBench as below the card.</p>
+<p><strong>Limits of these numbers.</strong> (1) One run per benchmark; the spread between runs at temperature 1.0 is unknown and the
+intervals above do not contain it. (2) The 81,920-token limit cut off 6 of 198 GPQA answers and 10 of 131
+LiveCodeBench answers that were still reasoning; the card states no budget for its benchmark runs (its best-practice
+section recommends 262,144 reasoning tokens), so the comparison is not like for like.
+(3) We did not run the unquantized model, Qwen's own harness or any other quantization on these benchmarks, so a
+difference to the card mixes quantization, engine, our harness and chance, and we cannot separate them. The benchmarks
+check the production configuration; they do not measure quantization loss (that is <a class="ref" href="#s3">Section 3</a>). (4) LiveCodeBench has
+only 131 problems in the window, 61 of them hard; the interval is wide. (5) The card's LiveCodeBench number may come
+from a different window. (6) Everything ran on one machine in one engine state.</p>
+<p><strong>A first run was invalid, and why.</strong> The first IFBench and GPQA runs (2026-10-06/07) sent their requests directly
+to the server while the gateway in front of it assigned interactive requests to slots by <code>id_slot</code>. In upstream
+<code>get_available_slot</code>, a request that names a slot which is still processing gets that slot returned; because no
+cached prompt matches, the function then runs the prompt-cache update on the busy slot (<code>prompt_save</code> and
+<code>prompt_load</code>), which replaces the KV and recurrent state of the running generation with the waiting request's cached
+prompt, on every retry until the slot is free. The running answer then continued inside another conversation or
+stopped early. Long generations were hit hardest, because their own state exceeds the prompt-cache limit, is not
+saved, and therefore never evicts the waiting entry. A canary test (<code>scripts/fle/bench/slot_kanarien.py</code>: a long
+answer on slot 0, then a request for slot 0 with a different cached conversation) flipped 3 of 3 rounds into the
+other conversation; with patch 50 (return the busy slot untouched, the caller defers the task) 0 of 3, the waiting
+request was deferred for 15–17 s and the long answer ran to its full length. Both invalid runs were discarded and all
+three benchmarks were re-run on the fixed server.</p>
+<h2 id="s6"><span class="num">6</span> Negative results</h2>
+<figure class="film" id="film-6">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-6.jpg" aria-label="Film 6: What did not work"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4">making-rhea-fast-6.mp4</a></video></div>
+<figcaption><span class="film-head">Film 6/8 · What did not work · 0:56</span><span class="film-text">Retells <a class="ref" href="#s6">Section 6</a>.</span><span class="film-links"><a href="https://youtu.be/-C8z5JmGRGE">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4">MP4, 4.2 MB</a></span></figcaption>
+</figure>
+<p><strong>Pre-gating prefetch</strong> (router top-K of layer l+1 on the input of layer l, asynchronous loads): a trace simulation
+gave +18 .. +25 % for a single stream (+24 .. +35 % with two parallel slots), assuming free room for the prefetch
+slots and leaving out the cost of the extra copies. Offline, the router inputs predicted 57–81 % of the misses one
+layer ahead (prefetch width 10 to 24), within the simulated range. Measured: −9.67 % [−11.14 .. −8.22] (bracket VL,
+reference drift −1.28 %), worse with more prefetch slots (−12.49 %, −27.34 %); the extra copies cost more than the hits
+save. Registering the memory-mapped model file in place with <code>cudaHostRegister</code> failed (0 of 3 ranges); the final
+configuration instead reads the experts into a separately allocated pinned buffer (<a class="ref" href="#s4-6">Section 4.6</a>).</p>
+<p><strong>Smaller items.</strong> N-gram drafting before MTP: −13.77 % [−18.86 .. −8.58] and −23.34 % [−30.02 .. −16.12] (bracket NG;
+acceptance falls from 78 % to 66–71 %). Low-rank kernels for the Gated Residual (patches 30/30b) were slower than the
+existing kernel chain in micro-benchmarks (49 against 28 µs per mix) and are not enabled. <code>GRAPH_OPT=1</code> changed the
+step cost by −1.7 to −0.4 %, inside the spread of the reference runs (up to 7 %). Q6_K dense weights pass quality but
+give no speed.</p>
+<p><strong>Re-training the MTP head.</strong> Head c2, re-trained by recursive self-distillation, was +4.54 % faster than the untrained
+head on the 8 tasks whose answers were in its training corpus (bracket KTC); on 16 unseen tasks the untrained head
+was +2.95 % [+1.96 .. +3.93] faster than c2 (bracket KTG), and a head trained on public prompts only (pub) was
+−1.63 % [−2.35 .. −0.91] against c2. Details in <a class="ref" href="#s4-3">Section 4.3</a>. The release ships the untrained head; measurement
+tasks and training corpus must be disjoint.</p>
+<p><strong>Rebase onto current upstream.</strong> We rebased the fork's changes onto a newer upstream commit. A first bracket (RB2)
+gave −47.21 %, but the rebased build fitted only 39 instead of 46 cache layers on the GPU. Under equal conditions
+(bracket RB3b: fit target 18300, 165 slots, 47 cache layers against 46, both 16 threads; reference drift +2.4 %)
+the rebased build is still <strong>−5.74 %</strong> [−6.87 .. −4.61], across all prompt types (code −5.0, math −6.0, physics
+−9.3, prose −4.7 %), although the rebased build accepted slightly more drafted tokens (82.1 against 81.1 %). The
+same bracket RB2 shows that the slot count alone does not explain it: our build with 165 instead of 173 slots
+−0.23 % [−1.38 .. +1.08]. We stay on the older base. Whether the loss comes from
+upstream changes or from differences in the rebased stack is not decomposed.</p>
+<p><strong>Copying part of the misses over PCIe (patch 47).</strong> Strata copies about half of the missed experts to the GPU
+instead of computing them on the CPU. Our version (a three-slot ring per layer, filled ahead of the GPU chain) served
+up to 40.6 % of the non-cached experts and lost −4.5 % decode speed (<a class="ref" href="#s5-3">Section 5.3</a>), because the copies delay the hit
+chain on the same stream. A separate copy stream with one layer of lead would be the next variant; it is not built.</p>
+<p><strong>Strata's window graph.</strong> Enqueuing a whole verification window on the GPU and signalling layers from the host
+(Strata's design) was not built: Strata's fixed time per window, 11.9 ms (95 % 8.7–15.4 ms), is not clearly below
+ours (about 15.2 ms), and the largest fixed item in it is itself a wait for the GPU (<a class="ref" href="#s5-3">Section 5.3</a>). The hand-off
+mechanism itself is cheap (1.8 µs), so the idea stays available if a later measurement shows a gap.</p>
+<p><strong>Q2_0 without a vector kernel.</strong> Before patch 45 the Q2_0 dot product had only a scalar implementation on x86,
+which made every file with Q2_0 experts slow on the CPU side: ISTA Q2_0 −25.72 %, FLE-IQ2_M −5.11 % against FLE-IQ3_M at 173
+slots; with the AVX2 kernel +3.84 % and +5.49 % at 173 slots (earlier engine state), and +8.49 % and +11.60 % in the
+final measurement at equal budget (<a class="ref" href="#s7">Section 7</a>).</p>
+<h2 id="s7"><span class="num">7</span> Comparison with public quantizations and engines</h2>
+<p>Every public GGUF of this model that fits the comparison is measured on the same chain: KLD with the neutral
+meter on the public texts E/W/K (<a class="ref" href="#s2-3">Section 2.3</a>), and speed with the FLE production configuration, where only the
+model file differs, in paired brackets against FLE-IQ3_M (groups of up to three candidates). Unsloth UD-Q6_K_XL (169 GB)
+does not fit into 120 GB of RAM and serves only as a quality ceiling for KLD.</p>
+<p>Speed is measured with the final engine (<code>p49-ring</code>) and <strong>equal budget</strong>: every file gets the same cache budget in
+bytes (17,035 MiB, what FLE-IQ3_M uses), and the slot count per layer follows from the expert size. A fixed slot count would
+not be fair, because a smaller file would leave GPU memory unused (FLE-IQ2_M with FLE-IQ3_M's 173 slots: 11.7 GB of cache
+instead of 17,035 MiB). Final brackets B3e1–B3e5 (2026-10-06 17:52–20:27, 24 paired requests each, groups of up to three
+candidates against FLE-IQ3_M, reference drift −0.30 .. +1.16 %, no invalid requests; <code>scripts/fle/bench/end_kette.sh</code>).
+FLE-IQ3_M-REAP448 followed on 2026-10-09 in bracket B3e6 (22:26–22:50, same build, budget and protocol, reference
+drift +1.64 %).
+Quants that contain Q2_0 tensors (ISTA Q2_0, FLE-IQ2_M, FLE-IQ3_XXS) depend on patch 45 (<a class="ref" href="#s6">Section 6</a>), which the final build
+contains.</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Quant</th>
+<th>Source</th>
+<th>Size (GB)</th>
+<th>KLD E</th>
+<th>KLD W</th>
+<th>KLD K</th>
+<th>Top-1 E / W / K (%)</th>
+<th>Speed vs FLE-IQ3_M, equal budget</th>
+<th>Bracket</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>UD-Q6_K_XL</td>
+<td>Unsloth</td>
+<td>169.2</td>
+<td>0.0116</td>
+<td>0.0164</td>
+<td>0.0363</td>
+<td>98.5 / 95.1 / 93.0</td>
+<td>does not fit</td>
+<td>—</td>
+</tr>
+<tr>
+<td>AD 4.27 bpw</td>
+<td>AtomicChat</td>
+<td>94.5</td>
+<td>0.079</td>
+<td>0.071</td>
+<td>0.207</td>
+<td>96.0 / 89.9 / 85.7</td>
+<td>−22.52 % [−23.28 .. −21.72]¹</td>
+<td>B3e3</td>
+</tr>
+<tr>
+<td>UD-IQ4_XS</td>
+<td>Unsloth</td>
+<td>93.7</td>
+<td>0.049</td>
+<td>0.046</td>
+<td>0.122</td>
+<td>96.8 / 91.7 / 88.6</td>
+<td>−34.74 % [−35.42 .. −34.04]¹</td>
+<td>B3e1</td>
+</tr>
+<tr>
+<td><strong>FLE-IQ3_M</strong></td>
+<td>ours</td>
+<td>88.9</td>
+<td><strong>0.051</strong></td>
+<td><strong>0.050</strong></td>
+<td><strong>0.129</strong></td>
+<td>96.9 / 91.5 / 89.1</td>
+<td>reference</td>
+<td>all</td>
+</tr>
+<tr>
+<td>IQ3_XXS</td>
+<td>bartowski</td>
+<td>88.0</td>
+<td>0.181</td>
+<td>0.106</td>
+<td>0.292</td>
+<td>92.8 / 87.6 / 82.4</td>
+<td>−1.10 % [−2.42 .. +0.19]</td>
+<td>B3e2</td>
+</tr>
+<tr>
+<td>AD 3.84 bpw</td>
+<td>AtomicChat</td>
+<td>84.9</td>
+<td>0.199</td>
+<td>0.185</td>
+<td>0.447</td>
+<td>92.6 / 83.6 / 78.6</td>
+<td>−5.99 % [−7.29 .. −4.68]¹ ²</td>
+<td>B3e2</td>
+</tr>
+<tr>
+<td>IQ3_S</td>
+<td>ISTA GSQ-RCO</td>
+<td>83.6</td>
+<td>0.069</td>
+<td>0.061</td>
+<td>0.183</td>
+<td>96.4 / 90.6 / 86.8</td>
+<td>−4.33 % [−5.54 .. −3.17]</td>
+<td>B3e1</td>
+</tr>
+<tr>
+<td><strong>FLE-IQ3_M-REAP448</strong></td>
+<td>ours</td>
+<td>82.0</td>
+<td><strong>0.080</strong></td>
+<td><strong>0.086</strong></td>
+<td><strong>0.185</strong></td>
+<td>96.0 / 89.7 / 87.2</td>
+<td>+0.71 % [−0.32 .. +1.75]⁴</td>
+<td>B3e6</td>
+</tr>
+<tr>
+<td>UD-IQ3_XXS</td>
+<td>Unsloth</td>
+<td>82.0</td>
+<td>0.091</td>
+<td>0.091</td>
+<td>0.229</td>
+<td>95.5 / 88.3 / 84.6</td>
+<td><strong>+8.61 %</strong> [+7.39 .. +9.84]</td>
+<td>B3e2</td>
+</tr>
+<tr>
+<td><strong>FLE-IQ3_XXS</strong></td>
+<td>ours</td>
+<td>79.5</td>
+<td><strong>0.090</strong></td>
+<td><strong>0.093</strong></td>
+<td><strong>0.227</strong></td>
+<td>95.7 / 88.1 / 84.2</td>
+<td>−0.69 % [−2.07 .. +0.57]</td>
+<td>B3e5</td>
+</tr>
+<tr>
+<td>UD-Q2_K_XL</td>
+<td>Unsloth</td>
+<td>78.9</td>
+<td>0.133</td>
+<td>0.125</td>
+<td>0.299</td>
+<td>94.4 / 85.5 / 81.7</td>
+<td>+0.57 % [−0.83 .. +1.90]</td>
+<td>B3e4</td>
+</tr>
+<tr>
+<td>IQ3_XXS</td>
+<td>ISTA GSQ-RCO</td>
+<td>75.8</td>
+<td>0.118</td>
+<td>0.112</td>
+<td>0.264</td>
+<td>95.0 / 87.4 / 83.6</td>
+<td>−0.37 % [−2.18 .. +1.40]³</td>
+<td>B3e1</td>
+</tr>
+<tr>
+<td>UD-IQ1_M</td>
+<td>Unsloth</td>
+<td>74.5</td>
+<td>0.189</td>
+<td>0.186</td>
+<td>0.413</td>
+<td>92.6 / 83.4 / 79.5</td>
+<td>+2.26 % [+0.41 .. +3.94]³</td>
+<td>B3e4</td>
+</tr>
+<tr>
+<td><strong>FLE-IQ2_M</strong></td>
+<td>ours</td>
+<td>71.6</td>
+<td><strong>0.160</strong></td>
+<td><strong>0.163</strong></td>
+<td><strong>0.339</strong></td>
+<td>94.0 / 84.7 / 80.9</td>
+<td><strong>+11.60 %</strong> [+9.78 .. +13.39]³</td>
+<td>B3e5</td>
+</tr>
+<tr>
+<td>IQ2_XS</td>
+<td>ISTA GSQ-RCO</td>
+<td>68.0</td>
+<td>0.179</td>
+<td>0.191</td>
+<td>0.382</td>
+<td>93.0 / 83.6 / 80.3</td>
+<td><strong>+13.85 %</strong> [+11.22 .. +16.67]³</td>
+<td>B3e3</td>
+</tr>
+<tr>
+<td>Q2_0</td>
+<td>ISTA GSQ-RCO</td>
+<td>66.4</td>
+<td>0.223</td>
+<td>0.236</td>
+<td>0.485</td>
+<td>92.4 / 82.3 / 77.7</td>
+<td>+8.49 % [+6.23 .. +10.76]³</td>
+<td>B3e3</td>
+</tr>
+</tbody>
+</table></div>
+<p>¹ Too large for the budget: only 48 (AD 3.84), 47 (AD 4.27) or 46 (UD-IQ4_XS) of 49 layers fit on the GPU.
+² 1 of 24 answers hit the length limit. ³ 2 of 24 answers hit the length limit (FLE-IQ2_M: 3 of 24); FLE-IQ3_M: none.
+⁴ Measured cold like all candidates (see below); with its own warm-start profile +0.53 % [−0.59 .. +1.73].
+All arms ran with the internal MTP head c2 (<a class="ref" href="#s4-3">Section 4.3</a>). MTP acceptance in B3e5: FLE-IQ3_M 81.6 %, FLE-IQ2_M 81.5 %,
+FLE-IQ3_XXS 77.9 %. Prefill at 8.6k tokens: 1,197–1,363 tokens/s for all
+files that fit completely (FLE-IQ3_M 1,233–1,254).</p>
+<p>Reading: at equal budget the speed order roughly follows the expert size, as expected for a decoder whose misses run
+on the CPU, but the CPU kernel per quant type decides the details: ISTA's IQ3_XXS and IQ3_S, the main donors of
+FLE-IQ3_XXS, are not faster than FLE-IQ3_M despite being 13 and 5 GB smaller, while Unsloth's UD-IQ3_XXS is +8.6 %. Quality follows
+the KLD columns. FLE-IQ3_XXS matches UD-IQ3_XXS in KLD at 2.5 GB less but is slower (−0.7 % against +8.6 %); FLE-IQ2_M is
++11.6 % at a KLD below every public file of similar size; ISTA IQ2_XS is slightly faster (+13.9 %) at a clearly
+higher KLD. The small files hit the length limit more often in the greedy speed prompts, a hint of repetition loops
+at low bit widths. The cause of the per-type differences (CPU kernel, slot count, MTP acceptance) is not decomposed.</p>
+<p><strong>Cold candidates.</strong> The warm-start profile (<a class="ref" href="#s4-1">Section 4.1</a>) belongs to FLE-IQ3_M; every other file rejects it at start
+(<code>written for a different model</code>) and begins with equal slot counts. In the first 512 steps the cold candidates hit
+67–68 % of their lookups in the cache, the warm reference 93.7 %. The warm start is worth +1.49 % [+0.64 .. +2.41]
+for FLE-IQ3_M (bracket CG), so the candidates in B3e1–B3e5 may be disadvantaged by up to about this amount. B3e6
+measured FLE-IQ3_M-REAP448 both ways, cold (+0.71 %) and with the profile its cold arm had written (+0.53 %); with 24
+requests the two cannot be told apart. Differences of one to two percent in the table should not be read as a ranking.</p>
+<p>Sizes of the public files are the totals of their GGUF splits as listed on Hugging Face; the FLE stages are the
+sizes of the built files. Publishers' own quality numbers (AtomicChat's KLD on its own corpus, ISTA's task
+benchmarks) are not comparable to ours and are not used.</p>
+<p>Engines: upstream llama.cpp is measured in <a class="ref" href="#s5-1">Section 5.1</a> and Strata in <a class="ref" href="#s5-3">Section 5.3</a>. ik_llama.cpp and KTransformers
+were not measured, and we make no claim about their speed on this model.</p>
+<h2 id="s8"><span class="num">8</span> Related work</h2>
+<p>Offloading MoE experts between GPU and CPU: Fiddler [Kamahori et al., arXiv:2402.07033] orchestrates CPU and GPU
+so that experts in host memory are computed on the CPU instead of moving their weights; Mixtral offloading [Eliseev &amp;
+Mazur, arXiv:2312.17238] combines an LRU expert cache with speculative loading and mixed quantization; MoE-Infinity
+[Xue et al., arXiv:2401.14361] guides expert caching and prefetching by traced activation patterns; HybriMoE [Zhong et
+al., arXiv:2504.05897] balances expert computation between CPU and GPU with impact-driven prefetching and score-based
+caching. HOBBIT [Tang et al., arXiv:2411.01433] replaces less critical cache-miss experts with low-precision copies and
+adds layer-level prefetching and a multidimensional expert cache on top of llama.cpp. MoE-SpAc [Li et al.,
+arXiv:2603.09983] uses speculative decoding as a look-ahead for expert utility that drives prefetching, eviction and
+CPU/GPU balancing, and SpecMoEOff [Wang et al., arXiv:2508.21706] uses it to raise the work per offloaded expert. Like
+HOBBIT, FLE is built on llama.cpp; it differs in running IQ-quantized GGUF files of one model on a single 32 GB card,
+in drafting with the model's own MTP head, and in measuring every step in paired brackets, including an attempt to
+re-train that head that did not generalize (<a class="ref" href="#s4-3">Section 4.3</a>).</p>
+<p>FLE builds directly on four projects. <strong>ik_llama.cpp</strong> (Kawrakow, MIT): the trellis quant types IQ2/3/4_KT and
+their CUDA dequantization are taken over essentially verbatim (<code>NOTICE-ik_llama.md</code> in the engine repository). <strong>FreeToken</strong> [Yang et al.,
+arXiv:2608.16157; code by FlashML-org, Apache 2.0]: the bandwidth-matched split of missed experts between PCIe
+transfers and CPU execution, the default rule of its profiler that chooses hybrid execution when the CPU bandwidth
+exceeds twice the PCIe bandwidth, and the hybrid expert path are re-implemented in C++, with a provenance note in each
+file. <strong>KTransformers</strong> (Apache 2.0): the idea of computing cold experts with optimized CPU operators next to a
+GPU-resident hot set; an experimental port of its CPU operators was never part of the build and is not shipped.
+<strong>Strata</strong> (Niko1221, MIT): the slot-release change (<a class="ref" href="#s4-6">Section 4.6</a>) and further scheduling ideas, with file and line
+references in each commit. The pairing of two quant blocks per
+512-bit vector in llama.cpp PR #27590 (&quot;ggml-cpu: add AVX-512 and VNNI paths for Q5_K/Q6_K dot products&quot;, still open)
+informed our AVX-512 IQ4_NL dot product on the CPU side of the expert path. Quantization: importance matrix and IQ
+quants in llama.cpp [Kawrakow, llama.cpp #4861 (importance matrix), #4897 (IQ2 quantization with an importance
+matrix), #5590 (IQ4_NL), #5676 (IQ3_S, IQ3_M)]; GSQ and RCO as above.</p>
+<h2 id="s9"><span class="num">9</span> Limitations and reproducibility</h2>
+<p>One model, one machine; effects of policies tuned on this hardware may not transfer. The task benchmarks
+(<a class="ref" href="#s5-4">Section 5.4</a>) are single runs with a 81,920-token output limit, without a run of the unquantized model, so they
+do not separate quantization loss from engine, harness and chance; LiveCodeBench is below Qwen's card. The MKQA
+probe (<a class="ref" href="#s3">Section 3</a>) checks short factual answers only, with one sampled answer per question, and was run on the pruned
+files, FLE-IQ3_M and FLE-IQ3_XXS, not on FLE-IQ2_M or the public files. Builds,
+patches, scripts and raw data are listed in <a class="ref" href="#appendix-a">Appendix A</a>; the gaps found in the inventory are listed there too.</p>
+<p><strong>Availability.</strong> The engine is published as FastLocalExperts at <a href="https://github.com/sirfyyn/FastLocalExperts">https://github.com/sirfyyn/FastLocalExperts</a> under
+the MIT license of llama.cpp; tag <code>v1.0</code> is the configuration measured here (final profile <code>p49-ring</code>) plus the slot
+fix of patch 50 and the crash report of patch 51, neither of which changes the computation. The GGUF files, the MTP
+head, the films and the SHA-256 of every file are at <a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF</a>,
+under the Qwen Community License 1.0 of the base model. The raw measurement data are not part of this release.</p>
+<h2 id="appendix-a">Appendix A: evidence table</h2>
+<p>State of the inventory of 2026-10-03, extended 2026-10-07. Paths are on the measurement machine unless they start with <code>docs/</code> or
+<code>scripts/</code> (this repository). Snapshot of the scripts: <code>scripts/fle/titan-stand-20261003/</code>.</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Claim</th>
+<th>Raw data</th>
+<th>Evaluation</th>
+<th>Bracket spec</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>END2 +58.53 %</td>
+<td><code>/mnt/perf/rhea-m2-20260929/</code> (END2 runs)</td>
+<td><code>docs/fle/paper/belege/END2-gepaart.txt</code></td>
+<td>missing</td>
+<td>recomputed 2026-10-03</td>
+</tr>
+<tr>
+<td>ALL2 overlap / MTP head</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/ALL2-gepaart.txt</code></td>
+<td><code>m2spec-ALL2.txt</code></td>
+<td>recomputed 2026-10-03</td>
+</tr>
+<tr>
+<td>P35Q micro-batch 1024</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/P35Q-gepaart.txt</code></td>
+<td><code>m2spec-P35Q.txt</code></td>
+<td>recomputed; <code>compare-P35Q.json</code> is empty</td>
+</tr>
+<tr>
+<td>NM2 n-max 1/3/6</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/NM2-gepaart.txt</code></td>
+<td>missing</td>
+<td><strong>invalid</strong> (drift −5.88 %), not cited</td>
+</tr>
+<tr>
+<td>HZ2 cache policy +12.15 %</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/HZ2-gepaart.txt</code></td>
+<td>missing</td>
+<td>recomputed 2026-10-04, confirmed</td>
+</tr>
+<tr>
+<td>VK 32k vocabulary +4.14 %</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/VK-gepaart.txt</code></td>
+<td><code>m2spec-VK.txt</code></td>
+<td>recomputed 2026-10-04, confirmed</td>
+</tr>
+<tr>
+<td>VL pre-gating −9.67 %</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/VL-gepaart.txt</code></td>
+<td><code>m2spec-VL.txt</code></td>
+<td>recomputed 2026-10-04; drift −1.28 % (status document right, compare file wrong)</td>
+</tr>
+<tr>
+<td>NG n-gram drafting</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/NG-gepaart.txt</code></td>
+<td><code>m2spec-NG.txt</code></td>
+<td>recomputed 2026-10-04</td>
+</tr>
+<tr>
+<td>KTC head c2 +4.54 % (on its training tasks)</td>
+<td><code>/mnt/perf/rhea-mtp-train-20261001/</code></td>
+<td><code>docs/fle/paper/belege/KTC-gepaart.txt</code></td>
+<td><code>m2spec-KTC.txt</code></td>
+<td>recomputed 2026-10-04; <strong>corrected</strong> from +4.92 % (not reproducible; c3 gives +4.90 %)</td>
+</tr>
+<tr>
+<td>KTF untrained head +1.61 %, pub −0.11 % vs c2 (unseen tasks, separate warm-start profiles)</td>
+<td><code>/mnt/perf/rhea-mtp-train-20261001/</code></td>
+<td><code>docs/fle/paper/belege/KTF-gepaart.txt</code></td>
+<td>—</td>
+<td>confounded by the separate profiles; repeated as KTG</td>
+</tr>
+<tr>
+<td>KTG untrained head +2.95 %, pub −1.63 % vs c2 (unseen tasks, same profile)</td>
+<td><code>/mnt/perf/rhea-mtp-train-20261001/</code></td>
+<td><code>docs/fle/paper/belege/KTG-gepaart.txt</code></td>
+<td>—</td>
+<td>measured 2026-10-09 15:14–16:09; basis of the head choice</td>
+</tr>
+<tr>
+<td>B1b mainline −61.29 % (FLE 2.58×, <code>p43-pin</code>)</td>
+<td><code>/mnt/perf/rhea-m2-20260929/</code> (B1b runs)</td>
+<td><code>docs/fle/paper/belege/B1b-gepaart.txt</code></td>
+<td><code>scripts/fle/bench/b1_kette.sh</code></td>
+<td>measured 2026-10-05; superseded by B1e</td>
+</tr>
+<tr>
+<td>B1e mainline ub1024 −59.87 %, ub4096 −64.01 %, prefill (<a class="ref" href="#s5-1">Section 5.1</a>)</td>
+<td><code>/mnt/perf/fle-end/</code></td>
+<td><code>B1e-gepaart.txt</code>, <code>B1e-prefill.txt</code></td>
+<td><code>scripts/fle/bench/end_kette.sh</code></td>
+<td>final measurement 2026-10-06</td>
+</tr>
+<tr>
+<td>B3e1–B3e5 all quants, equal budget (<a class="ref" href="#s7">Section 7</a>)</td>
+<td><code>/mnt/perf/fle-end/</code></td>
+<td><code>B3e&lt;n&gt;-gepaart.txt</code>, <code>B3e&lt;n&gt;-prefill.txt</code></td>
+<td><code>scripts/fle/bench/end_kette.sh</code></td>
+<td>final measurement 2026-10-06</td>
+</tr>
+<tr>
+<td>S Strata vs FLE <code>p49-ring</code> (<a class="ref" href="#s5-3">Section 5.3</a>)</td>
+<td><code>/mnt/perf/fle-end/</code></td>
+<td><code>S-auswertung.txt</code>, <code>scripts/fle/fusion/v12_strata_fle.py</code></td>
+<td><code>scripts/fle/bench/end_kette.sh</code></td>
+<td>final measurement 2026-10-06, unpaired means of per-task medians</td>
+</tr>
+<tr>
+<td>W7 ubatch lending (patch 48)</td>
+<td><code>/mnt/perf/fle-release/</code></td>
+<td><code>W7-gepaart.txt</code>, <code>W7-prefill.txt</code></td>
+<td><code>scripts/fle/fusion/w7_kette.sh</code></td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>W49c prefetch ring (patch 49), W49n/W49n2 timelines</td>
+<td><code>/mnt/perf/fle-release/</code></td>
+<td><code>w49_kette.sh</code> output, <code>w49n_fenster.py</code></td>
+<td><code>scripts/fle/fusion/w49_kette.sh</code></td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>PC PCIe share of misses (patch 47) −4.46 %</td>
+<td><code>/mnt/perf/fle-release/</code></td>
+<td><code>PC-gepaart.txt</code></td>
+<td><code>scripts/fle/fusion/pc_kette.sh</code></td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>Slot contamination and patch 50 (<a class="ref" href="#s5-4">Section 5.4</a>)</td>
+<td><code>/mnt/perf/rhea-bench/ungueltig-20261007/</code></td>
+<td><code>scripts/fle/bench/slot_kanarien.py</code></td>
+<td><code>scripts/fle/bench/rhea_p50_umstellen.sh</code></td>
+<td>canary 3/3 flips before, 0/3 after, 2026-10-07</td>
+</tr>
+<tr>
+<td>Standard benchmarks (<a class="ref" href="#s5-4">Section 5.4</a>)</td>
+<td><code>/mnt/perf/rhea-bench/{ifbench,gpqa,lcb}/</code> (<code>gen.jsonl</code>, <code>gen.log</code>), chain log <code>kette.log</code></td>
+<td><code>ifbench/eval.txt</code>, <code>gpqa/ergebnis.json</code>, <code>lcb/ergebnis.json</code>, <code>lcb/score.txt</code>; token statistics from <code>*/gen.log</code></td>
+<td><code>scripts/fle/bench/bench_kette.sh</code>, <code>rhea_gen.py</code>, <code>bench_daten.py</code></td>
+<td>measured 2026-10-07/08 on <code>p50-fix</code>; one run each; raw data not copied into the repository</td>
+</tr>
+<tr>
+<td>mainline + MTP not loadable</td>
+<td>—</td>
+<td>—</td>
+<td><code>scripts/fle/bench/b1_mtp_probe.sh</code>, <code>b1_mtp_probe_gpu0.sh</code></td>
+<td>smoke test 2026-10-05</td>
+</tr>
+<tr>
+<td>HY slot count (FLE-IQ3_M against UD-IQ4_XS)</td>
+<td><code>/mnt/perf/rhea-m2-20260929/</code> (HY runs; <code>mem_high_events</code> in the block manifests)</td>
+<td><code>docs/fle/paper/belege/HY-gepaart.txt</code></td>
+<td>missing</td>
+<td><strong>invalid</strong>: memory-high events in all three candidate arms and none in the reference arms, output limit 4,096 instead of 8,192, 19 paired requests; not cited (<a class="ref" href="#s4-1">Section 4.1</a>)</td>
+</tr>
+<tr>
+<td>RB2 16 threads +5.23 %, rebase −47.21 %</td>
+<td><code>/mnt/perf/fle-rebase-probe-20261002/</code></td>
+<td><code>docs/fle/paper/belege/RB2-gepaart.txt</code></td>
+<td>—</td>
+<td>measured 2026-10-05</td>
+</tr>
+<tr>
+<td>RB3b rebase fair −5.74 %</td>
+<td>same</td>
+<td><code>docs/fle/paper/belege/RB3b-gepaart.txt</code></td>
+<td><code>scripts/fle/strata-20261005/rb3_kette.sh</code></td>
+<td>measured 2026-10-05</td>
+</tr>
+<tr>
+<td>Pinned experts (W3 stage 1b)</td>
+<td><code>/mnt/perf/fle-fusion/messungen/w3s1b-20261005-141156/</code></td>
+<td><code>scripts/fle/fusion/w3_klammer.py</code></td>
+<td>—</td>
+<td>alternating arms, medians; the decode gain was not repeated in a paired bracket</td>
+</tr>
+<tr>
+<td>Patch 43 slot release −202.5 ms</td>
+<td><code>/mnt/perf/fle-fusion/messungen/w1-20261005-130045/</code> (<code>zusammenfassung.txt</code>, <code>ergebnis.json</code>)</td>
+<td><code>docs/current/RHEA-STRATA-UEBERNAHME.md</code></td>
+<td>—</td>
+<td>alternating arms (24 slot switches per arm); bootstrap 95 % over pooled medians −217 .. −164 ms</td>
+</tr>
+<tr>
+<td>Public texts E/W/K</td>
+<td><code>/mnt/perf/b6-texte/</code> (<code>quellen.json</code> with SHA-256)</td>
+<td><code>scripts/fle/bench/b6_texte.py</code></td>
+<td>—</td>
+<td>built 2026-10-05</td>
+</tr>
+<tr>
+<td>KLD comparison (<a class="ref" href="#s7">Section 7</a>)</td>
+<td><code>/mnt/perf/b2-kld/oeff/</code> (<code>kld-*-{E,W,K}.log</code>)</td>
+<td><code>scripts/fle/bench/b2_kld.sh</code></td>
+<td>—</td>
+<td>measured 2026-10-05/06, incl. UD-Q6_K_XL</td>
+</tr>
+<tr>
+<td>Expert pruning REAP/MAN, KLD and MKQA probe (<a class="ref" href="#s3">Section 3</a>)</td>
+<td><code>/mnt/perf/rhea-reap/</code> (<code>reap-g3.tsv</code>, <code>kld-*-{E,W,K}.log</code>, <code>proben-*.jsonl</code>, <code>*.manifest.json</code>, <code>kette.log</code>)</td>
+<td><code>ergebnis.txt</code> / <code>ergebnis.json</code> (<code>bin/reap_auswerten.py</code>)</td>
+<td><code>bin/reap_kette.sh</code>, <code>reap_kalib.py</code>, <code>reap_proben_bauen.py</code>, <code>reap_probe.py</code></td>
+<td>measured 2026-10-08 21:14–23:01; G3/FLE-Q3 KLD taken from <code>/mnt/perf/b2-kld/oeff/</code></td>
+</tr>
+<tr>
+<td>FLE-IQ3_XXS / FLE-IQ2_M selection and build (built as Q3 / Q2; the Q1 class was dropped)</td>
+<td><code>/mnt/fastmodels/b8-hybride/</code> (<code>FLE-Q3.auswahl.json</code>, <code>FLE-Q3.bau.log</code>), <code>/mnt/perf/b8-hybride/</code> (<code>FLE-Q2.*</code>, <code>FLE-Q1.bau.log</code>), chain log <code>/mnt/perf/b2-kld/oeff/kette.log</code></td>
+<td><code>scripts/fle/bench/b8_auswahl.py</code> (released as <code>tools/fle-hybrid/fle_select.py</code>), <code>gguf_splice.py</code></td>
+<td>—</td>
+<td>built 2026-10-05 (FLE-IQ3_XXS 16:52–16:54, FLE-IQ2_M 18:26–18:28), 79,483,799,936 and 71,617,465,600 bytes; SHA-256 of the build files in <code>rhea-publish/SHA256SUMS</code> (2026-10-08) and of the published splits in <code>rhea-publish/hf/SHA256SUMS</code> (2026-10-09); the layer provenance check of 2026-10-07 is described in the model card, its raw output was not archived</td>
+</tr>
+<tr>
+<td>Speed comparison, 173 slots (<a class="ref" href="#s7">Section 7</a>)</td>
+<td><code>/mnt/perf/b3-tempo/</code></td>
+<td><code>B3m&lt;n&gt;-gepaart.txt</code>, <code>B3w1-gepaart.txt</code></td>
+<td><code>scripts/fle/bench/b3_kette.sh</code></td>
+<td>measured 2026-10-05/06; superseded by B3e</td>
+</tr>
+<tr>
+<td>Speed comparison, equal budget (<a class="ref" href="#s7">Section 7</a>)</td>
+<td><code>/mnt/perf/b3-tempo/</code>, <code>/mnt/perf/fle-fusion/tore/</code></td>
+<td><code>B3s1</code>–<code>B3s4-gepaart.txt</code>, <code>B3sP-gepaart.txt</code></td>
+<td><code>scripts/fle/fusion/b3sp_kette.sh</code></td>
+<td>measured 2026-10-06; superseded by B3e</td>
+</tr>
+<tr>
+<td>Patch 45 AVX2 Q2_0</td>
+<td><code>/mnt/perf/fle-fusion/tore/</code></td>
+<td><code>P45-gepaart.txt</code></td>
+<td>—</td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>Strata vs FLE: decode, prefill, TTFT, window timing (<a class="ref" href="#s5-3">Section 5.3</a>)</td>
+<td><code>/mnt/perf/fle-fusion/tore/</code> (<code>v12.jsonl</code>)</td>
+<td><code>scripts/fle/fusion/v12_auswerten.py</code>, <code>v1_achse.py</code></td>
+<td><code>scripts/fle/fusion/tore_kette.sh</code></td>
+<td>measured 2026-10-06, unpaired means of per-task medians</td>
+</tr>
+<tr>
+<td>Doorbell hand-off 1.8 µs</td>
+<td><code>/mnt/perf/fle-fusion/tore/</code></td>
+<td>—</td>
+<td><code>a0_doorbell.cu</code></td>
+<td>measured 2026-10-06 (16 GB card)</td>
+</tr>
+<tr>
+<td>Patch 44 budget and warm start (bracket CG)</td>
+<td><code>/mnt/perf/fle-fusion/tore/</code></td>
+<td><code>CG-gepaart.txt</code></td>
+<td><code>scripts/fle/fusion/cg_kette.sh</code></td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>Miss sensitivity (bracket V6b)</td>
+<td><code>/mnt/perf/fle-fusion/tore/</code></td>
+<td><code>V6b-gepaart.txt</code></td>
+<td><code>scripts/fle/fusion/v6_nach.sh</code></td>
+<td>measured 2026-10-06</td>
+</tr>
+<tr>
+<td>FLE-IQ3_M KLD (F/E/V), acceptance (<a class="ref" href="#s3">Section 3</a>)</td>
+<td>decode mode, own build, GPU0 (2026-09-30): <code>rhea-kld-20260929/kld-dec14-{G3-CB001ADMEVs173,U-CTRL}-{F,E,V}.log</code>; files alone, own build: same folder, <code>kld-G3-*.log</code>, <code>kld-U-*.log</code>, <code>kld-moe2-U-CTRL-V.log</code>; neutral meter, GPU1 (2026-10-05): <code>/mnt/perf/b2-kld/kld-{g3,unsloth-iq4xs}-{F,E,V}.log</code></td>
+<td>—</td>
+<td>—</td>
+<td>verified 2026-10-09 against the logs; the folder <code>rhea-kld-20260929</code> moved to the cold store on TrueNAS (<code>/mnt/Files/titan-coldstore/rhea-quant-history-20260930/</code>, manifest <code>manifest.tsv</code>)</td>
+</tr>
+<tr>
+<td>Rejected quantization candidates (<a class="ref" href="#s3">Section 3</a>)</td>
+<td>cold store <code>rhea-kld-20260929/</code>: <code>kld-{CTRL,HCQ8,FRONTIER}-F.log</code> (own full quantizations), <code>kld-G3q5-*.log</code>, <code>kld-half-U-K8-*-F.log</code>, <code>kld-dec14-G3-CB002ADMEVs173-*.log</code>, <code>kld-G4-*.log</code>, <code>kld-G6-*.log</code></td>
+<td>—</td>
+<td><code>hybrid_candidates2.json</code> (G3 = budget 0.12, G4 = 0.25), <code>hybrid_candidates2_cap007.json</code> (G6)</td>
+<td>verified 2026-10-09 against the logs</td>
+</tr>
+<tr>
+<td>FLE-IQ3_M selection recomputed with the knapsack (<a class="ref" href="#s3">Section 3</a>)</td>
+<td><code>/mnt/perf/fle-end/g3probe.auswahl.json</code></td>
+<td><code>docs/fle/paper/belege/g3probe.auswahl.json</code></td>
+<td><code>scripts/fle/bench/b8_auswahl.py</code> (target 88.87 GB, sources UD-IQ4_XS, ISTA IQ3_S, ISTA IQ3_XXS; predictors <code>rhea-heal-20260929/qs*/quant_sensitivity.json</code>)</td>
+<td>computed 2026-10-09; compared with the layer lists of <code>hybrid_candidates2.json</code> budget 0.12</td>
+</tr>
+<tr>
+<td>Noise floor (<a class="ref" href="#s2-3">Section 2.3</a>)</td>
+<td><code>/mnt/perf/rhea-p35-ursache-20261003/</code> (<code>kld-g1aus-V.log</code>, <code>kld-g1aus2-V.log</code>, <code>kld-fa-aus-V.log</code>, <code>kld-c4-ub2048-V.log</code>); GPU0 value from the cold store, <code>kld-G3-V.log</code></td>
+<td>—</td>
+<td><code>scripts/fle/titan-kld-20260929/kld_g1_p35*.sh</code></td>
+<td>measured 2026-10-03 (GPU0 value 2026-09-30)</td>
+</tr>
+<tr>
+<td>Prefill at 8.6k about 425 against 280 tokens/s (patch 35), follow-up turn 2.4 s / 17.5 s (patches 39/39b)</td>
+<td><code>/mnt/perf/rhea-p35-reihe-20261003/</code> (<code>pf-p35aus-512.txt</code>, <code>pf-p35an-1024.txt</code>, <code>prefill.jsonl</code>), <code>/mnt/perf/rhea-p35p-reihe-20261003/</code> (<code>pf-p1024ft.txt</code>, <code>reihe.log</code>); follow-up turn: <code>rhea.service</code> journal of 2026-10-03 17:08 and <code>/mnt/perf/rhea-zeitprofil-20261003/folgeturn.log</code></td>
+<td><code>prefill-kurz.txt</code> in both folders; <code>docs/fle/paper/belege/folgeturn.log</code></td>
+<td><code>docs/fle/paper/belege/folgeturn_probe_20261003.py</code></td>
+<td>measured 2026-10-03; two cold runs per arm; the follow-up turn is a single probe whose output went to the terminal, its numbers come from the journal and the observer log</td>
+</tr>
+<tr>
+<td>Cycle model and Nsight profile (<a class="ref" href="#s4-4">Section 4.4</a>)</td>
+<td>NM blocks <code>/mnt/perf/rhea-m2-20260929/blocks/NM-*/results.jsonl</code>, <code>compare-MA.json</code>; <code>/mnt/perf/rhea-zeitprofil-20261003/</code> (<code>ns-prod.txt</code>, <code>uebergaben-prod.txt</code>)</td>
+<td><code>docs/fle/rhea-verifikation-mathe-2026-09-30.md</code> (cycle model); <code>docs/fle/paper/belege/ns-prod.txt</code>, <code>uebergaben-prod.txt</code></td>
+<td>—</td>
+<td>NM measured 2026-09-30 (base build), profile 2026-10-04 22:37 (production build <code>rhea-prod-20261003</code>); cycles recomputed 2026-10-09</td>
+</tr>
+<tr>
+<td>Pre-gating simulation and router recall (<a class="ref" href="#s6">Section 6</a>)</td>
+<td>trace <code>rhea-expert-trace-long-20260923</code>; <code>/mnt/perf/rhea-pregating-20261003/20261003-020130.ergebnis.txt</code></td>
+<td><code>scripts/fle/verify_sim_ab.py</code>, output <code>docs/fle/verify-math-2026-09-30/verify_sim_ab-2026-10-02.txt</code></td>
+<td>—</td>
+<td>simulation 2026-10-02; extra copies not modelled</td>
+</tr>
+<tr>
+<td>FLE-IQ3_M-REAP448 speed, cold and warm (bracket B3e6)</td>
+<td><code>/mnt/perf/fle-end/</code> (<code>pause-20261009.log</code>, <code>profil-B3e6-*.txt</code>), blocks <code>/mnt/perf/rhea-m2-20260929/blocks/B3e6-*</code></td>
+<td><code>docs/fle/paper/belege/B3e6-gepaart.txt</code></td>
+<td><code>m2spec-B3e6.txt</code>, <code>pause_b3e6.sh</code></td>
+<td>measured 2026-10-09 22:26–22:50 with the <code>p49-ring</code> build; the old <code>compare-quant</code> step refuses brackets whose reference arms load different slot plans (<code>compare-B3e6.json</code> is empty), as in all budget brackets</td>
+</tr>
+<tr>
+<td>Engine build</td>
+<td><code>/mnt/perf/fle-p3334-20260930/</code></td>
+<td>—</td>
+<td>—</td>
+<td>build folders are not git repositories; patches 26/29/37/38/39 not in the overlay; manifest missing</td>
+</tr>
+</tbody>
+</table></div>
+<h2 id="appendix-b">Appendix B: supplementary films</h2>
+<p>Eight short films, <em>Making Rhea Fast</em> (English, subtitles burned in, 6 min 59 s in total), retell <a class="ref" href="#s2-4">Sections 2.4</a> to 6 for
+readers who prefer to watch. They were generated from the measurement database (6,130 measurements, state of
+2026-10-08) and contain no number that is not in this paper or its evidence, except for the two corrections to film 6
+below; where a film words or rounds a number differently, the text and <a class="ref" href="#appendix-a">Appendix A</a> are the reference. Files and SHA-256 are in the model repository under <code>media/</code>
+(<a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/tree/main/media">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/tree/main/media</a>); the same films are on YouTube as one
+playlist (<a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ</a>).</p>
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Film</th>
+<th>Retells</th>
+<th>File</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="#film-1">1 The race</a></td>
+<td><a class="ref" href="#s5-1">Section 5.1</a> (B1e), 5.2 (END2), 5.3</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-1.mp4"><code>making-rhea-fast-1.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-2">2 The bracket</a></td>
+<td><a class="ref" href="#s2-4">Section 2.4</a>, the 47 brackets of 2026-10-03 to 08 and the two void ones (NM2, B3m1)</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-2.mp4"><code>making-rhea-fast-2.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-3">3 The staircase</a></td>
+<td><a class="ref" href="#s4-1">Sections 4.1</a> to 4.6, step by step</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-3.mp4"><code>making-rhea-fast-3.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-4">4 The expert cache</a></td>
+<td><a class="ref" href="#s4-1">Sections 4.1</a> and 4.4, bracket V6b, warm start (CG)</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.mp4"><code>making-rhea-fast-4.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-5">5 Draft and verify</a></td>
+<td><a class="ref" href="#s4-3">Sections 4.3</a> and 4.4; shows how the re-trained head c2 learned (made before brackets KTF/KTG; the release ships the untrained head because c2's gain held only on its training tasks, <a class="ref" href="#s4-3">Section 4.3</a>)</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4"><code>making-rhea-fast-5.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-6">6 What did not work</a></td>
+<td><a class="ref" href="#s6">Section 6</a></td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4"><code>making-rhea-fast-6.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-7">7 The rebench</a></td>
+<td><a class="ref" href="#s5-4">Section 5.4</a></td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.mp4"><code>making-rhea-fast-7.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-8">8 Why we do this</a></td>
+<td><a class="ref" href="#s2-1">Section 2.1</a>, the release</td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.mp4"><code>making-rhea-fast-8.mp4</code></a></td>
+</tr>
+<tr>
+<td><a href="#film-complete">all eight in one file</a></td>
+<td></td>
+<td><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4"><code>making-rhea-fast-complete.mp4</code></a></td>
+</tr>
+</tbody>
+</table></div>
+<figure class="film" id="film-complete">
+<div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-1.jpg" aria-label="All 8 films in one file"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4">making-rhea-fast-complete.mp4</a></video></div>
+<figcaption><span class="film-head">All 8 films in one file · 6:59</span><span class="film-links"><a href="https://youtu.be/XORhN-U4mNM">YouTube</a><a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">Playlist</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4">MP4, 43.1 MB</a></span></figcaption>
+</figure>
+<p>Corrections to film 6, found when the paper was checked against the raw data after the films were made: the film
+shows the simulated gain of pre-gating as +18 … +35 %, but +35 % holds only for two parallel slots, a single stream
+gives +18 .. +25 % (<a class="ref" href="#s6">Section 6</a>); and it shows a forecast of ±1.5 % for copying misses over PCIe, while the forecast
+written down before that measurement was +3 .. +10 % (<a class="ref" href="#s5-3">Section 5.3</a>).</p>
+<h2 id="appendix-c">Appendix C: all paired brackets</h2>
+<p>Every paired bracket whose evaluation is in <code>docs/fle/paper/belege/</code>, in the order of measurement. <em>Speed</em> is the
+paired change in decode speed of the candidate against the reference (positive = faster) with its bootstrap 95 %
+interval; <em>drift</em> is the change in time per token of the reference between its run before and its run after the
+candidates; <em>n</em> is the number of paired requests. A bracket is valid only if the drift stays within ±5 % (Section
+2.4). <em>Cited in</em> lists the sections that name the bracket (A and B are the appendices). Dates are local time (CEST)
+of the first reference run. The table is generated by <code>scripts/fle/release/klammer_tabelle.py</code> from the evaluations
+and <code>belege/klammern.json</code>. Strata against FLE (S, <a class="ref" href="#s5-3">Section 5.3</a>) and the cycle-model runs (NM, <a class="ref" href="#s4-4">Section 4.4</a>) are not
+paired brackets and are not listed.</p>
+<!-- klammer_tabelle:start -->
+<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
+<thead>
+<tr>
+<th>Bracket</th>
+<th>Date</th>
+<th>Reference (drift)</th>
+<th>Candidate</th>
+<th>Speed vs reference [95 % CI]</th>
+<th>n</th>
+<th>Cited in</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ALL2</td>
+<td>2026‑09‑30</td>
+<td>FLE-IQ3_M, n-max 2, without overlap and fused kernels (−0.44 %)</td>
+<td>overlap + fused kernels</td>
+<td>+15.93 % [+14.60 .. +17.42]</td>
+<td>24</td>
+<td>4.2, A</td>
+</tr>
+<tr>
+<td>ALL2</td>
+<td></td>
+<td></td>
+<td>same + IQ4_NL MTP head</td>
+<td>+19.46 % [+18.00 .. +21.03]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>ALL2</td>
+<td></td>
+<td></td>
+<td>same + Q4_0 MTP head</td>
+<td>+16.63 % [+15.25 .. +18.14]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>ALL2</td>
+<td></td>
+<td></td>
+<td>IQ4_NL head + Q6_K dense weights</td>
+<td>+19.14 % [+15.76 .. +22.14]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>HY</td>
+<td>2026‑09‑30</td>
+<td>Unsloth UD-IQ4_XS, 160 slots (+3.42 %); <em>invalid: memory-high events in all candidate arms, output limit 4,096, 19 requests</em></td>
+<td>FLE-IQ3_M, 160 slots</td>
+<td>−5.66 % [−9.11 .. −2.70]</td>
+<td>19</td>
+<td>4.1, A</td>
+</tr>
+<tr>
+<td>HY</td>
+<td></td>
+<td></td>
+<td>same + cache bias and policy</td>
+<td>+3.66 % [−1.53 .. +8.60]</td>
+<td>19</td>
+<td></td>
+</tr>
+<tr>
+<td>HY</td>
+<td></td>
+<td></td>
+<td>FLE-IQ3_M, 173 slots + cache bias</td>
+<td>+6.53 % [+4.92 .. +8.24]</td>
+<td>19</td>
+<td></td>
+</tr>
+<tr>
+<td>HZ2</td>
+<td>2026‑09‑30</td>
+<td>Unsloth UD-IQ4_XS, 160 slots, n-max 1 (+0.38 %)</td>
+<td>FLE-IQ3_M alone</td>
+<td>+4.05 % [+2.92 .. +5.19]</td>
+<td>24</td>
+<td>4.1, A</td>
+</tr>
+<tr>
+<td>HZ2</td>
+<td></td>
+<td></td>
+<td>FLE-IQ3_M + cache bias and policy</td>
+<td>+12.15 % [+10.68 .. +13.57]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>NG</td>
+<td>2026‑09‑30</td>
+<td>FLE-IQ3_M, cache policy, MTP n-max 2 (−0.44 %)</td>
+<td>n-gram drafting (ngram-map-k) before MTP</td>
+<td>−13.77 % [−18.86 .. −8.58]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>NG</td>
+<td></td>
+<td></td>
+<td>n-gram drafting (ngram-mod) before MTP</td>
+<td>−23.34 % [−30.02 .. −16.12]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>NM2</td>
+<td>2026‑09‑30</td>
+<td>FLE-IQ3_M, MTP n-max 2 (−5.88 %); <em>invalid: reference drift −5.88 %</em></td>
+<td>n-max 1</td>
+<td>−6.74 % [−8.38 .. −5.08]</td>
+<td>24</td>
+<td>4.3, A, B</td>
+</tr>
+<tr>
+<td>NM2</td>
+<td></td>
+<td></td>
+<td>n-max 3, p-min 0.7</td>
+<td>−1.29 % [−3.11 .. +0.50]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>NM2</td>
+<td></td>
+<td></td>
+<td>n-max 6, p-min 0.7</td>
+<td>−30.72 % [−33.91 .. −27.28]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>END2</td>
+<td>2026‑10‑01</td>
+<td>previous production: stock build, Unsloth UD-IQ4_XS (+1.44 %)</td>
+<td>FLE: FLE-IQ3_M, cache policy, overlap, IQ4_NL head, n-max 2</td>
+<td>+58.53 % [+55.83 .. +61.58]</td>
+<td>24</td>
+<td>4.5, 4.6, 5.2, A, B</td>
+</tr>
+<tr>
+<td>END2</td>
+<td></td>
+<td></td>
+<td>same, micro-batch 1024 without memory fit</td>
+<td>−20.36 % [−22.32 .. −18.36]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>KTC</td>
+<td>2026‑10‑03</td>
+<td>untrained MTP head, n-max 2 (−1.84 %)</td>
+<td>re-trained head c2 (training tasks)</td>
+<td>+4.54 % [+2.67 .. +6.75]</td>
+<td>24</td>
+<td>4.3, 6, A</td>
+</tr>
+<tr>
+<td>KTC</td>
+<td></td>
+<td></td>
+<td>head c2, n-max 3</td>
+<td>+4.90 % [+2.16 .. +8.19]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>KTC</td>
+<td></td>
+<td></td>
+<td>head b, n-max 3</td>
+<td>+5.59 % [+2.66 .. +8.78]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>P35Q</td>
+<td>2026‑10‑03</td>
+<td>micro-batch 512 (−0.30 %)</td>
+<td>lean prefill, micro-batch 1024</td>
+<td>−19.01 % [−19.76 .. −18.26]</td>
+<td>24</td>
+<td>4.5, A</td>
+</tr>
+<tr>
+<td>P35Q</td>
+<td></td>
+<td></td>
+<td>same, memory fit 18806 MiB</td>
+<td>+2.26 % [+1.24 .. +3.29]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>VK</td>
+<td>2026‑10‑03</td>
+<td>head c2, full draft vocabulary (+1.24 %)</td>
+<td>16k draft vocabulary</td>
+<td>+2.88 % [+1.57 .. +4.03]</td>
+<td>24</td>
+<td>4.3, A</td>
+</tr>
+<tr>
+<td>VK</td>
+<td></td>
+<td></td>
+<td>32k draft vocabulary</td>
+<td>+4.14 % [+3.04 .. +5.24]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>VK</td>
+<td></td>
+<td></td>
+<td>32k draft vocabulary, n-max 3</td>
+<td>+4.09 % [+1.98 .. +6.08]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>VL</td>
+<td>2026‑10‑03</td>
+<td>production p38 (−1.28 %)</td>
+<td>pre-gating prefetch, width 10</td>
+<td>−9.67 % [−11.14 .. −8.22]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>VL</td>
+<td></td>
+<td></td>
+<td>width 10, 8 prefetch slots</td>
+<td>−12.49 % [−13.84 .. −11.21]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>VL</td>
+<td></td>
+<td></td>
+<td>width 16, 8 prefetch slots</td>
+<td>−27.34 % [−28.81 .. −25.83]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>KTE</td>
+<td>2026‑10‑04</td>
+<td>head c2, n-max 2 (−0.83 %)</td>
+<td>larger re-training (lauf5), n-max 2</td>
+<td>+0.28 % [−0.73 .. +1.48]</td>
+<td>48</td>
+<td>4.3</td>
+</tr>
+<tr>
+<td>KTE</td>
+<td></td>
+<td></td>
+<td>same, n-max 3</td>
+<td>+1.22 % [−0.38 .. +2.91]</td>
+<td>48</td>
+<td></td>
+</tr>
+<tr>
+<td>KTE</td>
+<td></td>
+<td></td>
+<td>same, n-max 4</td>
+<td>−0.58 % [−3.19 .. +2.06]</td>
+<td>48</td>
+<td></td>
+</tr>
+<tr>
+<td>RB2</td>
+<td>2026‑10‑05</td>
+<td>production, 8 threads, 173 slots (−1.79 %)</td>
+<td>MTP penalties off</td>
+<td>−0.62 % [−1.92 .. +0.86]</td>
+<td>24</td>
+<td>4.6, 6, A</td>
+</tr>
+<tr>
+<td>RB2</td>
+<td></td>
+<td></td>
+<td>rebased build</td>
+<td>−47.21 % [−48.20 .. −46.12]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>RB2</td>
+<td></td>
+<td></td>
+<td>165 slots</td>
+<td>−0.23 % [−1.38 .. +1.08]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>RB2</td>
+<td></td>
+<td></td>
+<td>16 threads on cores 0-15</td>
+<td>+5.23 % [+3.64 .. +6.86]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>RB3b</td>
+<td>2026‑10‑05</td>
+<td>production, 16 threads (+2.36 %)</td>
+<td>rebased build, fit target 18300, 165 slots</td>
+<td>−5.74 % [−6.87 .. −4.61]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>B1b</td>
+<td>2026‑10‑05</td>
+<td>FLE p43-pin (+0.40 %); <em>superseded by B1e</em></td>
+<td>upstream llama.cpp a8c9a4e7c, no MTP</td>
+<td>−61.29 % [−62.56 .. −60.11]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3m1</td>
+<td>2026‑10‑05</td>
+<td>FLE-IQ3_M, 173 slots per layer (−6.17 %); <em>invalid: reference drift −6.17 %; fixed slot count, superseded by B3e</em></td>
+<td>Unsloth UD-IQ4_XS, 173 slots</td>
+<td>−31.38 % [−32.22 .. −30.53]</td>
+<td>24</td>
+<td>A, B</td>
+</tr>
+<tr>
+<td>B3m1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_S, 173 slots</td>
+<td>−4.73 % [−5.86 .. −3.62]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_XXS, 173 slots</td>
+<td>−6.96 % [−8.52 .. −5.35]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m2</td>
+<td>2026‑10‑05</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.27 %); <em>fixed slot count, superseded by B3e</em></td>
+<td>Unsloth UD-IQ3_XXS, 173 slots</td>
+<td>+7.21 % [+5.89 .. +8.36]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3m2</td>
+<td></td>
+<td></td>
+<td>bartowski IQ3_XXS, 173 slots</td>
+<td>+1.37 % [+0.23 .. +2.45]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m2</td>
+<td></td>
+<td></td>
+<td>AtomicChat AD 3.84 bpw, 173 slots</td>
+<td>−10.55 % [−15.12 .. −7.73]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m3</td>
+<td>2026‑10‑05</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.14 %); <em>fixed slot count, superseded by B3e</em></td>
+<td>AtomicChat AD 4.27 bpw, 173 slots</td>
+<td>−22.64 % [−23.41 .. −21.79]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>B3m3</td>
+<td></td>
+<td></td>
+<td>ISTA IQ2_XS, 173 slots</td>
+<td>−6.45 % [−9.64 .. −3.36]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m3</td>
+<td></td>
+<td></td>
+<td>ISTA Q2_0, 173 slots, scalar Q2_0 kernel</td>
+<td>−25.72 % [−28.97 .. −22.37]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m4</td>
+<td>2026‑10‑05</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.26 %); <em>fixed slot count, superseded by B3e</em></td>
+<td>Unsloth UD-Q2_K_XL, 173 slots</td>
+<td>−1.97 % [−2.91 .. −1.02]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3m4</td>
+<td></td>
+<td></td>
+<td>Unsloth UD-IQ1_M, 173 slots</td>
+<td>−0.47 % [−1.98 .. +0.95]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3m5</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.64 %); <em>fixed slot count, superseded by B3e</em></td>
+<td>FLE-IQ3_XXS, 173 slots</td>
+<td>−6.10 % [−7.35 .. −4.93]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>B3m5</td>
+<td></td>
+<td></td>
+<td>FLE-IQ2_M, 173 slots, scalar Q2_0 kernel</td>
+<td>−5.11 % [−6.72 .. −3.42]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3w1</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (+0.20 %); <em>repeat of B3m1, superseded by B3e</em></td>
+<td>Unsloth UD-IQ4_XS, 173 slots</td>
+<td>−34.46 % [−35.11 .. −33.83]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3w1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_S, 173 slots</td>
+<td>−7.74 % [−8.81 .. −6.81]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3w1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_XXS, 173 slots</td>
+<td>−9.29 % [−10.82 .. −7.73]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>CG</td>
+<td>2026‑10‑06</td>
+<td>production p43-pin, 173 slots (+0.28 %)</td>
+<td>patch-44 build without budget</td>
+<td>−0.08 % [−0.57 .. +0.37]</td>
+<td>24</td>
+<td>4.1, 4.6, 5.3, 7, A, B</td>
+</tr>
+<tr>
+<td>CG</td>
+<td></td>
+<td></td>
+<td>byte budget 17,035 MiB, no profile</td>
+<td>+0.01 % [−0.49 .. +0.48]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>CG</td>
+<td></td>
+<td></td>
+<td>byte budget + warm-start profile</td>
+<td>+1.49 % [+0.64 .. +2.41]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>CG</td>
+<td></td>
+<td></td>
+<td>budget 2.6 GB smaller (14,435 MiB) + profile</td>
+<td>−3.26 % [−4.19 .. −2.32]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s1</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (+0.55 %); <em>earlier engine state, superseded by B3e</em></td>
+<td>FLE-IQ3_XXS, equal budget</td>
+<td>−1.83 % [−2.69 .. −0.97]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3s1</td>
+<td></td>
+<td></td>
+<td>FLE-IQ2_M, equal budget</td>
+<td>+5.13 % [+3.22 .. +7.06]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s1</td>
+<td></td>
+<td></td>
+<td>Unsloth UD-IQ3_XXS, equal budget</td>
+<td>+12.06 % [+10.89 .. +13.33]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s2</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (+0.47 %); <em>earlier engine state, superseded by B3e</em></td>
+<td>ISTA IQ3_S, equal budget</td>
+<td>−5.96 % [−7.03 .. −4.93]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3s2</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_XXS, equal budget</td>
+<td>−2.74 % [−4.57 .. −0.90]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s3</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.64 %); <em>earlier engine state, superseded by B3e</em></td>
+<td>Unsloth UD-Q2_K_XL, equal budget</td>
+<td>+2.75 % [+1.28 .. +4.11]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3s3</td>
+<td></td>
+<td></td>
+<td>Unsloth UD-IQ1_M, equal budget</td>
+<td>+4.64 % [+3.29 .. +6.03]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s3</td>
+<td></td>
+<td></td>
+<td>AtomicChat AD 3.84 bpw, equal budget</td>
+<td>−3.93 % [−5.11 .. −2.78]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3s4</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (−0.25 %); <em>earlier engine state, superseded by B3e</em></td>
+<td>ISTA IQ2_XS, equal budget</td>
+<td>+8.84 % [+6.23 .. +11.56]</td>
+<td>24</td>
+<td>A</td>
+</tr>
+<tr>
+<td>B3s4</td>
+<td></td>
+<td></td>
+<td>ISTA Q2_0, equal budget</td>
+<td>−5.14 % [−8.63 .. −1.85]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>P45</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (+0.95 %)</td>
+<td>FLE-IQ3_XXS, AVX2 Q2_0 kernel (patch 45)</td>
+<td>−2.68 % [−4.29 .. −1.04]</td>
+<td>24</td>
+<td>6, A</td>
+</tr>
+<tr>
+<td>P45</td>
+<td></td>
+<td></td>
+<td>FLE-IQ2_M, AVX2 Q2_0 kernel</td>
+<td>+5.49 % [+3.13 .. +7.86]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>P45</td>
+<td></td>
+<td></td>
+<td>ISTA Q2_0, AVX2 Q2_0 kernel</td>
+<td>+3.84 % [+1.43 .. +6.22]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>V6b</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, 173 slots per layer (+0.68 %)</td>
+<td>146 slots</td>
+<td>−4.39 % [−5.43 .. −3.37]</td>
+<td>24</td>
+<td>4.1, 4.4, 5.3, A, B</td>
+</tr>
+<tr>
+<td>V6b</td>
+<td></td>
+<td></td>
+<td>120 slots</td>
+<td>−10.04 % [−10.74 .. −9.37]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>PC</td>
+<td>2026‑10‑06</td>
+<td>production p45-pin (+2.37 %)</td>
+<td>patch 47, PCIe share 0.35</td>
+<td>−4.46 % [−5.73 .. −3.32]</td>
+<td>24</td>
+<td>5.3, A</td>
+</tr>
+<tr>
+<td>PC</td>
+<td></td>
+<td></td>
+<td>patch 47, PCIe share 0.55</td>
+<td>−4.47 % [−5.53 .. −3.46]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>W7</td>
+<td>2026‑10‑06</td>
+<td>production p45-pin (−0.26 %)</td>
+<td>ubatch lending, batch/micro-batch 4096</td>
+<td>−0.25 % [−1.15 .. +0.66]</td>
+<td>24</td>
+<td>4.6, 5.3, A</td>
+</tr>
+<tr>
+<td>W7</td>
+<td></td>
+<td></td>
+<td>ubatch lending, batch 4096, micro-batch 2048</td>
+<td>−0.81 % [−1.65 .. +0.05]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>W49c</td>
+<td>2026‑10‑06</td>
+<td>build with patch 48 (p48) (+0.35 %)</td>
+<td>prefetch ring (patch 49)</td>
+<td>−0.18 % [−0.91 .. +0.49]</td>
+<td>24</td>
+<td>4.6, 5.3, A</td>
+</tr>
+<tr>
+<td>B1e</td>
+<td>2026‑10‑06</td>
+<td>FLE p49-ring (+0.44 %)</td>
+<td>upstream llama.cpp a8c9a4e7c, micro-batch 1024, no MTP</td>
+<td>−59.87 % [−61.24 .. −58.50]</td>
+<td>24</td>
+<td>4.3, 5.1, A, B</td>
+</tr>
+<tr>
+<td>B1e</td>
+<td></td>
+<td></td>
+<td>same, micro-batch 4096</td>
+<td>−64.01 % [−65.20 .. −62.86]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e1</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (+0.37 %)</td>
+<td>Unsloth UD-IQ4_XS</td>
+<td>−34.74 % [−35.42 .. −34.04]</td>
+<td>24</td>
+<td>7, A</td>
+</tr>
+<tr>
+<td>B3e1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_S</td>
+<td>−4.33 % [−5.54 .. −3.17]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e1</td>
+<td></td>
+<td></td>
+<td>ISTA IQ3_XXS</td>
+<td>−0.37 % [−2.18 .. +1.40]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e2</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (−0.30 %)</td>
+<td>Unsloth UD-IQ3_XXS</td>
+<td>+8.61 % [+7.39 .. +9.84]</td>
+<td>24</td>
+<td>7</td>
+</tr>
+<tr>
+<td>B3e2</td>
+<td></td>
+<td></td>
+<td>bartowski IQ3_XXS</td>
+<td>−1.10 % [−2.42 .. +0.19]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e2</td>
+<td></td>
+<td></td>
+<td>AtomicChat AD 3.84 bpw</td>
+<td>−5.99 % [−7.29 .. −4.68]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e3</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (+0.25 %)</td>
+<td>AtomicChat AD 4.27 bpw</td>
+<td>−22.52 % [−23.28 .. −21.72]</td>
+<td>24</td>
+<td>7</td>
+</tr>
+<tr>
+<td>B3e3</td>
+<td></td>
+<td></td>
+<td>ISTA IQ2_XS</td>
+<td>+13.85 % [+11.22 .. +16.67]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e3</td>
+<td></td>
+<td></td>
+<td>ISTA Q2_0</td>
+<td>+8.49 % [+6.23 .. +10.76]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e4</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (+0.23 %)</td>
+<td>Unsloth UD-Q2_K_XL</td>
+<td>+0.57 % [−0.83 .. +1.90]</td>
+<td>24</td>
+<td>7</td>
+</tr>
+<tr>
+<td>B3e4</td>
+<td></td>
+<td></td>
+<td>Unsloth UD-IQ1_M</td>
+<td>+2.26 % [+0.41 .. +3.94]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e5</td>
+<td>2026‑10‑06</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (+1.16 %)</td>
+<td>FLE-IQ3_XXS</td>
+<td>−0.69 % [−2.07 .. +0.57]</td>
+<td>24</td>
+<td>3, 4.1, 7, A</td>
+</tr>
+<tr>
+<td>B3e5</td>
+<td></td>
+<td></td>
+<td>FLE-IQ2_M</td>
+<td>+11.60 % [+9.78 .. +13.39]</td>
+<td>24</td>
+<td></td>
+</tr>
+<tr>
+<td>KTF</td>
+<td>2026‑10‑09</td>
+<td>head c2, unseen tasks, own warm-start profile per arm (−1.11 %); <em>confounded by separate profiles, repeated as KTG</em></td>
+<td>untrained head</td>
+<td>+1.61 % [+0.88 .. +2.36]</td>
+<td>48</td>
+<td>4.3, A, B</td>
+</tr>
+<tr>
+<td>KTF</td>
+<td></td>
+<td></td>
+<td>head pub (public prompts only)</td>
+<td>−0.11 % [−1.11 .. +0.86]</td>
+<td>48</td>
+<td></td>
+</tr>
+<tr>
+<td>KTG</td>
+<td>2026‑10‑09</td>
+<td>head c2, unseen tasks, same profile for all arms (−2.38 %)</td>
+<td>untrained head (released)</td>
+<td>+2.95 % [+1.96 .. +3.93]</td>
+<td>48</td>
+<td>4.3, 5.1, 6, A, B</td>
+</tr>
+<tr>
+<td>KTG</td>
+<td></td>
+<td></td>
+<td>head pub (public prompts only)</td>
+<td>−1.63 % [−2.35 .. −0.91]</td>
+<td>48</td>
+<td></td>
+</tr>
+<tr>
+<td>B3e6</td>
+<td>2026‑10‑09</td>
+<td>FLE-IQ3_M, p49-ring, budget 17,035 MiB (+1.64 %)</td>
+<td>FLE-IQ3_M-REAP448, cold</td>
+<td>+0.71 % [−0.32 .. +1.75]</td>
+<td>24</td>
+<td>3, 4.1, 7, A</td>
+</tr>
+<tr>
+<td>B3e6</td>
+<td></td>
+<td></td>
+<td>FLE-IQ3_M-REAP448, own warm-start profile</td>
+<td>+0.53 % [−0.59 .. +1.73]</td>
+<td>24</td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<!-- klammer_tabelle:end -->
+</article>
+<footer><p>Generated on 2026-10-09 from <code>fle-paper.md</code> (SHA-256 79dec6b3cd0d). The PDF has the same text; the films are in <a class="ref" href="#appendix-b">Appendix B</a>.</p></footer>
+</main>
+</div>
+<script>
+// Mark the section in view in the side contents; only one film plays at a time.
+(() => {
+  const links = new Map([...document.querySelectorAll('.toc-side a')].map(a => [a.hash.slice(1), a]));
+  if ('IntersectionObserver' in window) {
+    const watch = new IntersectionObserver(entries => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        links.forEach(a => a.classList.remove('active'));
+        links.get(e.target.id)?.classList.add('active');
+      }
+    }, { rootMargin: '0px 0px -75% 0px' });
+    document.querySelectorAll('article h2[id], article h3[id]').forEach(h => watch.observe(h));
+  }
+  const films = [...document.querySelectorAll('video')];
+  films.forEach(v => v.addEventListener('play', () => films.forEach(w => { if (w !== v) w.pause(); })));
+})();
+</script>
+</body>
+</html>
