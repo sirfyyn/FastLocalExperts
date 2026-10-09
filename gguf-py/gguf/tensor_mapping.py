@@ -2723,6 +2723,17 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.HY_V3: {
+            # Hy3 uses per-layer post_attention_layernorm for ffn_norm; pin it so the
+            # shared final_layernorm (MTP layer 80) does not collide with ffn_norm.
+            MODEL_TENSOR.FFN_NORM: (
+                "model.layers.{bid}.post_attention_layernorm",
+            ),
+            # Hy3 MTP shared-head norm is named final_layernorm (not shared_head.norm)
+            MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM: (
+                "model.layers.{bid}.final_layernorm",
+            ),
+        },
         MODEL_ARCH.ARCTIC: {
             MODEL_TENSOR.FFN_NORM: (
                 "model.layers.{bid}.residual_layernorm",
@@ -2764,6 +2775,15 @@ class TensorNameMap:
             ),
             MODEL_TENSOR.HC_HEAD_UP: (
                 "model.hyper_connection_mixer.input_mix_weight_up",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: (
+                "model.layers.{bid}.hyper_connection_mixer.hc_norm",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: (
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: (
+                "model.layers.{bid}.hyper_connection_mixer.input_mix_weight_up",
             ),
             MODEL_TENSOR.INDEXER_Q_NORM: (
                 "model.layers.{bid}.self_attn.indexer.q_layernorm",

@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -236,7 +237,39 @@ struct server_batch {
     }
 };
 
+// FLE adaptive spec gate: revives the EAGLE3 gate for draft-mtp/dflash —
+// skip cold accept streaks (drop the draft BEFORE the expensive verify). Default off.
+static inline bool fle_spec_adaptive() { static const bool v = std::getenv("FLE_SPEC_ADAPTIVE") != nullptr; return v; }
+static inline int  fle_spec_cold_n()   { static const int v = std::getenv("FLE_SPEC_COLD_N") ? atoi(std::getenv("FLE_SPEC_COLD_N")) : 4; return v; }
+static inline int  fle_spec_skip_m()   { static const int v = std::getenv("FLE_SPEC_SKIP_M") ? atoi(std::getenv("FLE_SPEC_SKIP_M")) : 8; return v; }
+
+// FLE phase clock (stage 2 of the async pipeline): locates the draft<->verify serialization.
+// Measures draft (draft GPU) / verify (target llama_decode: GPU attention + CPU cold experts, serial) / process (re-eval).
+// FLE_PHASE_CLOCK=N -> one split report every N target decodes. Default off (0).
+static inline int fle_phase_clock() { static const int v = std::getenv("FLE_PHASE_CLOCK") ? atoi(std::getenv("FLE_PHASE_CLOCK")) : 0; return v; }
+static int64_t g_fle_t_draft = 0, g_fle_t_verify = 0, g_fle_t_process = 0, g_fle_n_decode = 0;
+// sampling counters (sampler clone, sampling and accepting the target tokens, processing of the accepted tokens); see [fle-phase-sampling]
+static int64_t g_fle_t_clone = 0, g_fle_t_samp = 0, g_fle_t_tok = 0;
+static inline void fle_phase_tick() {
+    const int every = fle_phase_clock();
+    if (every <= 0) return;
+    if (++g_fle_n_decode % every != 0) return;
+    const double tot = (double)(g_fle_t_draft + g_fle_t_verify + g_fle_t_process);
+    if (tot <= 0) return;
+    LOG_INF("[fle-phase] n=%lld draft=%.1fms(%.0f%%) verify=%.1fms(%.0f%%) process=%.1fms(%.0f%%) | serial-sum=%.1fms\n",
+        (long long)g_fle_n_decode,
+        g_fle_t_draft/1000.0,   100.0*g_fle_t_draft/tot,
+        g_fle_t_verify/1000.0,  100.0*g_fle_t_verify/tot,
+        g_fle_t_process/1000.0, 100.0*g_fle_t_process/tot, tot/1000.0);
+    LOG_INF("[fle-phase-sampling] n=%lld clone=%.1fms sample+accept=%.1fms token=%.1fms\n",
+        (long long)g_fle_n_decode, g_fle_t_clone/1000.0, g_fle_t_samp/1000.0, g_fle_t_tok/1000.0);
+    g_fle_t_clone = g_fle_t_samp = g_fle_t_tok = 0;
+    g_fle_t_draft = g_fle_t_verify = g_fle_t_process = 0;
+}
+
 struct server_slot {
+    int spec_cold_streak = 0;  // FLE gate: consecutive drafts with zero accepted tokens
+    int spec_skip_left   = 0;  // FLE gate: draft rounds still to be skipped
     int id;
 
     llama_context * ctx_tgt = nullptr;
@@ -265,6 +298,10 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+
+    // FLE Patch 43 (FLE_SLOT_EARLY_SAVE): set on release when the content of this slot should go into the RAM cache;
+    // update_slots then saves it right away instead of on the path of the next task (get_available_slot).
+    bool fle_early_pending = false;
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -309,7 +346,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, id);
         if (cur == nullptr) {
             return false;
         }
@@ -521,6 +558,9 @@ struct server_slot {
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
+            { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                fprintf(stderr, "[BATCH-BUILD] spec_draft=%zu\n", spec_draft.size()); fflush(stderr);
+            } }
 
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -550,6 +590,9 @@ struct server_slot {
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
+
+            // FLE Patch 43: only completion tasks are cached (as in get_available_slot)
+            fle_early_pending = task->type == SERVER_TASK_TYPE_COMPLETION && !task->is_child();
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -1139,12 +1182,13 @@ private:
                 }
 
                 if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
+                    SRV_ERR("%s", "failed to create draft context\n");
                     return false;
                 }
 
                 params_base.speculative.draft.ctx_tgt = ctx_tgt;
                 params_base.speculative.draft.ctx_dft = ctx_dft;
+                params_base.speculative.draft.ctx_mtp = spec_init->context_mtp();
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
@@ -1410,6 +1454,7 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+            fle_early_save(); // FLE Patch 43: right after the pass in which a slot became free
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -1552,6 +1597,13 @@ private:
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
+            // FLE Patch 50: a requested slot that is still processing is returned untouched, the caller defers the task.
+            // Without this the cache update below ran on the busy slot: prompt_save + prompt_load replaced the KV and
+            // recurrent state of the running generation with the cached prompt of the waiting task, on every retry of
+            // the deferred task. The running answer then continued in the other conversation or stopped early.
+            if (ret && ret->is_processing()) {
+                return ret;
+            }
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
@@ -1603,7 +1655,10 @@ private:
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // FLE Patch 39b: an empty slot (e.g. cleared by --cache-idle-slots) gave 0/0 = NaN, so the comparison was false
+                // and an empty slot addressed via id_slot never queried the RAM cache; a client pinned to id_slot 0 then
+                // recomputed its whole context on the follow-up turn after an automated request although it was in the cache.
+                if (ret->prompt.tokens.empty() || f_keep < 0.5f) {
                     update_cache = true;
                 }
             }
@@ -2790,6 +2845,40 @@ private:
     };
 #endif
 
+    // FLE Patch 43 (Strata, switch FLE_SLOT_EARLY_SAVE=1, default off): a slot that became free is saved into the
+    // RAM prompt cache right away, not only when get_available_slot clears it for the next task.
+    // alloc() then finds the prompt already in the cache and skips the copy; the wait moves out of the
+    // TTFT of the next task into the pause after the last one. Runs after every update_slots pass.
+    void fle_early_save() {
+        if (!prompt_cache) {
+            return;
+        }
+        static const bool fle_early = [] {
+            const char * e = fle_getenv_compat("FLE_SLOT_EARLY_SAVE", "FLE_SLOT_FRUEH");
+            const bool on = e && atoi(e) != 0;
+            if (on) { SRV_INF("%s", "[fle-slot-early-save] ON: slots are saved into the RAM cache when they become free\n"); }
+            return on;
+        }();
+        static long long fle_early_n = 0;
+        static double    fle_early_ms = 0;
+        for (auto & slot : slots) {
+            if (!slot.fle_early_pending || slot.is_processing()) {
+                continue;
+            }
+            slot.fle_early_pending = false;
+            if (!fle_early) {
+                continue;
+            }
+            const int64_t t0 = ggml_time_us();
+            const bool is_new = slot.prompt_save(*prompt_cache);
+            prompt_cache->update();
+            const double ms = (ggml_time_us() - t0) / 1000.0;
+            fle_early_n++; fle_early_ms += ms;
+            SLT_INF(slot, "[fle-slot-early-save] %s %d tokens in %.2f ms (n = %lld, total %.1f ms)\n",
+                    is_new ? "saved:" : "not copied (already in cache or rejected):", (int) slot.prompt.tokens.size(), ms, fle_early_n, fle_early_ms);
+        }
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3032,6 +3121,7 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .sampling = */ &slot.task->params.sampling,   // FLE Patch 41
                         };
 
                         drafting.push_back(&slot);
@@ -3042,9 +3132,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t fle_t_d0 = ggml_time_us();   // FLE phase timing
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            g_fle_t_draft += ggml_time_us() - fle_t_d0;
         }
 
         // make checkpoints if needed
@@ -3052,6 +3144,12 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
+            if (fle_spec_adaptive() && slot.spec_skip_left > 0 && !draft.empty()) {
+                slot.spec_skip_left--;
+                draft.clear();     // saves the verify; draft cost (~3%) is still paid, the verify overhead (~15-20%) is not
+            }
+            // upstream now keeps the counter in slot.stats (n_draft_tokens is read elsewhere);
+            // slot.n_draft_total no longer exists.
             slot.stats.n_draft_tokens += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
@@ -3562,7 +3660,15 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // FLE Patch 34: decouple the distance of the second-to-last checkpoint from the ubatch size.
+                            // With -ub 4096 it sat 4100 tokens before the end of the prompt; a follow-up task with
+                            // the same prefix then recomputed up to n_ubatch tokens (measured with -ub 4096).
+                            // FLE_CKPT_TAIL=N sets the distance (default: n_ubatch = old behaviour).
+                            static const int ckpt_tail = [&]() {
+                                const char * e = getenv("FLE_CKPT_TAIL");
+                                return e ? std::max(1, atoi(e)) : (int) n_ubatch;
+                            }();
+                            const int checkpoint_offsets[] = {4 + ckpt_tail, 4};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -3678,12 +3784,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t fle_t_v0 = ggml_time_us();   // FLE phase timing: the decode happens
+                                                   // here, not above at the embd check.
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        g_fle_t_verify += ggml_time_us() - fle_t_v0;
 
         if (ret != 0) {
             {
@@ -3708,6 +3817,19 @@ private:
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                    { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        for (auto & slot : slots) {
+                            if (!slot.is_processing()) { continue; }
+                            fprintf(stderr, "[CTX-ERR] slot=%d n_tokens=%d pos_min=%d pos_max=%d n_ctx=%d batch=%d spec_draft=%zu\n",
+                                    slot.id, slot.prompt.n_tokens(),
+                                    (int) llama_memory_seq_pos_min(mem, slot.id),
+                                    (int) llama_memory_seq_pos_max(mem, slot.id),
+                                    (int) slot.n_ctx, (int) batch.size(), slot.spec_draft.size());
+                            fflush(stderr);
+                        }
+                    } }
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
@@ -3741,7 +3863,51 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        const int64_t fle_t_p0 = ggml_time_us();   // FLE phase timing
+        //
+        // FLE_SPEC_PREFILL_SKIP=1 — arm C from llama.cpp #27306.
+        //
+        // The TODO above is not theoretical: with qwen4exp, MTP is `!is_mem_shared`,
+        // i.e. the draft context is its OWN context. Every `llama_decode(ctx_tgt, ubatch)`
+        // is therefore followed by a second, EQUALLY WIDE `llama_decode(ctx_dft, ubatch)` through the
+        // whole MTP block — also during prefill, where nothing is drafted yet.
+        //
+        // Measured (same setup, four rounds, output checked):
+        //
+        //     --spec-type none        26.93 t/s   spread  0.9 %
+        //     --spec-type draft-mtp   16.71 t/s   spread 10.2 %   draft 116/43 = 37 %
+        //
+        // 38 percent of the throughput and eleven times the spread. The reporter of #27306 shows with
+        // the same cut on Vulkan 55,296 -> 125,948 tokens (arm B versus arm C).
+        //
+        // The cut: while NO slot is generating, the draft context is of no use for
+        // anything needed in this pass. It is rebuilt at the first generation
+        // step anyway.
+        //
+        // The reporter names "tail-only / last-ubatch process" as the production-ready form,
+        // so that `pending_h` stays warm for generation. That is NOT built here —
+        // first we measure what skipping gains at all. Hence a switch
+        // that defaults to off, no change in behaviour.
+        const bool fle_spec_prefill_skip = [] {
+            static const bool v = std::getenv("FLE_SPEC_PREFILL_SKIP") &&
+                                  atoi(std::getenv("FLE_SPEC_PREFILL_SKIP")) != 0;
+            return v;
+        }();
+        bool fle_any_generating = true;
+        if (fle_spec_prefill_skip) {
+            fle_any_generating = false;
+            for (const auto & s : slots) {
+                if (s.state == SLOT_STATE_GENERATING) { fle_any_generating = true; break; }
+            }
+            if (!fle_any_generating) {
+                static int64_t fle_n_skip = 0;
+                if ((++fle_n_skip & 0x3f) == 1) {
+                    SRV_INF("[fle-spec] prefill process skipped (%lld times), no slot generating\n",
+                            (long long) fle_n_skip);
+                }
+            }
+        }
+        if (spec && fle_any_generating) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
@@ -3754,6 +3920,8 @@ private:
                 throw std::runtime_error("failed to process speculative batch");
             }
         }
+        g_fle_t_process += ggml_time_us() - fle_t_p0;
+        fle_phase_tick();
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
         for (auto & slot : slots) {
@@ -3790,11 +3958,34 @@ private:
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
-            for (auto & i : slot.spec_i_batch) {
-                if (!is_inside_view(i)) {
-                    throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
-                }
+            if (slot.spec_i_batch.empty()) {
+                return;
             }
+            size_t keep = 0;
+            while (keep < slot.spec_i_batch.size() && is_inside_view(slot.spec_i_batch[keep])) {
+                keep++;
+            }
+            if (keep == slot.spec_i_batch.size()) {
+                return;
+            }
+            if (keep == 0) {
+                // base token outside the sub-batch window: not reconstructible.
+                throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", slot.spec_i_batch[0], off, off + n_batch_tokens));
+            }
+            // batch split under cache pressure — truncate the round to the validly
+            // decoded prefix instead of aborting the server (#24840). The rest
+            // counts as rejected; verify/rollback work with the new sizes
+            // (n_draft is read from spec_draft.size() after this point).
+            const size_t n_drop = slot.spec_i_batch.size() - keep;
+            SLT_WRN(slot, "spec round truncated by batch split: keep=%zu of %zu (drop %zu phantom tokens)\n",
+                    keep, slot.spec_i_batch.size(), n_drop);
+            slot.spec_i_batch.resize(keep);
+            slot.spec_draft.resize(keep - 1);
+            // The truncated draft tokens were already booked into prompt.tokens in
+            // handle_last_sampled_token but NEVER decoded — without removing them there is
+            // a gap between the bookkeeping and the memory (n_tokens > pos_max),
+            // on which every subsequent decode fails.
+            slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - n_drop);
         });
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
@@ -3908,15 +4099,24 @@ private:
 
             // verify and try to accept the draft
             {
+                const int64_t fle_t_c0 = ggml_time_us();
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                g_fle_t_clone += ggml_time_us() - fle_t_c0;
 
+                { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                    fprintf(stderr, "[VERIFY] n_draft=%zu i_batch=%zu\n",
+                            n_draft, slot.spec_i_batch.size());
+                    fflush(stderr);
+                } }
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                const int64_t fle_t_s0 = ggml_time_us();
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                g_fle_t_samp += ggml_time_us() - fle_t_s0;
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -3963,6 +4163,17 @@ private:
 
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
+                if (fle_spec_adaptive()) {
+                    if (accepted.size() - 1 == 0) {
+                        if (++slot.spec_cold_streak >= fle_spec_cold_n()) {
+                            slot.spec_skip_left = fle_spec_skip_m();
+                            slot.spec_cold_streak = 0;
+                        }
+                    } else {
+                        slot.spec_cold_streak = 0;
+                    }
+                }
+
                 slot.spec_draft = std::move(accepted);
             }
 
@@ -3997,6 +4208,7 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            const int64_t fle_t_k0 = ggml_time_us();
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -4016,6 +4228,8 @@ private:
                     return;
                 }
             }
+
+            g_fle_t_tok += ggml_time_us() - fle_t_k0;
 
             slot.print_timings_tg();
 

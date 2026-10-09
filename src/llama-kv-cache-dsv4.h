@@ -163,6 +163,19 @@ private:
 
     std::vector<uint32_t> rs_idx;
 
+    // true iff ANY layer of the model uses CSA/HCA compression; the seq_rm
+    // partial-rollback restriction exists only for compressor-derived rows.
+    bool has_compressors = false;
+
+    // Drafter instance: block-stateless -> partial remove may be answered with a full
+    // clear (losing the cache costs nothing, the next block refills).
+    bool is_draft_stateless = false;
+
+    // ONE base partial remove is allowed immediately after a PARTIAL checkpoint
+    // restore has freshly set SWA + compressor state (spec-rollback tail).
+    // Otherwise partial stays forbidden -> the can_seq_rm probe sees FULL,
+    // checkpoints stay active.
+
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;

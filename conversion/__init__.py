@@ -122,6 +122,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "GroveMoeForCausalLM": "grovemoe",
     "HunYuanDenseV1ForCausalLM": "hunyuan",
     "HunYuanMoEV1ForCausalLM": "hunyuan",
+    "HYV3ForCausalLM": "hy_v3",
     "HunYuanVLForConditionalGeneration": "hunyuan",
     "HYV3ForCausalLM": "hunyuan",
     "HYV4ForCausalLM": "hy_v4",

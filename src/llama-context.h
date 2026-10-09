@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -58,6 +59,7 @@ struct llama_context {
     void synchronize();
 
     const llama_model   & get_model()   const;
+    bool replicate_shared_from(llama_context * ctx_tgt);   // cross-device
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
@@ -345,6 +347,26 @@ private:
 
     bool sched_need_reserve = true;
 
+    // Patch 48 (FLE_UBATCH_LEND): the compute buffers are sized for a small ubatch; a decode call with many tokens borrows
+    // the difference from the expert cache and runs with cparams.n_ubatch, the next small call returns it (Strata's prefill)
+    uint32_t            fle_ub_small  = 0;       // > 0: lending is on for this context, buffers sized for this ubatch
+    uint32_t            fle_lend_min  = 0;       // calls with at least this many tokens use the large ubatch
+    size_t              fle_lend_rsv  = 0;       // extra bytes asked on top of the measured need
+    bool                fle_big       = false;   // compute buffers currently sized for cparams.n_ubatch
+    bool                fle_measured  = false;
+    std::vector<size_t> fle_big_size;            // per backend: compute buffer of the large ubatch (measured once)
+    size_t              fle_need      = 0;       // device bytes the large ubatch needs beyond the small one
+    uint64_t            fle_mc_epoch  = 0;       // expert-cache epoch of the graph in gf_res_prev
+    uint64_t            fle_lend_n    = 0, fle_lend_skip = 0;
+    // Patch 49 (FLE_UBATCH_PREFETCH): during a lend the scheduler copies the next expert weight on its own stream into a slot
+    // of this size (largest offloaded expert tensor), lent from the cache as well; 0 = off
+    size_t              fle_pf_bytes  = 0;
+    int                 fle_pf_slots  = 0;       // ring of slots (FLE_UBATCH_PREFETCH_SLOTS, default 3 = one layer ahead)
+    uint64_t            fle_pf_skip   = 0;
+    uint32_t fle_ub_eff() const { return fle_ub_small > 0 && !fle_big ? std::min(fle_ub_small, cparams.n_ubatch) : cparams.n_ubatch; }
+    void     fle_lend_begin();
+    void     fle_lend_end();
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -369,6 +391,10 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // keeps the cross-device replicas of the shared tensors alive
+    ggml_context_ptr        ctx_shared_replica;
+    ggml_backend_buffer_ptr buf_shared_replica;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;

@@ -353,6 +353,20 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // FLE (FLE_MC_OVERLAP + MoE cache PCIe share): called for a marked GPU hit chain right after the inputs of the following CPU
+    // subgraph were fetched and before the hit chain is enqueued. cpu_node is the first MUL_MAT_ID of that CPU subgraph with a
+    // cache table in src[3] (its src[2] holds the routed ids in host memory), gpu_backend is the backend of the hit chain; work
+    // enqueued on it runs before the hit chain. Process-wide, NULL = off.
+    typedef void (*ggml_backend_fle_mc_hook_t)(struct ggml_tensor * cpu_node, ggml_backend_t gpu_backend, void * user_data);
+    GGML_API void                 ggml_backend_set_fle_mc_hook(ggml_backend_fle_mc_hook_t hook, void * user_data);
+
+    // FLE Patch 49: prefetch of offloaded MoE expert weights for large ubatches. bytes > 0 allocates a ring of n_slots staging
+    // slots of that size on backend and a second backend on the same device (its own stream): while one weight split computes,
+    // the whole weights of the next ones (MUL_MAT_ID with at least min_tokens tokens, weight in host memory) are copied into the
+    // slots without waiting for their ids; a split then only copies slot -> scheduler buffer on the device. bytes == 0 frees the
+    // ring (prefetch off). Returns false if the ring could not be allocated; the prefetch then stays off.
+    GGML_API bool                 ggml_backend_sched_fle_prefetch(ggml_backend_sched_t sched, ggml_backend_t backend, size_t bytes, int n_slots, int min_tokens);
+
     //
     // Meta backend
     //

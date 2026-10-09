@@ -1738,6 +1738,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
         LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
         return;
     }
+    // FLE: --chunks applies here as well. The tokens of all chunks are at the start of the file and have been read;
+    // the logits follow chunk by chunk, so stopping after the first chunks is safe.
+    if (params.n_chunks > 0 && params.n_chunks < n_chunk) {
+        n_chunk = params.n_chunks;
+    }
 
     const int n_batch = params.n_batch;
     const int num_batches = (static_cast<int>(n_ctx) + n_batch - 1) / n_batch;
@@ -1908,6 +1913,18 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("\n");
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
+
+    if (const char * dump = std::getenv("FLE_KLD_DUMP")) {
+        // FLE: KLD and delta-p per token in file order (before sorting), for paired comparisons
+        // of two runs over the same tokens. Layout: uint32 n, uint32 per chunk, n float KLD, n float dp.
+        std::ofstream out(dump, std::ios::binary);
+        const uint32_t n_values = (uint32_t) kld_values.size();
+        const uint32_t per_chunk = (uint32_t) (n_ctx - 1 - n_ctx/2);
+        out.write((const char *) &n_values, sizeof(n_values));
+        out.write((const char *) &per_chunk, sizeof(per_chunk));
+        out.write((const char *) kld_values.data(), kld_values.size()*sizeof(float));
+        out.write((const char *) p_diff_values.data(), p_diff_values.size()*sizeof(float));
+    }
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());

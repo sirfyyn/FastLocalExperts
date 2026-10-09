@@ -85,6 +85,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK2OCR,
     LLM_ARCH_DEEPSEEK32,
     LLM_ARCH_DEEPSEEK4,
+    LLM_ARCH_DSPARK_DRAFT,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -582,6 +583,8 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_B,
     LLM_TENSOR_ATTN_Q_A_NORM,
     LLM_TENSOR_ATTN_KV_A_NORM,
+    LLM_TENSOR_DSPARK_MAIN_PROJ,
+    LLM_TENSOR_DSPARK_MAIN_NORM,
     LLM_TENSOR_HC_HEAD_FN,
     LLM_TENSOR_HC_HEAD_BASE,
     LLM_TENSOR_HC_HEAD_SCALE,
@@ -673,6 +676,10 @@ enum llm_tensor {
     LLM_TENSOR_INDEXER_PROJ,
     LLM_TENSOR_INDEXER_ATTN_K,
     LLM_TENSOR_INDEXER_ATTN_Q_B,
+    LLM_TENSOR_INDEX_Q_PROJ,
+    LLM_TENSOR_INDEX_K_PROJ,
+    LLM_TENSOR_INDEX_Q_NORM,
+    LLM_TENSOR_INDEX_K_NORM,
     LLM_TENSOR_INDEXER_Q_PROJ,
     LLM_TENSOR_INDEXER_K_PROJ,
     LLM_TENSOR_INDEXER_Q_NORM,
@@ -687,14 +694,29 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_EMBED_TOKENS,
     LLM_TENSOR_NEXTN_ENORM,
     LLM_TENSOR_NEXTN_HNORM,
+    LLM_TENSOR_NEXTN_HC_NORM,
+    LLM_TENSOR_NEXTN_HC_DOWN,
+    LLM_TENSOR_NEXTN_HC_UP,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_HC_HEAD_UP,
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
+    LLM_TENSOR_FC_NORM_0,
+    LLM_TENSOR_FC_NORM_1,
+    LLM_TENSOR_FC_NORM_2,
     LLM_TENSOR_D2T,
     LLM_TENSOR_DSPARK_MARKOV_W1,
     LLM_TENSOR_DSPARK_MARKOV_W2,
+    // The dflash family writes the same tensor WITHOUT the dspark. prefix. Until here
+    // both families shared one enum, and LLM_TENSOR_NAMES is a std::map, so the second
+    // name was always dead.
+    LLM_TENSOR_DFLASH_MARKOV_W1,
+    LLM_TENSOR_DFLASH_MARKOV_W2,
+    LLM_TENSOR_DFLASH_AUX_NORM,
     LLM_TENSOR_DSPARK_CONF_PROJ,
     LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
     LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
@@ -783,6 +805,10 @@ llm_arch llm_arch_from_string(const std::string & name);
 const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 
 bool llm_arch_is_recurrent      (const llm_arch & arch);
+// FLE: DSV4 family = deepseek4 + dspark-draft (same MLA/mHC/MoE semantics,
+// different tensor contract and graph).
+bool llm_arch_is_dsv4_family(llm_arch arch);
+
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);

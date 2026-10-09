@@ -575,20 +575,73 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // Debug: which branch, and with which inputs?
+        auto _branch = [&](const char * which, const ggml_backend_meta_split_state & ret) {
+            if (!std::getenv("FLE_META_MM_DEBUG")) return;
+            static const int _mmax = atoi(std::getenv("FLE_META_MM_DEBUG"));
+            static int _mc = 0;
+            if (_mc >= _mmax) return;
+            _mc++;
+            const size_t _nb = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+            fprintf(stderr, "[meta-mm] %-22s branch=%-14s src0(axis=%d ne=",
+                tensor->name[0] ? tensor->name : "(none)", which, (int) src_ss[0].axis);
+            for (size_t j = 0; j < _nb; j++) fprintf(stderr, "%s%lld", j?",":"", (long long) src_ss[0].ne[j]);
+            fprintf(stderr, ") src1(axis=%d) -> axis=%d ne=", (int) src_ss[1].axis, (int) ret.axis);
+            for (size_t j = 0; j < _nb; j++) fprintf(stderr, "%s%lld", j?",":"", (long long) ret.ne[j]);
+            fprintf(stderr, "  | tensor->ne=[%lld,%lld] src0->ne=[%lld,%lld]\n",
+                (long long) tensor->ne[0], (long long) tensor->ne[1],
+                (long long) (tensor->src[0] ? tensor->src[0]->ne[0] : -1),
+                (long long) (tensor->src[0] ? tensor->src[0]->ne[1] : -1));
+            fflush(stderr);
+        };
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
-            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            ggml_backend_meta_split_state _r = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+            _branch("both-mirrored", _r);
+            return _r;
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_ss[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
             ret.nr[0] = 1;
             ret.n_segments = 1;
+            _branch("src0-axis1", ret);
             return ret;
         }
         if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            _branch("src1-axis1", src_ss[1]);
             return src_ss[1];
         }
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            // This assertion fires for phi3 and thereby ends the whole model test suite
+            // at enumeration position 49 — everything after it, including
+            // LLM_ARCH_LAGUNA at position 117, is never checked. It named neither
+            // the tensor nor the two states it compares: the abort only said
+            // "failed" and left a stack trace.
+            //
+            // Same lesson as for the CAPTURE diagnostic in llama-context.cpp — an
+            // assertion that withholds its sizes costs a separate measurement run
+            // every time. Output only in the failure case, costs nothing otherwise.
+            if (!split_states_equal(src_ss[0], src_ss[1])) {
+                auto show_state = [&](const char * what, const ggml_backend_meta_split_state & z) {
+                    fprintf(stderr, "[meta-split] %s: axis=%d n_segments=%d", what, (int) z.axis, (int) z.n_segments);
+                    for (size_t s = 0; s < z.n_segments; s++) {
+                        fprintf(stderr, " seg%zu(nr=%d ne=[", s, (int) z.nr[s]);
+                        for (size_t j = 0; j < n_bufs; j++) {
+                            fprintf(stderr, "%s%lld", j ? "," : "", (long long) z.ne[s*n_bufs + j]);
+                        }
+                        fprintf(stderr, "])");
+                    }
+                    fprintf(stderr, "\n");
+                };
+                fprintf(stderr, "[meta-split] BREAK at %s op=%s src0=%s src1=%s n_bufs=%zu\n",
+                    tensor->name[0] ? tensor->name : "(none)", ggml_op_name(tensor->op),
+                    tensor->src[0] && tensor->src[0]->name[0] ? tensor->src[0]->name : "(none)",
+                    tensor->src[1] && tensor->src[1]->name[0] ? tensor->src[1]->name : "(none)",
+                    n_bufs);
+                show_state("src0", src_ss[0]);
+                show_state("src1", src_ss[1]);
+                fflush(stderr);
+            }
             GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}, {1}, 1};
         }
@@ -1103,6 +1156,38 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ASSERT(!first_src_split_by_axis);
         }
+        // Make the CHAIN visible, not only its break end. At the break stood
+        // weight 128/256 against activation 192/192 — both sums 384, distributed
+        // differently. The conversion further up demonstrably preserves the ratio
+        // (ne_new = ne_source * ne_target / ne_source_axis), so the inequality must arise
+        // earlier. Where, only one output per node can tell.
+        if (std::getenv("FLE_META_SPLIT_DEBUG")) {
+            // The cap depends on the switch value: FLE_META_SPLIT_DEBUG=60 for a
+            // glance, =100000 for the whole suite. A fixed cap of 60 did not reach
+            // phi3 (enumeration position 49) — the output was there where it
+            // helped nothing.
+            static const int _kmax = atoi(std::getenv("FLE_META_SPLIT_DEBUG"));
+            static int _kc = 0;
+            if (_kc < _kmax) { _kc++;
+                const size_t _nb = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
+                fprintf(stderr, "[meta-chain] %-28s op=%-12s axis=%d nseg=%d ne=[",
+                    tensor->name[0] ? tensor->name : "(none)",
+                    ggml_op_name(tensor->op), (int) split_state.axis, (int) split_state.n_segments);
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    for (size_t j = 0; j < _nb; j++) {
+                        fprintf(stderr, "%s%lld", (s || j) ? "," : "",
+                            (long long) split_state.ne[s*_nb + j]);
+                    }
+                }
+                fprintf(stderr, "] src=");
+                for (size_t i = 0; i < GGML_MAX_SRC && tensor->src[i]; i++) {
+                    fprintf(stderr, "%s%s(axis=%d)", i ? "," : "",
+                        tensor->src[i]->name[0] ? tensor->src[i]->name : "(none)",
+                        (int) src_ss[i].axis);
+                }
+                fprintf(stderr, "\n"); fflush(stderr);
+            }
+        }
         return split_state;
     };
 
@@ -1299,6 +1384,21 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
     }
 
+    // Which split does this leaf get? Useless only in the failure case, otherwise
+    // the one place where the rule becomes visible. The switch carries the count.
+    if (const char * _dbg = std::getenv("FLE_META_LEAF_DEBUG")) {
+        static const int _lmax = atoi(_dbg);
+        static int _lc = 0;
+        if (_lc < _lmax && tensor->op == GGML_OP_NONE) { _lc++;
+            fprintf(stderr, "[meta-leaf] %-30s ne=[%lld,%lld] axis=%d ->",
+                tensor->name[0] ? tensor->name : "(none)",
+                (long long) tensor->ne[0], (long long) tensor->ne[1], split_dim);
+            for (size_t j = 0; j < n_simple_bufs; j++) {
+                fprintf(stderr, " %lld", (long long) simple_tensors[j]->ne[split_dim >= 0 ? split_dim : 0]);
+            }
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
     stc.simple_tensors[tensor] = simple_tensors;
 
     return GGML_STATUS_SUCCESS;

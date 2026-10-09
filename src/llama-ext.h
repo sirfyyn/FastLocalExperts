@@ -123,6 +123,11 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * model);
 
 // returns pointer to the target-model layer indices
+// DSpark context channel: post-mHC residual of the target layers, averaged over the HC
+// streams (reference: h.mean(dim=2)). Unlike llama_get_embeddings_layer_inp, which returns
+// the layer INPUT. Valid until the next decode of the main model's context.
+LLAMA_API const float * llama_get_dspark_aux(int32_t layer, int64_t * n_tokens_out);
+
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);

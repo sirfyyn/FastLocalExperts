@@ -698,6 +698,57 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
+// Patch 45: AVX2 path for Q2_0 x Q8_0. x86 had only the scalar fallback, so every expert with Q2_0 weights that runs on
+// the CPU (cache misses; ISTA GSQ-RCO quants, FLE-Q2/Q3 down projections) was far slower than its IQ2/IQ4 neighbours.
+// One Q2_0 block (64 weights, 16 bytes) covers two Q8_0 blocks. Weight j of a 32-weight half is (qs[j/4] >> 2*(j%4)) & 3,
+// mapped to {-1,0,1,2}; sum((q-1)*y) = sum(q*y) - sum(y), both with maddubs (q unsigned 0..3, no int16 saturation).
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const __m128i m3     = _mm_set1_epi8(3);
+    const __m256i ones8  = _mm256_set1_epi8(1);
+    const __m256i ones16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        for (int k = 0; k < 2; ++k) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*2 + k];
+            // 8 bytes -> 32 two-bit values in weight order: interleave the four bit planes byte by byte
+            const __m128i b   = _mm_loadl_epi64((const __m128i *)(x[i].qs + k*8));
+            const __m128i v0  = _mm_and_si128(b, m3);
+            const __m128i v1  = _mm_and_si128(_mm_srli_epi16(b, 2), m3);
+            const __m128i v2  = _mm_and_si128(_mm_srli_epi16(b, 4), m3);
+            const __m128i v3  = _mm_and_si128(_mm_srli_epi16(b, 6), m3);
+            const __m128i a01 = _mm_unpacklo_epi8(v0, v1);
+            const __m128i a23 = _mm_unpacklo_epi8(v2, v3);
+            const __m256i q   = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_unpacklo_epi16(a01, a23)),
+                                                        _mm_unpackhi_epi16(a01, a23), 1);
+            const __m256i qy  = _mm256_loadu_si256((const __m256i *)yb->qs);
+            const __m256i p   = _mm256_sub_epi16(_mm256_maddubs_epi16(q, qy), _mm256_maddubs_epi16(ones8, qy));
+            const __m256  f   = _mm256_cvtepi32_ps(_mm256_madd_epi16(p, ones16));
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(yb->d)), f, acc);
+        }
+    }
+
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -2088,6 +2139,55 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
         __m256i sumi = _mm256_setzero_si256();
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        // ── AVX-512: 128 weights per pass instead of 64. QK_K/64 = 4 is even, so the
+        //    loop runs in exactly two passes and needs no remainder.
+        //
+        //    Unlike iq4_nl, two super-blocks are NOT paired here (that is what PR #27590
+        //    does); instead the INNER loop is widened. This leaves the scale unpacking (the 12
+        //    packed bytes in utmp[0..3]) completely untouched — that is where all the fiddliness
+        //    of q4_K sits, and vectorizing it would be most of the work at zero additional throughput.
+        //
+        //    The q4 bytes are contiguous (64 bytes in a row), the activations
+        //    are NOT: the low nibbles of bytes 0..31 belong to q8[0..32), those of
+        //    bytes 32..63 to q8[64..96). Hence two 256-bit loads each and
+        //    inserti64x4 instead of one 512-bit load.
+        //
+        //    Saturation as in the AVX2 path: q4 nibbles 0..15 unsigned, q8 int8 -> pair sum
+        //    <= 3810; scales are 6-bit (0..63) -> after madd_epi16 <= 480,060, fits in
+        //    int32.
+        {
+            __m512i sumi512 = _mm512_setzero_si512();
+            const __m512i m4_512 = _mm512_set1_epi8(0xF);
+            for (int j = 0; j < QK_K/64; j += 2) {
+                const __m512i scale_l = _mm512_inserti64x4(_mm512_castsi256_si512(
+                        _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0))),
+                        _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+2)), 1);
+                const __m512i scale_h = _mm512_inserti64x4(_mm512_castsi256_si512(
+                        _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+1))),
+                        _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+3)), 1);
+
+                const __m512i q4bits = _mm512_loadu_si512((const __m512i*)q4); q4 += 64;
+                const __m512i q4l = _mm512_and_si512(q4bits, m4_512);
+                const __m512i q4h = _mm512_and_si512(_mm512_srli_epi16(q4bits, 4), m4_512);
+
+                const __m512i q8l = _mm512_inserti64x4(_mm512_castsi256_si512(
+                        _mm256_loadu_si256((const __m256i*)(q8 +  0))),
+                        _mm256_loadu_si256((const __m256i*)(q8 + 64)), 1);
+                const __m512i q8h = _mm512_inserti64x4(_mm512_castsi256_si512(
+                        _mm256_loadu_si256((const __m256i*)(q8 + 32))),
+                        _mm256_loadu_si256((const __m256i*)(q8 + 96)), 1);
+                q8 += 128;
+
+                const __m512i p16l = _mm512_madd_epi16(scale_l, _mm512_maddubs_epi16(q4l, q8l));
+                const __m512i p16h = _mm512_madd_epi16(scale_h, _mm512_maddubs_epi16(q4h, q8h));
+                sumi512 = _mm512_add_epi32(sumi512, _mm512_add_epi32(p16l, p16h));
+            }
+            // back to 256 bit so that the epilogue stays unchanged
+            sumi = _mm256_add_epi32(_mm512_castsi512_si256(sumi512),
+                                    _mm512_extracti64x4_epi64(sumi512, 1));
+        }
+#else
         for (int j = 0; j < QK_K/64; ++j) {
 
             const __m256i scale_l = _mm256_shuffle_epi8(scales, get_scale_shuffle_k4(2*j+0));
@@ -2108,6 +2208,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
             sumi = _mm256_add_epi32(sumi, sumj);
         }
+#endif
 
         __m256 vd = _mm256_set1_ps(d);
         acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
@@ -2212,6 +2313,7 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
     ggml_vec_dot_q4_K_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
 
 void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy,  size_t by, int nrc) {
     assert(n % QK_K == 0);
@@ -3940,6 +4042,67 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     const __m128i m4b  = _mm_set1_epi8(0x0f);
     const __m256i mone = _mm256_set1_epi16(1);
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    // ── AVX-512: four blocks per pass instead of two, in two 512-bit accumulators.
+    //    Same structure as the AVX2 loop below, at double width; the
+    //    remainder continues there and falls through to scalar from there. Technique taken from
+    //    llama.cpp PR #27590 (two blocks per 512-bit vector via inserti64x4).
+    //
+    //    `_mm512_sign_epi8` DOES NOT EXIST. Rebuilt with abs + mask subtraction:
+    //      ax = |x|                     _mm512_abs_epi8
+    //      sy = y, negated where x < 0  movepi8_mask + mask_sub_epi8
+    //    Where x == 0, sign_epi8 zeroes y, here it stays — but ax is 0 there,
+    //    so the product is 0 as well. Verified exhaustively over all 65,536 int8 pairs
+    //    with an offline probe (self-check 7/7).
+    //
+    //    PRECONDITION under which BOTH vector paths are correct: q8_0 never produces -128
+    //    (quantize_row_q8_0 computes d = amax/127). Both sign_epi8 and the
+    //    mask subtraction negate -128 to -128, because int8 overflows there.
+    //
+    //    Saturation: |kvalues_iq4nl| <= 127 and |q8| <= 127 -> pair sum <= 32258
+    //    < 32767, so maddubs does not saturate. Same guarantee as in the AVX2 path.
+    {
+        const __m512i mone512 = _mm512_set1_epi16(1);
+        __m512 acc512_1 = _mm512_setzero_ps();
+        __m512 acc512_2 = _mm512_setzero_ps();
+        for (; ib + 3 < nb; ib += 4) {
+            __m512i q4v[2], q8v[2];
+            __m512  scv[2];
+            for (int h = 0; h < 2; ++h) {
+                const int i0 = ib + 2*h;
+                const __m128i b0 = _mm_loadu_si128((const __m128i*)x[i0 + 0].qs);
+                const __m128i b1 = _mm_loadu_si128((const __m128i*)x[i0 + 1].qs);
+                const __m256i v0 = MM256_SET_M128I(
+                    _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(b0, 4), m4b)),
+                    _mm_shuffle_epi8(values128, _mm_and_si128(b0, m4b)));
+                const __m256i v1 = MM256_SET_M128I(
+                    _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(b1, 4), m4b)),
+                    _mm_shuffle_epi8(values128, _mm_and_si128(b1, m4b)));
+                q4v[h] = _mm512_inserti64x4(_mm512_castsi256_si512(v0), v1, 1);
+                q8v[h] = _mm512_inserti64x4(_mm512_castsi256_si512(
+                            _mm256_loadu_si256((const __m256i*)y[i0 + 0].qs)),
+                            _mm256_loadu_si256((const __m256i*)y[i0 + 1].qs), 1);
+                const __m256 s0 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[i0 + 0].d) *
+                                                 GGML_CPU_FP16_TO_FP32(x[i0 + 0].d));
+                const __m256 s1 = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[i0 + 1].d) *
+                                                 GGML_CPU_FP16_TO_FP32(x[i0 + 1].d));
+                scv[h] = _mm512_insertf32x8(_mm512_castps256_ps512(s0), s1, 1);
+            }
+            const __m512i ax0 = _mm512_abs_epi8(q4v[0]);
+            const __m512i ax1 = _mm512_abs_epi8(q4v[1]);
+            const __m512i sy0 = _mm512_mask_sub_epi8(q8v[0], _mm512_movepi8_mask(q4v[0]),
+                                                     _mm512_setzero_si512(), q8v[0]);
+            const __m512i sy1 = _mm512_mask_sub_epi8(q8v[1], _mm512_movepi8_mask(q4v[1]),
+                                                     _mm512_setzero_si512(), q8v[1]);
+            const __m512i p0 = _mm512_madd_epi16(_mm512_maddubs_epi16(ax0, sy0), mone512);
+            const __m512i p1 = _mm512_madd_epi16(_mm512_maddubs_epi16(ax1, sy1), mone512);
+            acc512_1 = _mm512_fmadd_ps(scv[0], _mm512_cvtepi32_ps(p0), acc512_1);
+            acc512_2 = _mm512_fmadd_ps(scv[1], _mm512_cvtepi32_ps(p1), acc512_2);
+        }
+        sumf += _mm512_reduce_add_ps(_mm512_add_ps(acc512_1, acc512_2));
+    }
+#endif
+
     __m256 accum1 = _mm256_setzero_ps();
     __m256 accum2 = _mm256_setzero_ps();
     for (; ib + 1 < nb; ib += 2) {
@@ -3961,7 +4124,8 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
                 _mm256_cvtepi32_ps(p_2), accum2);
     }
 
-    sumf = hsum_float_8(_mm256_add_ps(accum1, accum2));
+    // += instead of =: the AVX-512 branch above may already have contributed.
+    sumf += hsum_float_8(_mm256_add_ps(accum1, accum2));
 
 #elif defined __AVX__
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
@@ -4000,6 +4164,7 @@ void ggml_vec_dot_iq4_nl_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const v
     }
     *s = sumf;
 }
+
 
 void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);

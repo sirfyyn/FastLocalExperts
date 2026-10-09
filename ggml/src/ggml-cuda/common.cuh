@@ -1198,6 +1198,15 @@ struct ggml_cuda_pool_alloc {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
         ptr = (T *) pool->alloc(size * sizeof(T), &this->actual_size);
+        // Evidence line (default OFF). The sanitizer names the "nearest
+        // allocation" — with a reusing pool that is the POOL BLOCK, not
+        // the logical buffer. Three candidates were tried to be matched by their SIZE
+        // and all three were off. Holding the address against the
+        // allocations ends that: this shows which pointer has which size.
+        if (getenv("GGML_CUDA_POOL_TRACE") || getenv("GGML_CUDA_POOL_BELEG")) {   // BELEG: deprecated alias
+            fprintf(stderr, "[pool] ptr=%p requested=%zu B actual=%zu B\n",
+                    (void *) ptr, size * sizeof(T), this->actual_size);
+        }
         return ptr;
     }
 

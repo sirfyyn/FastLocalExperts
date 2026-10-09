@@ -69,6 +69,10 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // FLE Patch 41: sampling parameters of the request (penalties), so that the draft applies the same penalties as the main path.
+    // nullptr = no penalties in the draft (old behaviour).
+    const common_params_sampling * sampling = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -104,6 +108,7 @@ struct common_speculative_init_result {
 
     llama_model   * model();
     llama_context * context();
+    llama_context * context_mtp();
 
 private:
     struct impl;

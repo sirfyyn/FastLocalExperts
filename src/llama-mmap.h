@@ -55,6 +55,10 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // Keep a range on disk: no read-ahead, drop it from the page cache.
+    // For lookup tables with random access (FLE_PLE_NVME).
+    void keep_on_disk(size_t first, size_t last, int fd);
+
     static const bool SUPPORTED;
 
 private:

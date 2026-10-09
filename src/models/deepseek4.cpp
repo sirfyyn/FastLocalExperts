@@ -8,6 +8,28 @@
 #include <stdexcept>
 #include <string>
 
+// #25202 companion (upstream 024c46a, later replaced by the #25370 f16-mask refactor):
+// zero-bias keeps multi-stream unified DSV4 on the explicit attention path (quant-KV fix).
+// FLE np>1 fix, optimised: ggml_cont ONLY when the tensor is really strided.
+// At np=1 the masks/operands are usually contiguous already -> no copy, no regression
+// (measured: an unconditional cont cost 6-8% single-stream: 19.8 -> 17.4-18.6 tok/s).
+static inline ggml_tensor * fle_cont_if_needed(ggml_context * ctx, ggml_tensor * t) {
+    return (t && !ggml_is_contiguous(t)) ? ggml_cont(ctx, t) : t;
+}
+
+static ggml_tensor * dsv4_build_kq_zero_bias(
+        ggml_context * ctx,
+        const llama_cparams & cparams,
+        ggml_tensor * kq_mask,
+        int64_t n_head) {
+    if (!cparams.kv_unified || !cparams.flash_attn || kq_mask->ne[3] == 1) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+            kq_mask->ne[0], kq_mask->ne[1], n_head, kq_mask->ne[3]);
+    return ggml_fill(ctx, res, 0.0f);
+}
+
 static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     if (ext_factor == 0.0f) {
         return 1.0f;
@@ -329,7 +351,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_sinkhorn(
     comb = ggml_add(ctx0, comb, eps);
 
     auto norm_cols = [&]() {
-        ggml_tensor * comb_src_dst = ggml_cont(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
+        ggml_tensor * comb_src_dst = fle_cont_if_needed(ctx0, ggml_permute(ctx0, comb, 1, 0, 2, 3));
         ggml_tensor * col_sum = ggml_sum_rows(ctx0, comb_src_dst);
         col_sum = ggml_add(ctx0, col_sum, eps);
         col_sum = ggml_permute(ctx0, col_sum, 1, 0, 2, 3);
@@ -440,7 +462,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
         }
 
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, nt);
-        out = out ? ggml_concat(ctx0, out, cur, 1) : cur;
+        out = out ? ggml_concat(ctx0, fle_cont_if_needed(ctx0, out), fle_cont_if_needed(ctx0, cur), 1) : cur;
     }
 
     return out;
@@ -494,13 +516,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
     score = ggml_reshape_3d(ctx0, score, n_embd_head, DSV4_HCA_RATIO, n_blocks);
     cb(score, name, il);
 
-    ggml_tensor * values = ggml_cont(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
-    ggml_tensor * scores = ggml_cont(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
+    ggml_tensor * values = fle_cont_if_needed(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
+    ggml_tensor * scores = fle_cont_if_needed(ctx0, ggml_permute(ctx0, score, 1, 0, 2, 3));
 
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
     ggml_tensor * comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    comp = fle_cont_if_needed(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
@@ -564,16 +586,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_overlap_compressed_kv_from_sta
                 n_read*score_rows->nb[1] + ggml_row_size(score_rows->type, n_embd_head)));
     score_cur = ggml_reshape_3d(ctx0, score_cur, n_embd_head, ratio, n_blocks);
 
-    ggml_tensor * values = ggml_concat(ctx0, kv_prev, kv_cur, 1);
-    ggml_tensor * scores = ggml_concat(ctx0, score_prev, score_cur, 1);
+    ggml_tensor * values = ggml_concat(ctx0, fle_cont_if_needed(ctx0, kv_prev), fle_cont_if_needed(ctx0, kv_cur), 1);
+    ggml_tensor * scores = ggml_concat(ctx0, fle_cont_if_needed(ctx0, score_prev), fle_cont_if_needed(ctx0, score_cur), 1);
 
-    values = ggml_cont(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));
-    scores = ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
+    values = fle_cont_if_needed(ctx0, ggml_permute(ctx0, values, 1, 0, 2, 3));
+    scores = fle_cont_if_needed(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3));
 
     ggml_tensor * weights = ggml_soft_max(ctx0, scores);
     ggml_tensor * comp = ggml_mul(ctx0, values, weights);
     comp = ggml_sum_rows(ctx0, comp);
-    comp = ggml_cont(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
+    comp = fle_cont_if_needed(ctx0, ggml_permute(ctx0, comp, 1, 0, 2, 3));
     cb(comp, name, il);
 
     comp = build_norm(comp, norm, nullptr, LLM_NORM_RMS, il);
@@ -656,13 +678,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         ggml_tensor * indexer_kq = ggml_mul_mat(ctx0, indexer_k, indexer_q);
         cb(indexer_kq, "lid_kq", il);
 
-        indexer_kq = ggml_cont(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
+        indexer_kq = fle_cont_if_needed(ctx0, ggml_permute(ctx0, indexer_kq, 2, 1, 0, 3));
         cb(indexer_kq, "lid_kq", il);
 
         indexer_score = ggml_relu(ctx0, indexer_kq);
         indexer_score = ggml_mul(ctx0, indexer_score, indexer_weights);
         indexer_score = ggml_sum_rows(ctx0, indexer_score);
-        indexer_score = ggml_cont(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
+        indexer_score = fle_cont_if_needed(ctx0, ggml_permute(ctx0, indexer_score, 2, 1, 0, 3));
         cb(indexer_score, "lid_score", il);
 
         indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
@@ -670,7 +692,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     }
 
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+    ggml_tensor * top_k = fle_cont_if_needed(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
     cb(top_k, "lid_top_k", il);
 
     return top_k;
@@ -748,17 +770,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+    ggml_tensor * k_all = ggml_concat(ctx0, fle_cont_if_needed(ctx0, raw_k), fle_cont_if_needed(ctx0, csa_k), 2);
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+    ggml_tensor * kq_mask = ggml_concat(ctx0, fle_cont_if_needed(ctx0, raw_mask), fle_cont_if_needed(ctx0, csa_mask), 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+    ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -804,16 +827,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
     cb(hca_k, "hca_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+    ggml_tensor * k_all = ggml_concat(ctx0, fle_cont_if_needed(ctx0, raw_k), fle_cont_if_needed(ctx0, hca_k), 2);
     cb(k_all, "hca_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
     ggml_tensor * hca_mask = inp_hca.kq_mask;
 
-    ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+    ggml_tensor * kq_mask = ggml_concat(ctx0, fle_cont_if_needed(ctx0, raw_mask), fle_cont_if_needed(ctx0, hca_mask), 0);
     cb(kq_mask, "hca_kq_mask", il);
 
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
+    ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -849,7 +873,21 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
 
-    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
+    // DSpark: prepend the context KV (built in build_attention, including RoPE).
+    if (dspark_main_kv) {
+        ggml_tensor * mkv = dspark_main_kv;
+        if (mkv->type != k->type) {
+            mkv = ggml_cast(ctx0, mkv, k->type);
+        }
+        // The sequence axis of the KV cache is 2 ([head_size, n_head_kv, n_kv, 1]).
+        k = ggml_concat(ctx0, mkv, k, 2);
+        if (dspark_ctx_mask && kq_mask->ne[3] == 1) {
+            kq_mask = ggml_concat(ctx0, ggml_cast(ctx0, dspark_ctx_mask, kq_mask->type), kq_mask, 0);
+        }
+    }
+
+    ggml_tensor * kq_b = dsv4_build_kq_zero_bias(ctx0, cparams, kq_mask, q->ne[1]);
+    ggml_tensor * out = build_attn_mha(q, k, k, kq_b, kq_mask, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -934,6 +972,33 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             freq_base_l, freq_scale_l, ext_factor_l, attn_factor_l, beta_fast_l, beta_slow_l);
     kv = ggml_rope_set_offset(kv, n_embd_head_nope);
     cb(kv, "kv", il);
+
+    // DSpark: context KV of this layer from the shared main_x -- its OWN wkv, its own
+    // RoPE on the ABSOLUTE context positions. Two separate position ranges:
+    // context = main-model slots, draft = block slots. Built identically to the draft KV above.
+    dspark_main_kv = nullptr;
+    if (dspark_main_x && dspark_ctx_pos) {
+        const int64_t n_win_ctx = dspark_main_x->ne[1];
+
+        ggml_tensor * mkv = build_lora_mm(layer.wkv, dspark_main_x);
+        mkv = build_norm(mkv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        mkv = ggml_reshape_3d(ctx0, mkv, n_embd_head, 1, n_win_ctx);
+
+        ggml_tensor * mkv_nope = ggml_view_3d(ctx0, mkv, n_embd_head_nope, 1, n_win_ctx,
+                ggml_row_size(mkv->type, n_embd_head),
+                ggml_row_size(mkv->type, n_embd_head),
+                0);
+        ggml_tensor * mkv_pe = ggml_view_3d(ctx0, mkv, n_embd_head_rope, 1, n_win_ctx,
+                ggml_row_size(mkv->type, n_embd_head),
+                ggml_row_size(mkv->type, n_embd_head),
+                ggml_row_size(mkv->type, n_embd_head_nope));
+        mkv_pe = ggml_rope_ext(ctx0, mkv_pe, dspark_ctx_pos, nullptr, n_embd_head_rope,
+                rope_type, n_ctx_orig_l, freq_base_l, freq_scale_l, ext_factor_l,
+                attn_factor_l, beta_fast_l, beta_slow_l);
+        mkv = ggml_concat(ctx0, fle_cont_if_needed(ctx0, mkv_nope), fle_cont_if_needed(ctx0, mkv_pe), 0);
+        cb(mkv, "dspark_main_kv", il);
+        dspark_main_kv = mkv;
+    }
 
     const int64_t ratio = hparams.dsv4_compress_ratios[il];
     GGML_ASSERT(inp_dsv4 || ratio == 0);
@@ -1224,7 +1289,21 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_context(params) {
     ggml_tensor * cur;
 
-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+    // For DSPARK_DRAFT `tok_embd` is missing -- the drafter shares it with the
+    // target. Pattern and wording follow dflash.cpp, where this has long been in use.
+    // The branch is taken ONLY when the pointer is null; DEEPSEEK4 itself, which always
+    // carries the embedding, is unaffected.
+    auto * tok_embd_eff = model.tok_embd;
+    if (tok_embd_eff == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr &&
+                    "DSpark drafter needs the target model for the embedding");
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->tok_embd != nullptr &&
+                    "DSpark drafter needs the embedding of the target model");
+        tok_embd_eff = cparams.replica_tok_embd ? cparams.replica_tok_embd : model_other->tok_embd;
+    }
+
+    ggml_tensor * inp = build_inp_embd(tok_embd_eff);
     ggml_tensor * inp_pos = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
@@ -1235,6 +1314,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
+
+    // DSpark: context channel of the drafter. main_x = main_norm(main_proj @ aux),
+    // aux = [h40;h41;h42] already averaged over the HC streams (reference: h.mean(dim=2)).
+    // Only for the draft architecture and only when the combiner is present in the artifact.
+    dspark_main_x = nullptr;
+    dspark_model  = &model;
+    if (model.arch == LLM_ARCH_DSPARK_DRAFT && model.dspark_main_proj) {
+        const int64_t n_win = 128;   // reference: window_size = 128 (ring window)
+        ggml_tensor * aux = build_inp_dspark_ctx(3*n_embd, n_win, &dspark_ctx_mask, &dspark_ctx_pos);
+        ggml_tensor * mx  = ggml_mul_mat(ctx0, model.dspark_main_proj, aux);
+        mx = build_norm(mx, model.dspark_main_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(mx, "dspark_main_x", -1);
+        dspark_main_x = mx;
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
@@ -1324,6 +1417,26 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_last", il);
+
+        // FLE DSpark-v1 aux capture (vLLM reference 642076d): mean over the hc streams
+        // of the post-mhc residual after the dspark_target_layer_ids (40/41/42) -- context input
+        // for main_proj of the DSpark drafter. Env-gated, no cost when off.
+        // Rebased onto upstream's loop; the tag there is
+        // "l_last" instead of "l_out" (upstream renamed it in this file only).
+        static const bool fle_dspark_aux = std::getenv("FLE_DSPARK_AUX") != nullptr;
+        if (fle_dspark_aux && (il == 40 || il == 41 || il == 42)) {
+            ggml_tensor * t_aux = fle_cont_if_needed(ctx0, ggml_permute(ctx0, inpL, 1, 0, 2, 3)); // [hc, n_embd, T]
+            ggml_tensor * aux = ggml_scale(ctx0, ggml_sum_rows(ctx0, t_aux), 1.0f/(float) hc);
+            aux = ggml_reshape_2d(ctx0, aux, n_embd, n_tokens);
+            cb(aux, il == 40 ? "dspark_aux_40" : il == 41 ? "dspark_aux_41" : "dspark_aux_42", il);
+            ggml_build_forward_expand(gf, aux);
+            // Marker for the callback dump: the name carries layer + position count, so that it can be
+            // reconstructed offline which context positions were captured (prefill + decode).
+            if (std::getenv("FLE_DSPARK_AUX_TRACE")) {
+                fprintf(stderr, "[DSPARK-AUX] layer=%d n_tokens=%d ne=[%lld,%lld]\n",
+                        il, (int) n_tokens, (long long) aux->ne[0], (long long) aux->ne[1]);
+            }
+        }
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
@@ -1352,7 +1465,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    // Same for the output head.
+    auto * output_eff = model.output;
+    if (output_eff == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr &&
+                    "DSpark drafter needs the target model for the output head");
+        const auto * model_other = llama_get_model(cparams.ctx_other);
+        GGML_ASSERT(model_other->output != nullptr &&
+                    "DSpark drafter needs the output head of the target model");
+        output_eff = model_other->output;
+    }
+    cur = ggml_mul_mat(ctx0, output_eff, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

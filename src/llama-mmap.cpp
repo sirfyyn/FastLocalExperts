@@ -514,6 +514,37 @@ struct llama_mmap::impl {
         mapped_fragments.emplace_back(0, file->size());
     }
 
+    // Keep a range on disk. Three measures, each against a different one of the three
+    // places that would otherwise pull it into RAM:
+    //   MADV_RANDOM   against read-ahead on future page faults
+    //   FADV_RANDOM   against the file read-ahead that FADV_SEQUENTIAL doubles
+    //   FADV_DONTNEED drops what MAP_POPULATE has already brought in
+    void keep_on_disk(size_t first, size_t last, int fd) {
+        if (last <= first || last > size) { return; }
+        const size_t page = sysconf(_SC_PAGESIZE);
+        // Round INWARD to page boundaries, otherwise DONTNEED hits neighbouring data
+        // that is supposed to stay in the cache.
+        const size_t begin = (first + page - 1) & ~(page - 1);
+        const size_t end   = last & ~(page - 1);
+        if (end <= begin) { return; }
+        const size_t len = end - begin;
+#ifdef _POSIX_MAPPED_FILES
+        if (posix_madvise((char *) addr + begin, len, POSIX_MADV_RANDOM)) {
+            LLAMA_LOG_WARN("%s: posix_madvise(RANDOM) failed: %s\n", __func__, strerror(errno));
+        }
+#endif
+#ifdef __linux__
+        if (posix_fadvise(fd, begin, len, POSIX_FADV_RANDOM)) {
+            LLAMA_LOG_WARN("%s: posix_fadvise(RANDOM) failed: %s\n", __func__, strerror(errno));
+        }
+        if (posix_fadvise(fd, begin, len, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("%s: posix_fadvise(DONTNEED) failed: %s\n", __func__, strerror(errno));
+        }
+#endif
+        LLAMA_LOG_INFO("[fle-ple] kept on disk: %.2f GiB (offset %zu to %zu)\n",
+                len / 1073741824.0, begin, end);
+    }
+
     static void align_range(size_t * first, size_t * last, size_t page_size) {
         size_t offset_in_page = *first & (page_size - 1);
         size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
@@ -665,6 +696,10 @@ struct llama_mmap::impl {
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
         const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
 llama_mmap::~llama_mmap() = default;
+
+void llama_mmap::keep_on_disk(size_t first, size_t last, int fd) {
+    pimpl->keep_on_disk(first, last, fd);
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }

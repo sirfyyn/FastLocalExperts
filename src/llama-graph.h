@@ -169,6 +169,27 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
+// DSpark context channel: raw aux hiddens of target layers 40/41/42 of the main model,
+// already averaged over the 4 HC streams and concatenated -> [3*n_embd, W].
+// Plus a zeroed mask column so that the context positions are always visible in the
+// attention (a zero block derived from kq_mask would be unsafe: -INF*0 = NaN).
+class llm_graph_input_dspark_ctx : public llm_graph_input_i {
+public:
+    llm_graph_input_dspark_ctx(int64_t n_aux, int64_t n_win, int64_t n_rows)
+        : n_aux(n_aux), n_win(n_win), n_rows(n_rows) {}
+    virtual ~llm_graph_input_dspark_ctx() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * aux      = nullptr;   // F32 [3*n_embd, W]
+    ggml_tensor * ctx_mask = nullptr;   // F32 [W, n_rows]  0 = filled, -INF = empty slot
+    ggml_tensor * ctx_pos  = nullptr;   // I32 [W]          ABSOLUTE Position je Slot (Ring-fest)
+
+    const int64_t n_aux;
+    const int64_t n_win;
+    const int64_t n_rows;
+};
+
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
@@ -983,6 +1004,10 @@ struct llm_graph_qkv {
 struct llm_graph_context {
     const llm_arch arch;
 
+    // FLE overlap: a tensor that build_moe_ffn (FLE_MC_OVERLAP) places in the graph behind the GPU hit chain of the expert cache, so that it
+    // runs on the GPU while the CPU computes the misses (e.g. the shared expert); the caller sets it before and clears it after build_moe_ffn.
+    mutable ggml_tensor * fle_early_extra = nullptr;
+
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
@@ -1149,6 +1174,8 @@ struct llm_graph_context {
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
     ggml_tensor * build_inp_pos() const;
+    ggml_tensor * build_inp_dspark_ctx(int64_t n_aux, int64_t n_win,
+            ggml_tensor ** ctx_mask, ggml_tensor ** ctx_pos) const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
@@ -1206,6 +1233,27 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il) const;
+
+    // as above, but attending only to positions named by top_k; for sparse attention
+    // architectures that are plain GQA rather than MLA
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * v_mla,
+            ggml_tensor * top_k, // [n_top_k, n_tokens]
+                  float   kq_scale,
+                    int   il) const;
+
+    ggml_tensor * build_attn_mask_top_k(
+            ggml_tensor * kq_mask,
+            ggml_tensor * top_k) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

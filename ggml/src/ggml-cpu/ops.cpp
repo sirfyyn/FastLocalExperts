@@ -1,5 +1,8 @@
 #include "ops.h"
 
+#include <cstring>
+#include <vector>
+
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
@@ -11381,6 +11384,288 @@ void ggml_compute_forward_dsv4_hc_post(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_dsv4_hc_post_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fle_hc_gate_mean
+
+// Same floating-point steps as the chain sigmoid, mul, cont, add, add, add, scale (see ggml.h).
+static void ggml_compute_forward_fle_hc_gate_mean_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xn = dst->src[0];
+    const ggml_tensor * g  = dst->src[1];
+
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int   hc    = ggml_get_op_params_i32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+
+    GGML_ASSERT(xn->ne[0] == n_embd*hc);
+    GGML_ASSERT(xn->ne[1] == n_tokens);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = n_embd * n_tokens;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const int64_t row_xn = xn->nb[1] / sizeof(float);
+    const int64_t row_g  = g->nb[1]  / sizeof(float);
+    const int64_t row_d  = dst->nb[1] / sizeof(float);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t it = ir / n_embd;
+
+        const float * xr = (const float *) xn->data + it*row_xn;
+        const float * gr = (const float *) g->data  + it*row_g;
+
+        float sum = 0.0f;
+        for (int c = 0; c < hc; ++c) {
+            const float gv  = gr[c*n_embd + i0];
+            const float sig = 1.0f / (1.0f + expf(-gv));
+            volatile float prod = xr[c*n_embd + i0] * sig;   // no FMA between product and sum
+            sum = (c == 0) ? prod : sum + prod;
+        }
+
+        ((float *) dst->data)[it*row_d + i0] = sum * scale;
+    }
+}
+
+void ggml_compute_forward_fle_hc_gate_mean(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fle_hc_gate_mean_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fle_hc_combine
+
+static void ggml_compute_forward_fle_hc_combine_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * residual = dst->src[0];
+    const ggml_tensor * x        = dst->src[1];
+    const ggml_tensor * inject   = dst->src[2];
+
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(inject->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const float scale_inject = ggml_get_op_params_f32(dst, 0);
+    const float scale_w      = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t hc       = dst->ne[1];
+    const int64_t n_tokens = dst->ne[2];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = n_embd * hc * n_tokens;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i0 = ir % n_embd;
+        const int64_t ic = (ir / n_embd) % hc;
+        const int64_t it = ir / (n_embd * hc);
+
+        const float iv = ((const float *) inject->data)[it*(inject->nb[1]/sizeof(float)) + ic];
+        const float xv = ((const float *) x->data)[it*(x->nb[1]/sizeof(float)) + i0];
+        const float rv = ((const float *) residual->data)[it*(residual->nb[2]/sizeof(float)) + ic*(residual->nb[1]/sizeof(float)) + i0];
+
+        const float t = iv * scale_inject;
+        const float s = 1.0f / (1.0f + expf(-t));
+        const float w = s * scale_w;
+        volatile float prod = xv * w;                       // no FMA between product and sum
+
+        ((float *) dst->data)[it*(dst->nb[2]/sizeof(float)) + ic*(dst->nb[1]/sizeof(float)) + i0] = rv + prod;
+    }
+}
+
+void ggml_compute_forward_fle_hc_combine(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fle_hc_combine_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fle_hc_lr_a
+
+// Reference computation: dequantize the Q8_0 weight row block-wise to F32, F32 activation, sum in element order.
+static void ggml_compute_forward_fle_hc_lr_a_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xn     = dst->src[0];
+    const ggml_tensor * w_down = dst->src[1];
+    const ggml_tensor * w_inj  = dst->src[2];
+
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_down->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(w_inj->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t k  = xn->ne[0];
+    const int64_t nt = xn->ne[1];
+    const int64_t r  = w_down->ne[1];
+    const int64_t hc = w_inj->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr  = r + hc;
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    const struct ggml_type_traits * tt = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<float> wrow(k);
+
+    for (int64_t row = ir0; row < ir1; ++row) {
+        if (row < r) {
+            tt->to_float((const char *) w_down->data + row*w_down->nb[1], wrow.data(), k);
+        } else {
+            std::memcpy(wrow.data(), (const char *) w_inj->data + (row - r)*w_inj->nb[1], k*sizeof(float));
+        }
+        for (int64_t t = 0; t < nt; ++t) {
+            const float * x = (const float *) ((const char *) xn->data + t*xn->nb[1]);
+            float sum = 0.0f;
+            for (int64_t i = 0; i < k; ++i) {
+                volatile float prod = wrow[i] * x[i];
+                sum += prod;
+            }
+            float out = sum;
+            if (row < r) {
+                const float v = sum * scale;
+                out = v / (1.0f + expf(-v));
+            }
+            *(float *) ((char *) dst->data + t*dst->nb[1] + row*sizeof(float)) = out;
+        }
+    }
+}
+
+void ggml_compute_forward_fle_hc_lr_a(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fle_hc_lr_a_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fle_hc_lr_b
+
+static void ggml_compute_forward_fle_hc_lr_b_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xn   = dst->src[0];
+    const ggml_tensor * a    = dst->src[1];
+    const ggml_tensor * w_up = dst->src[2];
+
+    GGML_ASSERT(xn->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(w_up->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int   hc    = ggml_get_op_params_i32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd = dst->ne[0];
+    const int64_t nt     = dst->ne[1];
+    const int64_t r      = w_up->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_embd + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_embd);
+
+    const struct ggml_type_traits * tt = ggml_get_type_traits(GGML_TYPE_Q8_0);
+    std::vector<float> wrow(r);
+    float g[8][4];
+
+    for (int64_t j = ir0; j < ir1; ++j) {
+        for (int c = 0; c < hc; ++c) {
+            tt->to_float((const char *) w_up->data + (c*n_embd + j)*w_up->nb[1], wrow.data(), r);
+            for (int64_t t = 0; t < nt; ++t) {
+                const float * lo = (const float *) ((const char *) a->data + t*a->nb[1]);
+                float sum = 0.0f;
+                for (int64_t i = 0; i < r; ++i) {
+                    volatile float prod = wrow[i] * lo[i];
+                    sum += prod;
+                }
+                g[t][c] = sum;
+            }
+        }
+        for (int64_t t = 0; t < nt; ++t) {
+            const float * x = (const float *) ((const char *) xn->data + t*xn->nb[1]);
+            float s = 0.0f;
+            for (int c = 0; c < hc; ++c) {
+                const float sig = 1.0f / (1.0f + expf(-g[t][c]));
+                volatile float prod = x[c*n_embd + j] * sig;
+                s = (c == 0) ? prod : s + prod;
+            }
+            *(float *) ((char *) dst->data + t*dst->nb[1] + j*sizeof(float)) = s * scale;
+        }
+    }
+}
+
+void ggml_compute_forward_fle_hc_lr_b(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fle_hc_lr_b_f32(params, dst);
             } break;
         default:
             {

@@ -80,6 +80,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
     { LLM_ARCH_DEEPSEEK32,       "deepseek32"       },
     { LLM_ARCH_DEEPSEEK4,        "deepseek4"        },
+    { LLM_ARCH_DSPARK_DRAFT,     "dspark-draft"     },
     { LLM_ARCH_CHATGLM,          "chatglm"          },
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
@@ -123,6 +124,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_HY_V3,            "hy_v3"            },
     { LLM_ARCH_HY_V4,            "hy_v4"            },
     { LLM_ARCH_SMOLLM3,          "smollm3"          },
+    { LLM_ARCH_MUSE_GLIMMER,     "muse-glimmer"     },
     { LLM_ARCH_OPENAI_MOE,       "gpt-oss"          },
     { LLM_ARCH_LFM2,             "lfm2"             },
     { LLM_ARCH_LFM2MOE,          "lfm2moe"          },
@@ -518,6 +520,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_KV_NORM,                           "blk.%d.attn_kv_a_norm" },
     { LLM_TENSOR_ATTN_OUT_A,                             "blk.%d.attn_output_a" },
     { LLM_TENSOR_ATTN_OUT_B,                             "blk.%d.attn_output_b" },
+    { LLM_TENSOR_DSPARK_MAIN_PROJ,           "dspark.main_proj"  },
+    { LLM_TENSOR_DSPARK_MAIN_NORM,           "dspark.main_norm"  },
+    { LLM_TENSOR_DSPARK_MARKOV_W1,           "dspark.markov_w1"  },
+    { LLM_TENSOR_DSPARK_MARKOV_W2,           "dspark.markov_w2"  },
+    { LLM_TENSOR_DFLASH_AUX_NORM,            "enc.aux_norm"      },
     { LLM_TENSOR_HC_HEAD_FN,                             "output_hc_fn" },
     { LLM_TENSOR_HC_HEAD_BASE,                           "output_hc_base" },
     { LLM_TENSOR_HC_HEAD_SCALE,                          "output_hc_scale" },
@@ -575,8 +582,14 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_EMBED_TOKENS,                     "blk.%d.nextn.embed_tokens" },
     { LLM_TENSOR_NEXTN_ENORM,                            "blk.%d.nextn.enorm" },
     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
+    { LLM_TENSOR_NEXTN_HC_NORM,                          "blk.%d.nextn.hc_norm" },
+    { LLM_TENSOR_NEXTN_HC_DOWN,                          "blk.%d.nextn.hc_down" },
+    { LLM_TENSOR_NEXTN_HC_UP,                            "blk.%d.nextn.hc_up" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+    { LLM_TENSOR_NEXTN_HC_HEAD_NORM,                     "blk.%d.nextn.hc_head_norm" },
+    { LLM_TENSOR_NEXTN_HC_HEAD_DOWN,                     "blk.%d.nextn.hc_head_down" },
+    { LLM_TENSOR_NEXTN_HC_HEAD_UP,                       "blk.%d.nextn.hc_head_up" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -674,6 +687,11 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_PROJ,                           "blk.%d.indexer.proj" },
     { LLM_TENSOR_INDEXER_ATTN_K,                         "blk.%d.indexer.attn_k" },
     { LLM_TENSOR_INDEXER_ATTN_Q_B,                       "blk.%d.indexer.attn_q_b" },
+    // Upstream renamed the enums (INDEX_ -> INDEXER_) and moved the tensor names from
+    // "blk.N.index_q_proj" to "blk.N.indexer.q_proj". We took upstream's llama-arch.h and
+    // minimax-m3.cpp, so upstream's naming applies here.
+    // Consequence: an M3 GGUF exported with the OLD scheme no longer loads the indexer
+    // tensors; re-export it.
     { LLM_TENSOR_INDEXER_Q_PROJ,                         "blk.%d.indexer.q_proj" },
     { LLM_TENSOR_INDEXER_K_PROJ,                         "blk.%d.indexer.k_proj" },
     { LLM_TENSOR_INDEXER_Q_NORM,                         "blk.%d.indexer.q_norm" },
@@ -685,9 +703,12 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
     { LLM_TENSOR_FC,                                     "fc" },
+    { LLM_TENSOR_FC_NORM_0,                              "fc_norm.0" },
+    { LLM_TENSOR_FC_NORM_1,                              "fc_norm.1" },
+    { LLM_TENSOR_FC_NORM_2,                              "fc_norm.2" },
     { LLM_TENSOR_D2T,                                    "d2t" },
-    { LLM_TENSOR_DSPARK_MARKOV_W1,                       "markov_w1" },
-    { LLM_TENSOR_DSPARK_MARKOV_W2,                       "markov_w2" },
+    { LLM_TENSOR_DFLASH_MARKOV_W1,                       "markov_w1" },
+    { LLM_TENSOR_DFLASH_MARKOV_W2,                       "markov_w2" },
     { LLM_TENSOR_DSPARK_CONF_PROJ,                       "conf_proj" },
     { LLM_TENSOR_DFLASH_ATTN_CONV_BASE,                  "blk.%d.attn_conv_base" },
     { LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,                  "blk.%d.attn_conv_proj" },
@@ -746,6 +767,13 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ATTN_KV_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ATTN_OUT_A,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_OUT_B,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_MAIN_PROJ,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLASH_AUX_NORM,            {LLM_TENSOR_LAYER_INPUT,     GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_MAIN_NORM,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DSPARK_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLASH_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_DFLASH_MARKOV_W2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_HC_HEAD_FN,                 {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_HC_HEAD_BASE,               {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_ADD}},
     {LLM_TENSOR_HC_HEAD_SCALE,              {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
@@ -945,6 +973,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_VISEXP_FFN_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_K_NORM,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_INDEXER_PROJ,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEX_Q_PROJ,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEX_K_PROJ,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEX_Q_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INDEX_K_NORM,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_INDEXER_ATTN_K,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_ATTN_Q_B,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_Q_PROJ,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
@@ -964,8 +996,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_NEXTN_EMBED_TOKENS,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_NEXTN_ENORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    // qwen4exp: the MTP block mixes hyper-connection state, so it carries its own
+    // hc norm/down/up on top of the shared nextn set.
+    {LLM_TENSOR_NEXTN_HC_NORM,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_NEXTN_HC_DOWN,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_NEXTN_HC_UP,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_NEXTN_HC_HEAD_NORM,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_NEXTN_HC_HEAD_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_NEXTN_HC_HEAD_UP,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     // Nemotron 3 Super
     // latent projections feed ggml_mul_mat, the buft probe must use MUL_MAT to keep them on GPU
     {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
@@ -974,6 +1014,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_FC_NORM_0,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FC_NORM_1,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FC_NORM_2,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
     // dspark
     {LLM_TENSOR_DSPARK_MARKOV_W1,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
@@ -1104,13 +1147,16 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_BAILINGMOE3:
+        // Only valid together with the recurrent rollback splits in qwen4exp.cpp:
+        // registering the arch alone advertises a capability the graph does not have,
+        // and yields fragments instead of text. Upstream PR #27842.
+        case LLM_ARCH_QWEN4EXP:
             return true;
         default:
             return false;
@@ -1132,6 +1178,11 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_OLMOE:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
+        // This is a DENY list (cases -> false, default -> true). Upstream removed
+        // DEEPSEEK4 here and thereby ENABLED -sm tensor for DSV4; a union of both
+        // sides would have silently kept the ban. DSPARK_DRAFT stays: upstream does
+        // not know the architecture at all, so the ban cannot be its choice.
+        case LLM_ARCH_DSPARK_DRAFT:
         case LLM_ARCH_HY_V4:
         case LLM_ARCH_DOTS3NOTE:
         case LLM_ARCH_GLM_DSA:
@@ -1143,6 +1194,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_01:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
+        case LLM_ARCH_HY_V3:          // FLE
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
@@ -1153,4 +1205,8 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         default:
             return true;
     }
+}
+
+bool llm_arch_is_dsv4_family(llm_arch arch) {
+    return arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DSPARK_DRAFT;
 }

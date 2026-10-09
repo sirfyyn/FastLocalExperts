@@ -352,6 +352,15 @@ extern "C" {
     // Returns the old callback for chaining
     GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t callback);
 
+    struct ggml_tensor;
+
+    // MoE expert-routing observation callback: invoked by the CPU mul_mat_id
+    // with the op's expert-id tensor (I32 [n_expert_used, n_tokens]). Used by
+    // the llama MoE expert cache to drive LRU placement decisions.
+    typedef void (*ggml_moe_obs_cb_t)(const char * tensor_name, const struct ggml_tensor * ids, void * ud);
+    GGML_API void            ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud);
+    GGML_API ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud);
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 
@@ -430,7 +439,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_IQ2_KT  = 43, // ik_llama trellis (QTIP), 2.125 bpw
+        GGML_TYPE_IQ3_KT  = 44, // ik_llama trellis (QTIP), 3.125 bpw
+        GGML_TYPE_IQ4_KT  = 45, // ik_llama trellis (QTIP), 4.0 bpw
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision
@@ -574,6 +586,10 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_FLE_HC_GATE_MEAN,
+        GGML_OP_FLE_HC_COMBINE,
+        GGML_OP_FLE_HC_LR_A,
+        GGML_OP_FLE_HC_LR_B,
 
         GGML_OP_UNARY,
 
@@ -654,6 +670,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_FLE_OVERLAP = 4096, // FLE: ...starts a subgraph of its own; if the next subgraph runs on the CPU, the scheduler fetches its inputs before enqueuing this subgraph (FLE_MC_OVERLAP)
     };
 
     enum ggml_tri_type {
@@ -2667,6 +2684,57 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
+    // FLE: hyper-connection mix and combine of the qwen4exp architecture as one kernel each (F32 only).
+    // Both operations perform the same floating-point steps in the same order as the chain of primitive operations
+    // (sigmoid, mul, cont, add, add, add, scale resp. scale, sigmoid, scale, repeat, mul, add) and are bit-identical to it.
+    //
+    // fle_hc_gate_mean: xn [hc*n_embd, n_tokens], g [hc*n_embd, n_tokens] (raw values before the sigmoid) -> [n_embd, n_tokens]
+    //   result[i, t] = (((xn[i, t]*sigmoid(g[i, t]) + xn[n_embd + i, t]*sigmoid(g[n_embd + i, t])) + ...) * scale
+    //
+    GGML_API struct ggml_tensor * ggml_fle_hc_gate_mean(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * g,
+            int                   hc,
+            float                 scale);
+
+    // fle_hc_combine: residual [n_embd, hc, n_tokens], x [n_embd, n_tokens], inject [hc, n_tokens] -> [n_embd, hc, n_tokens]
+    //   w[c, t] = sigmoid(inject[c, t]*scale_inject)*scale_w
+    //   result[i, c, t] = residual[i, c, t] + x[i, t]*w[c, t]
+    //
+    GGML_API struct ggml_tensor * ggml_fle_hc_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * inject,
+            float                 scale_inject,
+            float                 scale_w);
+
+    // FLE: the low-rank projection of the hyper-connection (qwen4exp) as two kernels for small batches (n_tokens <= 8).
+    // Computes with F32 activations and Q8_0 weights (dequantized block-wise), i.e. more accurate than the path via Q8_1 activations; not bit-identical to the chain of mul_mat.
+    //
+    // fle_hc_lr_a: xn [k, n_tokens] (F32), w_down [k, r] (Q8_0), w_inject [k, hc] (F32) -> [r + hc, n_tokens]
+    //   result[i, t] = silu(scale*dot(w_down[i, :], xn[:, t]))   for i < r
+    //   result[r + c, t] = dot(w_inject[c, :], xn[:, t])
+    //
+    GGML_API struct ggml_tensor * ggml_fle_hc_lr_a(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_inject,
+            float                 scale);
+
+    // fle_hc_lr_b: xn [hc*n_embd, n_tokens] (F32), a [r + hc, n_tokens] (output of fle_hc_lr_a, only the first r rows count), w_up [r, hc*n_embd] (Q8_0) -> [n_embd, n_tokens]
+    //   g[c, j, t] = dot(w_up[c*n_embd + j, :], a[0:r, t]);  result[j, t] = (((xn[j]*sigmoid(g[0, j]) + xn[n_embd + j]*sigmoid(g[1, j])) + ...) * scale
+    //
+    GGML_API struct ggml_tensor * ggml_fle_hc_lr_b(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xn,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * w_up,
+            int                   hc,
+            float                 scale);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
@@ -2922,6 +2990,7 @@ extern "C" {
         bool                     is_quantized;
         ggml_to_float_t          to_float;
         ggml_from_float_t        from_float_ref;
+        size_t                   row_meta_size; // ik_llama: per-row metadata bytes (KT-quants: 4=float row-scale); 0 for all others
     };
 
     GGML_API const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type);

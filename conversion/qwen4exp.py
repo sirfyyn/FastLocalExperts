@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from typing import Iterable, cast
+import json
+from typing import Callable, Iterable, cast
 
 import torch
 from torch import Tensor
 
 import gguf
+import logging
 import numpy as np
 
 from .base import ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
+
+logger = logging.getLogger(__name__)
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -21,19 +25,59 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     Shares the Qwen3.5 gated delta net and interleaved mrope, and adds three things:
     hyper-connections in place of every layer norm, QSA sparse attention on the full
     attention layers, and PLE n-gram hash embeddings on a single layer.
+
+    The checkpoint also carries a NextN/MTP draft head under `mtp.*`, exported as a
+    trailing block; pass --no-nextn to leave it out.
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
 
-    # the MTP block is a separate draft head; vLLM drops it too
-    supports_mtp_export = False
-    no_mtp = True
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # only the shard names, so the table itself is never held
+        # _QwenMtpMixin.set_vocab_and_blocks() already raises block_count by the
+        # number of MTP layers; only the index is needed here.
+        self._mtp_bid = self.hparams["num_hidden_layers"]
+        # fc_embedding and fc_hidden are concatenated into one eh_proj; hold the
+        # first one seen until its partner arrives
+        self._mtp_fc: dict[str, Tensor] = {}
+        # only the shard names, so the table itself is never held (upstream)
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        # the FP8 table's single global scale; its presence is what decides
+        self._ple_scale: float | None = None
+
+    _MTP_MIXER_PREFIX = "mtp.hyper_connection_mixer."
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if name.startswith("model." + cls._MTP_MIXER_PREFIX):
+            name = name.replace("model.", "", 1)
+        if name.startswith(cls._MTP_MIXER_PREFIX):
+            if cls.no_mtp:
+                return None
+            assert cls._original_block_count is not None
+            return f"model.layers.{cls._original_block_count}.{name[len('mtp.'):]}", gen
+        return super().filter_tensors((name, gen))
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors = super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+        emb = tensors.pop("mtp.fc_embedding.weight", None)
+        hid = tensors.pop("mtp.fc_hidden.weight", None)
+        if emb is None and hid is None:
+            return tensors
+        if emb is None or hid is None:
+            raise ValueError(
+                "the qwen4exp MTP combiner needs both mtp.fc_embedding.weight and "
+                "mtp.fc_hidden.weight; pass --no-nextn to convert without the draft head"
+            )
+
+        assert self._original_block_count is not None
+        # W_e@e + W_h@h == [W_e|W_h] @ concat(e, h); embedding first, matching the graph's concat.
+        name = f"model.layers.{self._original_block_count}.eh_proj.weight"
+        tensors[name] = lambda: torch.cat([emb(), hid()], dim=1)
+        return tensors
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -63,14 +107,14 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
         ratio = hp["indexer_compress_ratio"]
         layer_types = hp["layer_types"]
-        self.gguf_writer.add_attention_compress_ratios(
-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
-        )
+        ratios = [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+        # 0 selects dense, which is how the MTP block attends.
+        ratios += [0] * (self.block_count - n_layer)
+        self.gguf_writer.add_attention_compress_ratios(ratios)
 
         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
-        # so emit no PLE keys rather than optional ones
         ple_layers = [i - 1 for i in hp["ple_layer_ids"]]
-        if not ple_layers:
+        if not ple_layers or self.mtp_only:
             return
         self.gguf_writer.add_ple_layers(ple_layers)
         self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
@@ -93,7 +137,16 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             self._read_hash_constants("ple_embedding.ngram_heads_vocab_sizes"))
 
     def _image_token_id(self) -> int | None:
+        # image_token_id is top-level in config.json, not in self.hparams once that is
+        # narrowed to text_config, and the text model has no global_config; read the file
         img = self.hparams.get("image_token_id")
+        if img is not None:
+            return int(img)
+        try:
+            with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
+                img = json.load(f).get("image_token_id")
+        except Exception:
+            return None
         return None if img is None else int(img)
 
     def _eos_token_id(self) -> int:
@@ -105,6 +158,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # int64 hash constants must stay exact; 1-D tensors force F32, so use KV
         if name.endswith("ple_embedding.layer_multipliers"):
@@ -115,6 +169,18 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return []
         if name.endswith("ple_embedding.ngram_heads_vocab_sizes"):
             self._ple_head_vocab_sizes = [int(x) for x in data_torch.tolist()]
+            return []
+
+        # The FP8 release stores the whole n-gram table against a single global
+        # scale. base.py pairs scales by name (`X.weight` -> `X.weight_scale`), which
+        # never matches here: the shards are `shard_N.weight` and the scale is one
+        # level up. Caught before map_tensor_name() rejects it.
+        if name.endswith(".ngram_embedding.weight_scale"):
+            # still lazy at this point, like every tensor reaching modify_tensors
+            from .base import LazyTorchTensor
+            self._ple_scale = float(
+                LazyTorchTensor.to_eager(data_torch).to(torch.float32).reshape(-1)[0]
+            )
             return []
 
         if ".ngram_embedding.shard_" in name:
@@ -177,11 +243,22 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
             # a fresh lazy tensor every call, or to_eager() memoizes every shard
             eager = LazyTorchTensor.to_eager(self.model_tensors[name]())
-            return eager.to(torch.float32).contiguous().numpy()
+            arr = eager.to(torch.float32).contiguous().numpy()
+            # The scale decides, not the dtype: to_eager() has already cast to float32,
+            # so the FP8 type is gone while the raw values remain. Measured:
+            # [-48, 72, -80, 64] against a scale of 1.99e-4, off by a factor of 5017.
+            if self._ple_scale is not None:
+                arr *= self._ple_scale
+            return arr
         return load
 
     def prepare_tensors(self):
         super().prepare_tensors()
+        if self._ple_shards:
+            if self._ple_scale is not None:
+                logger.info("PLE table scaled by %g (global FP8 scale)", self._ple_scale)
+            else:
+                logger.info("no PLE weight_scale in this checkpoint — table taken as-is")
         n_parts = self.hparams.get("split_ngram_parts", 0)
         if self._ple_shards and len(self._ple_shards) != n_parts:
             raise ValueError(

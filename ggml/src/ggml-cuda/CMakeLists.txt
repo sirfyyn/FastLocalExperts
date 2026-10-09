@@ -103,6 +103,7 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/fle/pager_buffer.cu") # expert pager
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -172,6 +173,7 @@ if (CUDAToolkit_FOUND)
             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
         endif()
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
+        target_link_libraries(ggml-cuda PRIVATE ggml-cpu) # expert pager: the CPU miss fallback needs ggml_get_type_traits_cpu
     endif()
 
     if (GGML_CUDA_NO_VMM)

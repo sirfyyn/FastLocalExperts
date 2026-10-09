@@ -108,6 +108,83 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// FLE: exact prefilter. The chain penalties -> top-k (k <= 64) -> top-p -> min-p -> temperature -> distribution yields the same selection if it
+// only works on the K largest (unpenalized) logits, provided K >= top_k + penalty_last_n: penalties (repeat >= 1, frequency >= 0, presence >= 0)
+// only lower logits, and at most penalty_last_n distinct tokens are affected; a token outside the K largest therefore has at least K - penalty_last_n >= top_k
+// tokens above it. Scanning all ~248k logits (building the candidate list, hash lookup of the penalties, top-k) otherwise costs about 1 ms per sampling step.
+void common_sampler_topk_scan(const float * x, int n, int K, std::vector<llama_token_data> & out) {
+    out.clear();
+    out.reserve(K);
+    auto cmp = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; }; // min-heap by logit
+    int i = 0;
+    for (; i < K && i < n; ++i) {
+        out.push_back(llama_token_data{ (llama_token) i, x[i], 0.0f });
+    }
+    std::make_heap(out.begin(), out.end(), cmp);
+    float thr = out.front().logit;
+    constexpr int B = 16;
+    for (; i + B <= n; i += B) {
+        float m = x[i];
+        for (int j = 1; j < B; ++j) {
+            m = m > x[i + j] ? m : x[i + j];
+        }
+        if (m > thr) {
+            for (int j = 0; j < B; ++j) {
+                if (x[i + j] > thr) {
+                    std::pop_heap(out.begin(), out.end(), cmp);
+                    out.back() = llama_token_data{ (llama_token) (i + j), x[i + j], 0.0f };
+                    std::push_heap(out.begin(), out.end(), cmp);
+                    thr = out.front().logit;
+                }
+            }
+        }
+    }
+    for (; i < n; ++i) {
+        if (x[i] > thr) {
+            std::pop_heap(out.begin(), out.end(), cmp);
+            out.back() = llama_token_data{ (llama_token) i, x[i], 0.0f };
+            std::push_heap(out.begin(), out.end(), cmp);
+            thr = out.front().logit;
+        }
+    }
+}
+
+// Conditions under which the prefilter is exact (see above); everything else takes the old path.
+static bool fle_topk_prefilter_ok(const common_params_sampling & p, bool has_grammar_or_budget, int n_vocab, int & K) {
+    static const bool disabled = std::getenv("FLE_SAMPLER_NO_PREFILTER") != nullptr;
+    if (disabled || has_grammar_or_budget) return false;
+    if (p.mirostat != 0 || p.adaptive_target >= 0.0f) return false;
+    if (p.top_k < 1 || p.top_k > 64) return false;
+    if (p.dry_multiplier != 0.0f || p.xtc_probability > 0.0f || p.typ_p < 1.0f || p.top_n_sigma >= 0.0f || p.dynatemp_range != 0.0f) return false;
+    if (!p.logit_bias.empty() || !p.logit_bias_eog.empty()) return false;
+    if (p.penalty_last_n < 0 || p.penalty_last_n > 256) return false;
+    if (p.penalty_repeat < 1.0f || p.penalty_freq < 0.0f || p.penalty_present < 0.0f) return false;
+    int i_topk = -1, i_topp = -1, i_minp = -1;
+    for (size_t i = 0; i < p.samplers.size(); ++i) {
+        switch (p.samplers[i]) {
+            case COMMON_SAMPLER_TYPE_TOP_K:       i_topk = (int) i; break;
+            case COMMON_SAMPLER_TYPE_TOP_P:       i_topp = (int) i; break;
+            case COMMON_SAMPLER_TYPE_MIN_P:       i_minp = (int) i; break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+            case COMMON_SAMPLER_TYPE_DRY:            // excluded via dry_multiplier == 0 above
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:    // excluded via top_n_sigma < 0 above
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:      // excluded via typ_p == 1 above
+            case COMMON_SAMPLER_TYPE_XTC:            // excluded via xtc_probability == 0 above
+            case COMMON_SAMPLER_TYPE_ADAPTIVE_P:     // excluded via adaptive_target < 0 above
+                break;
+            default:
+                return false;
+        }
+    }
+    // top-k must come before top-p and min-p (their normalization otherwise depends on the whole vocabulary)
+    if (i_topk < 0) return false;
+    if (i_topp >= 0 && i_topp < i_topk) return false;
+    if (i_minp >= 0 && i_minp < i_topk) return false;
+    K = std::max(128, p.top_k + p.penalty_last_n + 16);
+    return n_vocab > 4 * K;
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -152,9 +229,14 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            int K = 0;
+            if (fle_topk_prefilter_ok(params, grmr != nullptr || rbudget != nullptr, n_vocab, K)) {
+                common_sampler_topk_scan(logits, n_vocab, K, cur);
+            } else {
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
+            }
             }
         }
 
@@ -513,8 +595,8 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
         /* .chain   = */ llama_sampler_clone(gsmpl->chain),
         /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .cur     = */ {},              // FLE: scratch memory, set_logits refills it on every sampling step (saves a 3 MB copy per cycle)
+        /* .cur_p   = */ { nullptr, 0, -1, false },
     };
 }
 

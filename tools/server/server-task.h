@@ -3,10 +3,20 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdlib>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+
+#ifndef FLE_GETENV_COMPAT_DEFINED
+#define FLE_GETENV_COMPAT_DEFINED
+// deprecated_name is the pre-release German name, kept as an alias
+static inline const char * fle_getenv_compat(const char * name, const char * deprecated_name) {
+    const char * v = std::getenv(name);
+    return v ? v : std::getenv(deprecated_name);
+}
+#endif
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -598,6 +608,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // FLE Patch 39: slot the entry was saved from (-1 = unknown), used to protect a guarded slot
+    int32_t id_slot = -1;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -613,7 +626,18 @@ struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        // FLE Patch 39: FLE_CACHE_GUARD_SLOT=<id> - entries from this slot are evicted last. Without the guard,
+        // short automated prompts evicted a long interactive context simply because it was the oldest entry.
+        if (const char * e = fle_getenv_compat("FLE_CACHE_GUARD_SLOT", "FLE_CACHE_SCHUTZ_SLOT")) {
+            this->guard_slot = std::atoi(e);
+        }
     }
+
+    // FLE Patch 39: guarded slot, -1 = off (the cache then evicts the oldest entry as before)
+    int32_t guard_slot = -1;
+
+    // removes one entry: the oldest one that does not come from the guarded slot, otherwise the oldest overall
+    void evict_one();
 
     std::list<server_prompt_cache_state> states;
 
@@ -627,7 +651,7 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft, int32_t id_slot = -1);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

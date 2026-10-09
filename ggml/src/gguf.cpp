@@ -709,6 +709,10 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         // tensor type
         {
             ok = ok && gr.read(info.t.type);
+            // ik_llama.cpp IQ_KT type numbers (153/154/155) -> fork (IQ2/3/4_KT = 43/44/45)
+            if      (info.t.type == (enum ggml_type)153) info.t.type = GGML_TYPE_IQ2_KT;
+            else if (info.t.type == (enum ggml_type)154) info.t.type = GGML_TYPE_IQ3_KT;
+            else if (info.t.type == (enum ggml_type)155) info.t.type = GGML_TYPE_IQ4_KT;
 
             // check that tensor type is within defined range
             if (info.t.type < 0 || info.t.type >= GGML_TYPE_COUNT) {
@@ -739,7 +743,7 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
 
             // calculate byte offsets given the tensor shape and type
             info.t.nb[0] = type_size;
-            info.t.nb[1] = info.t.nb[0]*(info.t.ne[0]/blck_size);
+            info.t.nb[1] = ggml_row_size(info.t.type, info.t.ne[0]); // row_meta-aware; identical for row_meta_size=0
             for (int j = 2; j < GGML_MAX_DIMS; ++j) {
                 info.t.nb[j] = info.t.nb[j - 1]*info.t.ne[j - 1];
             }
@@ -777,11 +781,20 @@ static struct gguf_context * gguf_init_from_reader(const struct gguf_reader & gr
         for (size_t i = 0; i < ctx->info.size(); ++i) {
             const gguf_tensor_info & ti = ctx->info[i];
             if (ti.offset != ctx->size) {
-                GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
-                    __func__, ti.t.name, ti.offset, ctx->size);
-                GGML_LOG_ERROR("%s: failed to read tensor data\n", __func__);
-                gguf_free(ctx);
-                return nullptr;
+                static const bool fle_lenient = std::getenv("FLE_GGUF_LENIENT_OFFSETS") != nullptr;
+                if (fle_lenient) {
+                    // An MTP gguf assembled with ik_llama.cpp wrote offsets without the IQ_KT row_meta.
+                    // The data is contiguous full-byte -> recompute the offset from the cumulative size.
+                    GGML_LOG_WARN("%s: tensor '%s' offset %" PRIu64 " != %zu -> recompute (FLE_GGUF_LENIENT_OFFSETS)\n",
+                        __func__, ti.t.name, ti.offset, ctx->size);
+                    ctx->info[i].offset = ctx->size;
+                } else {
+                    GGML_LOG_ERROR("%s: tensor '%s' has offset %" PRIu64 ", expected %zu\n",
+                        __func__, ti.t.name, ti.offset, ctx->size);
+                    GGML_LOG_ERROR("%s: failed to read tensor data\n", __func__);
+                    gguf_free(ctx);
+                    return nullptr;
+                }
             }
             size_t padded_size = GGML_PAD(ggml_nbytes(&ti.t), ctx->alignment);
             if (SIZE_MAX - ctx->size < padded_size) {

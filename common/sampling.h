@@ -65,6 +65,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
+// FLE: the K largest (id, logit) pairs from n logits (min-heap, unordered); prefilter for the sampler chain, see sampling.cpp
+void common_sampler_topk_scan(const float * x, int n, int K, std::vector<llama_token_data> & out);
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample

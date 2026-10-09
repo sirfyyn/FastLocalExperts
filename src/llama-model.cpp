@@ -200,6 +200,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_dots3note(params);
         case LLM_ARCH_DEEPSEEK4:
             return new llama_model_deepseek4(params);
+        case LLM_ARCH_DSPARK_DRAFT:
+            return new llama_model_dspark_draft(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_MISTRAL4:
@@ -958,6 +960,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_196B_A11B:     return "196B.A11B";
         case LLM_TYPE_230B_A10B:     return "230B.A10B";
         case LLM_TYPE_428B_A23B:     return "428B.A23B";
+        case LLM_TYPE_295B_A21B:     return "295B.A21B";
         case LLM_TYPE_235B_A22B:     return "235B.A22B";
         case LLM_TYPE_288B_A19B:     return "288B.A19B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
@@ -2502,7 +2505,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
-                     arch == LLM_ARCH_BAILINGMOE3);
+                     arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_QWEN4EXP);
+                // QWEN4EXP is listed here too. Without the entry the MTP context builds the
+                // HYBRID cache, whose filter (above) is `il < hparams.n_layer()`, so it
+                // excludes the nextn block. The draft graph would then compute attention on a
+                // layer the cache does not hold. This was caught in a dry run before the
+                // first start, not in operation: the `static_cast` in build_inp_mem_hybrid
+                // checks nothing.
 
                 const bool mtp_on_hybrid_nemotron =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
@@ -2644,7 +2653,27 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (llm_arch_is_dsv4_family(arch)) {   // dspark-draft: the dsv4 graph needs dsv4 memory; its seq_rm falls back to a full clear (block-stateless)
+                        GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+
+                        res = new llama_kv_cache_dsv4(
+                                *this,
+                                params.type_k,
+                                params.type_v,
+                                !cparams.flash_attn,
+                                cparams.offload_kqv,
+                                params.swa_full,
+                                cparams.kv_unified,
+                                cparams.n_ctx_seq,
+                                cparams.n_seq_max,
+                                cparams.n_ubatch,
+                                1,
+                                cparams.n_rs_seq,   // new upstream parameter;
+                                                    // value as at upstream's
+                                                    // own call site
+                                filter,
+                                reuse);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2822,7 +2851,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (llm_arch_is_dsv4_family(model->arch)) {
         return 0;
     }
     return model->hparams.n_swa;
@@ -2908,6 +2937,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DSPARK_DRAFT:
         case LLM_ARCH_MUSE_GLIMMER:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
@@ -2986,10 +3016,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_BAILINGMOE2:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_JAIS2:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_HUNYUAN_DENSE:
-        case LLM_ARCH_HY_V3:
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
         case LLM_ARCH_SMALLTHINKER:
@@ -3257,6 +3287,11 @@ const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
 
 uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
+}
+
+// Access to the DSpark Markov head for the draft sampler (common/speculative).
+const struct ggml_tensor * llama_model_dspark_markov(const struct llama_model * model, int which) {
+    return which == 0 ? model->dspark_markov_w1 : model->dspark_markov_w2;
 }
 
 uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {

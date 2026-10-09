@@ -1,3 +1,8 @@
+> **FLE - Fast Local Experts** is a llama.cpp fork for running large MoE models on one 32 GB GPU plus CPU experts.
+> This README is the upstream llama.cpp README; for what the fork adds, see [README-FLE.md](README-FLE.md).
+>
+> This is a private project: I build it for my own machine and publish it as it is. Hints, findings and bug reports are always welcome; acting on them, reviewing and merging can take a while, and there is no support promise.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

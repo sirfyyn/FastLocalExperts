@@ -16,6 +16,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -1310,6 +1311,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         cparams_dft.n_rs_seq = 0;
 
+        // Patch 44b: the MoE expert cache is allocated after the fit, from what the fit leaves free. With
+        // FLE_MOE_CACHE_BUDGET_FIT=1 and FLE_MOE_CACHE_BUDGET_MIB set, the budget is added to the margin of device 0, so
+        // -fit-target keeps meaning "free memory besides the cache" and the fit always leaves the budget free. Default
+        // off: the margin is then exactly params.fit_params_target, as before. (Devices are not split: the cache of
+        // every layer sits next to its router, which is device 0 for the usual single-GPU setup.)
+        std::vector<size_t> fit_target = params.fit_params_target;
+        {
+            const char * e_fit = std::getenv("FLE_MOE_CACHE_BUDGET_FIT");
+            const char * e_mib = std::getenv("FLE_MOE_CACHE_BUDGET_MIB");
+            if (e_fit && atoi(e_fit) != 0 && e_mib && atoll(e_mib) > 0 && !fit_target.empty()) {
+                fit_target[0] += (size_t) atoll(e_mib) * 1024 * 1024;
+                LOG_INF("%s: MoE cache budget %lld MiB added to the fit margin of device 0 (now %zu MiB)\n",
+                        __func__, atoll(e_mib), fit_target[0] / (1024*1024));
+            }
+        }
+
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
             /*.mparams      =*/ &mparams_dft,
@@ -1320,7 +1337,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
+            fit_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
@@ -1625,6 +1642,11 @@ done:
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
+        // Print the arguments: the backtrace only names the calling frame, not the
+        // call site. Without p0/p1/seq_pos_max the cause cannot be attributed.
+        fprintf(stderr, "[SEQ-RM-FAIL] seq_id=%d p0=%d p1=%d seq_pos_max=%d\n",
+                seq_id, p0, p1, seq_id >= 0 ? llama_memory_seq_pos_max(mem, seq_id) : -999);
+        fflush(stderr);
         GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
     }
 }
@@ -1726,6 +1748,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
+    cparams.n_moe_cache_slots   = params.n_moe_cache_slots;
+    cparams.n_moe_cache_inserts = params.n_moe_cache_inserts;
+    cparams.n_moe_active_experts    = params.n_moe_active_experts;
+    cparams.n_moe_active_ref        = params.n_moe_active_ref;
+    cparams.moe_active_scale        = params.moe_active_scale;
+    cparams.moe_cache_bias          = params.moe_cache_bias;
+    cparams.n_moe_active_max_tokens = params.n_moe_active_max_tokens;
+    cparams.moe_active_layers       = params.moe_active_layers.empty() ? nullptr : params.moe_active_layers.c_str();
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

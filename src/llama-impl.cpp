@@ -1,5 +1,6 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#include "ggml-backend.h"
 
 #include "gguf.h"
 #include "llama.h"

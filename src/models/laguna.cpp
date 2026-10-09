@@ -169,9 +169,43 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
     llm_graph_input_attn_kv_iswa * inp_attn_iswa = has_swa ? build_attn_inp_kv_iswa() : nullptr;
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // If the FINAL STATE is tapped, the reduction to the output rows has to wait.
+    //
+    // DFlash's `target_layers` ends at n_layer (Laguna S 2.1: [2,11,20,30,39,48] with
+    // 48 layers). Layers 2..39 are tapped at the layer input and therefore carry
+    // ALL n_tokens rows. The final state, by contrast, only exists after the
+    // loop -- and there `ggml_get_rows(cur, inp_out_ids)` in the last layer has
+    // already reduced to n_outputs rows.
+    //
+    // `llama_context::extract_layer_inputs` treats all taps the same:
+    //
+    //     row_floats = nfloats / n_tokens;        // assumes n_outputs == n_tokens
+    //     dst_offset = token_offset * row_floats;
+    //     GGML_ASSERT(nfloats % n_tokens == 0);
+    //
+    // The drafter thus received five inputs with n_tokens rows and one with
+    // n_outputs rows -- and that one was also written to the wrong place in the buffer. Two consequences:
+    //
+    //   * The assertion fires when n_tokens does not divide the row count (core dump,
+    //     not on every run -- which is why it looked sporadic).
+    //   * If it happens to divide, the data is silently written shifted. This matches the
+    //     bimodal acceptance rate: 55.6 % for "count from 1 to 30" (also predictable from
+    //     poor context), 0.0 % for "explain a hash table".
+    //
+    // The fix follows cohere2moe.cpp, which does the same for its nextn tap
+    // (there via `cparams.embeddings_nextn_masked`).
+    //
+    // Costs, when active, ONE additional FFN layer over (n_tokens - n_outputs)
+    // tokens -- one out of 48. With speculation off nothing changes.
+    const bool tap_final_state =
+        (size_t) n_layer < cparams.embeddings_layer_inp.size() &&
+        cparams.embeddings_layer_inp[n_layer];
+
     const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;   // DFlash/EAGLE3 capture (layer-input convention)
+
         const bool    is_swa_il   = hparams.is_swa(il);
         const int64_t n_head_il   = hparams.n_head(il);
         const int64_t n_head_kv_il = hparams.n_head_kv(il);
@@ -261,7 +295,7 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "attn_o_proj", il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !tap_final_state) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -320,7 +354,16 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
 
+    res->t_layer_inp[n_layer] = inpL;   // lid == n_layer: output of the last layer (target_layers ends at 48)
+
     cur = inpL;
+
+    // Now do what was deferred above -- after the tap, before the norm.
+    // Without this the output path would compute on all tokens instead of the output rows.
+    if (tap_final_state && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
+
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
     res->t_embd = cur;

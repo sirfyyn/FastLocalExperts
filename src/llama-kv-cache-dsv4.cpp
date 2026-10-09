@@ -26,6 +26,11 @@ static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
+    // FLE: ratio == 0 means "no compression" (dspark-draft has no compressor
+    // tensors). Without the guard -> division by 0 (SIGFPE during graph reserve).
+    if (ratio == 0) {
+        return kv_size;
+    }
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
@@ -494,9 +499,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             continue;
         }
 
-        plan.state_pos.push_back((int32_t) (pos%ratio));
+        plan.state_pos.push_back((int32_t) (ratio ? pos%ratio : 0));
 
-        const int64_t n_visible = (int64_t) (pos + 1)/ratio;
+        const int64_t n_visible = ratio ? (int64_t) (pos + 1)/ratio : 0;
         plan.n_visible[i] = (int32_t) n_visible;
         plan.n_kv = std::max(plan.n_kv, n_visible);
 
@@ -516,7 +521,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 it->pos = pos;
             }
 
-            if ((pos + 1) % ratio != 0) {
+            if (ratio && (pos + 1) % ratio != 0) {
                 continue;
             }
 
@@ -1268,6 +1273,16 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid.rope_type          = LLAMA_ROPE_TYPE_NEOX;
     dsv4_make_k_only(hparams_lid);
 
+    is_draft_stateless = (model.arch == LLM_ARCH_DSPARK_DRAFT);
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        const uint32_t cr = model.hparams.dsv4_compress_ratios[il];
+        if (cr == DSV4_CSA_RATIO || cr == DSV4_HCA_RATIO) {
+            has_compressors = true;
+            break;
+        }
+    }
+
     const layer_filter_cb filter_csa = [&](int32_t il) {
         if (filter && !filter(il)) {
             return false;
@@ -1457,6 +1472,33 @@ void llama_kv_cache_dsv4::clear(bool data) {
 }
 
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Removing from an empty range is a no-op, but ONLY for the block-stateless
+    // drafter instance.
+    // For real dsv4, upstream's p0>pos_max branch further below clears all four
+    // caches (raw, csa, hca, lid). An early `return true` would hide that branch and
+    // bring back exactly the orphans that `spec_rollback_armed` was built against
+    // (measured: 344 SLOT-FAILs, used 8185/8192 at position 770). The short-circuit
+    // was right as long as the alternative was `return false`; upstream now has the
+    // better alternative.
+    if (is_draft_stateless && seq_id >= 0 && p0 > kv_raw->seq_pos_max(seq_id)) {
+        return true;
+    }
+
+    // Without compressor layers there is no state that prevents partial removal:
+    // the restriction below exists solely because of rows derived from running
+    // compressor state. A drafter with compress_ratios == 0 is in that respect an
+    // ordinary raw KV, and kv_raw handles partial rollback. For real V4 contexts the
+    // behaviour is unchanged.
+    // Partial remove is FORBIDDEN in dsv4 (iswa cell leak, measured 2779->3998 at a
+    // logical context of ~500; the original abort protected this invariant). Only
+    // exception: the block-stateless drafter instance answers partial with a full
+    // clear (semantically safe, the next block refills).
+    if (is_draft_stateless && (p1 >= 0 || p0 > 0)) {
+        kv_raw->seq_rm(seq_id, -1, -1);
+        clear_compressed(seq_id, true);
+        return true;
+    }
+
     if (p1 >= 0) {
         return false;
     }

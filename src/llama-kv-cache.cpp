@@ -325,9 +325,23 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k() % 64 == 0;
 
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
-        if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 ||
-                model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
-                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+        // FLE RULE: derive the capability from TENSOR PRESENCE, never from family
+        // membership. The Hadamard rotation belongs to the lightning indexer; it may only
+        // be enabled if that indexer really exists (indexer_head_size > 0 AND the cache
+        // has a head size). Otherwise it reaches into empty compression caches whose
+        // n_embd_head_k_all == 0 -> endless loop in build_input_k_rot -> SIGFPE.
+        //
+        // The arch list is the UNION of both sides. Neither was a superset: upstream adds
+        // GLM_DSA and DOTS3NOTE, our llm_arch_is_dsv4_family carries DSPARK_DRAFT, which
+        // upstream does not know.
+        const bool has_indexer =
+            hparams.indexer_head_size > 0 &&
+            hparams.n_embd_head_k_full == hparams.indexer_head_size;
+        if ((model.arch == LLM_ARCH_DEEPSEEK32 ||
+             model.arch == LLM_ARCH_GLM_DSA    ||
+             model.arch == LLM_ARCH_DOTS3NOTE  ||
+             llm_arch_is_dsv4_family(model.arch)) &&
+                has_indexer && n_embd_head_k_all > 0) {
             attn_rot_k = true;
         }
 
@@ -1008,6 +1022,14 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         if (n_tokens > cells.size()) {
             LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+            { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                llama_pos p_lo = ubatch.pos ? ubatch.pos[0] : -1;
+                llama_pos p_hi = ubatch.pos ? ubatch.pos[ubatch.n_tokens-1] : -1;
+                fprintf(stderr, "[SLOT-FAIL] size=%u n_swa=%u used=%u head=%u want=%u pos=[%d..%d] cont=%d\n",
+                        get_size(), n_swa, v_cells[0].get_used(), v_heads[0],
+                        ubatch.n_tokens, (int) p_lo, (int) p_hi, (int) cont);
+                fflush(stderr);
+            } }
             return { };
         }
 
@@ -1079,12 +1101,28 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
             if (n_tested >= cells.size()) {
                 //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+                { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                    llama_pos p_lo = ubatch.pos ? ubatch.pos[0] : -1;
+                    llama_pos p_hi = ubatch.pos ? ubatch.pos[ubatch.n_tokens-1] : -1;
+                    fprintf(stderr, "[SLOT-FAIL] size=%u n_swa=%u used=%u head=%u want=%u pos=[%d..%d] cont=%d\n",
+                            get_size(), n_swa, v_cells[0].get_used(), v_heads[0],
+                            ubatch.n_tokens, (int) p_lo, (int) p_hi, (int) cont);
+                    fflush(stderr);
+                } }
                 return { };
             }
         }
 
         // we didn't find a suitable slot - return empty result
         if (res.idxs[s].size() < n_tokens) {
+            { static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr; if (_trc) {
+                llama_pos p_lo = ubatch.pos ? ubatch.pos[0] : -1;
+                llama_pos p_hi = ubatch.pos ? ubatch.pos[ubatch.n_tokens-1] : -1;
+                fprintf(stderr, "[SLOT-FAIL] size=%u n_swa=%u used=%u head=%u want=%u pos=[%d..%d] cont=%d\n",
+                        get_size(), n_swa, v_cells[0].get_used(), v_heads[0],
+                        ubatch.n_tokens, (int) p_lo, (int) p_hi, (int) cont);
+                fflush(stderr);
+            } }
             return { };
         }
     }
@@ -1440,10 +1478,14 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
 
         // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
         // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+        // FLE: without this guard the loop runs forever when n_embd_head_k_all == 0,
+        // until nrot overflows -> idiv by 0 (SIGFPE without a location).
+        GGML_ASSERT(n_embd_head_k_all > 0 && "attn_rot_k without a head size (capability derived wrongly?)");
         do {
             nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
+        } while (nrot > 0 && n_embd_head_k_all % nrot == 0);
         nrot /= 2;
+        GGML_ASSERT(nrot > 0 && "degenerate rotation size");
 
         res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
@@ -1805,6 +1847,109 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
                 const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
 
                 data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_qsa(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio) const {
+    GGML_ASSERT(ratio > 0);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t r        = ratio;
+
+    GGML_ASSERT(n_tokens % n_ns == 0);
+    const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
+
+    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
+    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    float   * dst_bias      = (float   *) bias->data;
+
+    // block b covers [b*ratio, (b+1)*ratio), so its first token is at b*ratio. All three
+    // mrope sections carry it: exact for text, approximate for images. Positions repeat per stream.
+    for (int64_t sec = 0; sec < 4; ++sec) {
+        for (int64_t s = 0; s < n_ns; ++s) {
+            for (int64_t b = 0; b < n_blocks; ++b) {
+                dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (b*r);
+            }
+        }
+    }
+
+    // One pass per stream: cell j is a different token in each, so no mapping is shared.
+    // n_ns == 1 is the single-stream behaviour this replaced.
+    std::vector<int32_t> blk_of(n_kv);
+    std::vector<int32_t> filled(n_blocks);
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
+        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = v_cells[seq_to_stream[seq_of_stream]];
+
+        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
+
+        // an incomplete block cannot be pooled: those tail cells are forced in by the bias
+        // below, so block 0 only keeps the gather in range. -1 = no usable block.
+        std::fill(blk_of.begin(),  blk_of.end(),  -1);
+        std::fill(filled.begin(),  filled.end(),   0);
+        std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                continue;
+            }
+
+            const llama_pos p = cells.pos_get(j);
+            const int64_t   b = p/r;
+
+            if (b >= n_blocks) {
+                continue;
+            }
+
+            blk_of[j] = (int32_t) b;
+            cur_blk_cells[b*r + (p%r)] = (int32_t) j;
+            filled[b]++;
+        }
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (blk_of[j] >= 0 && filled[blk_of[j]] < r) {
+                blk_of[j] = -1;
+            }
+            cur_cell_blk[j] = blk_of[j] < 0 ? 0 : blk_of[j];
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t      i      = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const llama_pos    q      = ubatch->pos[i];
+
+            // the rest is an incomplete block, always attended to, which is what lands the
+            // selection on block boundaries like the reference
+            const llama_pos tail_start = (q + 1)/r*r;
+
+            float * cur_bias = dst_bias + i*n_kv;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                float v = -INFINITY;
+
+                if (!cells.is_empty(j) && cells.seq_has(j, seq_id) && cells.pos_get(j) <= q) {
+                    // finite, so it can never meet a -inf and produce a nan
+                    v = cells.pos_get(j) >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                }
+
+                cur_bias[j] = v;
             }
         }
     }
@@ -2338,7 +2483,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
     if (dest_seq_id != -1) {
         // single sequence
+        static const bool _trc = std::getenv("FLE_SPEC_TRACE") != nullptr;
+        const uint32_t _pre = cells.get_used();
         seq_rm(dest_seq_id, -1, -1);
+        const uint32_t _cleared = cells.get_used();
+        if (_trc) {
+            fprintf(stderr, "[RESTORE] strm=%u used_pre=%u used_cleared=%u cell_count=%u\n",
+                    strm, _pre, _cleared, cell_count);
+            fflush(stderr);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2742,6 +2895,11 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_context::get_n_stream() const {
+    // streams in the current slot info, matching get_k/get_v's `ns`. 1 if unified.
+    return sinfos[i_cur].s1 - sinfos[i_cur].s0 + 1;
+}
+
 ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
@@ -2800,6 +2958,16 @@ void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ub
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_qsa(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio) const {
+    kv->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio);
 }
 
 void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {

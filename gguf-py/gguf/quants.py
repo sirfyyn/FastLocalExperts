@@ -33,8 +33,19 @@ def _apply_over_grouped_rows(func: Callable[[np.ndarray], np.ndarray], arr: np.n
     for dim in oshape:
         osize *= dim
     out = np.empty(shape=osize, dtype=otype)
-    # compute over groups of 16 rows (arbitrary, but seems good for performance)
-    n_groups = (rows.shape[0] // 16) or 1
+    # Groups of 16 rows, but capped.
+    #
+    # The 16 was arbitrary according to the original comment and fine for ordinary
+    # tensors. A very large n-gram table (320,001,536 rows) would give 20,000,096
+    # groups of 10 KB. Because every quantizer makes TWO passes over its data
+    # (abs().max(), then blocks * id) and the source is a 190 GiB mmap file, the
+    # pages are evicted in between and read again: measured 538 GiB read at
+    # 66 MiB/s, 12 % CPU, and no output file after 85 min.
+    #
+    # With 4096 groups each group is 78,125 rows = 50 MB, so both passes stay in
+    # the page cache. Tensors under 65,536 rows are unaffected, since
+    # rows.shape[0] // 16 stays below 4096.
+    n_groups = max(1, min(rows.shape[0] // 16, 4096))
     np.concatenate([func(group).ravel() for group in np.array_split(rows, n_groups)], axis=0, out=out)
     return out.reshape(oshape)
 

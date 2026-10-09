@@ -9575,6 +9575,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // ---- MUL_MAT_ID: out-of-bounds read on CUDA when ncols_x is not a multiple of
+    //      config.K_vram (= MMQ_ITER_K = 256, mmq.cuh:9).
+    //      Reproduced on RTX PRO 4500 Blackwell (sm_120), deterministic, 4/4 runs.
+    //
+    //   MMQ_K=640   fails   640 %512=128 padded   640 %256=128  not a K_vram multiple
+    //   MMQ_K=768   ?       768 %512=256 padded   768 %256=  0  IS a K_vram multiple
+    //   MMQ_K=1024  passes 1024 %512=  0 unpadded 1024%256=  0  IS a K_vram multiple
+    //
+    //   768 is the only kind of value that separates "padding" from "k % K_vram".
+    //
+    // The failure needs the preceding cases in the same process: running the failing
+    // shape in isolation passes, because the overread then lands in unmapped memory
+    // rather than a later block — it reads garbage silently instead of faulting.
+    //
+    // compute-sanitizer --tool memcheck:
+    //   Invalid __global__ read of size 4 bytes
+    //     at mul_mat_q<(ggml_type)12, (int)128, (bool)0>
+    //   address is ~5x the y buffer size past its end -> wrong stride, not off-by-one
+    //
+    // One k per process, because the first fault aborts the run.
+    {
+        const char * mk = getenv("MMQ_K");
+        const int64_t k = mk ? atoll(mk) : 640;
+        // FLE: n_used is made configurable (MMQ_NUSED), like MMQ_K above. All 36 cases
+        // of the earlier cross product ran with n_used=10 —
+        // **whether the fault also occurs with n_used=4 was never asked.**
+        //
+        // The answer matters beyond bug hunting: `mm_ids_pow2<n>` pads to
+        // the next power of two, so 10 -> 16 leaves six ghost slots, 4 -> 4 leaves
+        // none. If the fault depends on that, the operating point k=4
+        // resolves the blocker as a side effect.
+        //
+        // PREDICTION, fixed before the run: 4 and 8 pass (0 ghost slots),
+        // 6 and 10 crash (2 and 6). A PATTERN, not a trend — harder to hit
+        // by chance than a single direction.
+        const char * mn = getenv("MMQ_NUSED");
+        const int    nused = mn ? atoi(mn) : 10;
+        for (int64_t n : {1, 8, 9, 16, 30, 31, 32, 33, 48, 63, 64, 65, 127, 128, 129, 255, 256, 257, 508, 511, 512, 513}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,   GGML_TYPE_F32, 512, nused, false,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, nused, false, 2560, n,    k));
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));

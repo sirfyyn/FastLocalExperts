@@ -39,6 +39,107 @@
 #include <syscall.h>
 #endif
 
+// FLE Patch 51: crash report. A SIGSEGV or SIGBUS while a CPU thread computes a graph node prints that node, its
+// sources with their address ranges (and which one holds the fault address), the expert ids of a MUL_MAT_ID and a
+// backtrace to stderr, then re-raises the signal with the default action (exit status and core dump unchanged).
+// Reason (2026-10-07): a long-running server died with a SEGV in ggml_vec_dot_iq4_nl_q8_0 that left no core dump and
+// no hint which tensor had been read. Cost: one thread-local store per node. FLE_CRASH_REPORT=0 turns it off.
+#if defined(__gnu_linux__)
+#include <execinfo.h>
+#include <unistd.h>
+#define FLE_CRASH_REPORT 1
+static _Thread_local const struct ggml_tensor * fle_crash_node = NULL;
+static _Thread_local int                        fle_crash_ith  = -1;
+
+static void fle_crash_write(const char * s) {
+    size_t n = strlen(s);
+    while (n > 0) {
+        const ssize_t w = write(STDERR_FILENO, s, n);
+        if (w <= 0) {
+            return;
+        }
+        s += w;
+        n -= (size_t) w;
+    }
+}
+
+static void fle_crash_tensor(const char * role, const struct ggml_tensor * t, const void * addr) {
+    char buf[640];
+    const char * d  = (const char *) t->data;
+    const size_t nb = ggml_nbytes(t);
+    const bool inside = d && (const char *) addr >= d && (const char *) addr < d + nb;
+    snprintf(buf, sizeof(buf), "[fle-crash]   %s %s: %s ne [%lld, %lld, %lld, %lld] data %p..%p (%zu B)%s\n",
+            role, t->name, ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+            (long long) t->ne[3], (const void *) d, (const void *) (d ? d + nb : NULL), nb,
+            inside ? "  <- fault address inside" : "");
+    fle_crash_write(buf);
+}
+
+static void fle_crash_handler(int sig, siginfo_t * si, void * uc) {
+    (void) uc;
+    char buf[640];
+    const struct ggml_tensor * n = fle_crash_node;
+    snprintf(buf, sizeof(buf), "[fle-crash] %s at %p (si_code %d), CPU thread %d (tid %ld), node %s, op %s\n",
+            sig == SIGBUS ? "SIGBUS" : "SIGSEGV", si->si_addr, si->si_code, fle_crash_ith, (long) syscall(SYS_gettid),
+            n ? n->name : "(none: not inside a CPU graph)", n ? ggml_op_desc(n) : "-");
+    fle_crash_write(buf);
+    if (n) {
+        fle_crash_tensor("dst ", n, si->si_addr);
+        for (int i = 0; i < GGML_MAX_SRC && n->src[i]; ++i) {
+            char role[8];
+            snprintf(role, sizeof(role), "src%d", i);
+            fle_crash_tensor(role, n->src[i], si->si_addr);
+        }
+        const struct ggml_tensor * ids = n->src[2];
+        if (n->op == GGML_OP_MUL_MAT_ID && ids && ids->data && ids->type == GGML_TYPE_I32) {
+            const int64_t n_as = n->src[0]->ne[2];
+            int len = snprintf(buf, sizeof(buf), "[fle-crash]   expert ids (n_expert %lld, [%lld x %lld]):",
+                    (long long) n_as, (long long) ids->ne[0], (long long) ids->ne[1]);
+            int shown = 0;
+            for (int64_t r = 0; r < ids->ne[1] && shown < 96; ++r) {
+                for (int64_t c = 0; c < ids->ne[0] && shown < 96; ++c, ++shown) {
+                    const int32_t v = *(const int32_t *) ((const char *) ids->data + r*ids->nb[1] + c*ids->nb[0]);
+                    if (len < (int) sizeof(buf) - 16) {
+                        len += snprintf(buf + len, sizeof(buf) - len, (v < 0 || v >= n_as) ? " !%d!" : " %d", v);
+                    }
+                }
+            }
+            if (len < (int) sizeof(buf) - 2) {
+                buf[len++] = '\n';
+                buf[len]   = '\0';
+            }
+            fle_crash_write(buf);
+        }
+    }
+    void * bt[48];
+    const int nbt = backtrace(bt, 48);
+    backtrace_symbols_fd(bt, nbt, STDERR_FILENO);
+    raise(sig);  // SA_RESETHAND restored the default action: terminate with core dump as before
+}
+
+static void fle_crash_install(void) {
+    const char * e = getenv("FLE_CRASH_REPORT");
+    if (e && strcmp(e, "0") == 0) {
+        return;
+    }
+    void * bt[1];
+    backtrace(bt, 1);  // loads libgcc now; the handler must not trigger that first load
+    const int sigs[2] = { SIGSEGV, SIGBUS };
+    for (int i = 0; i < 2; ++i) {
+        struct sigaction old;
+        if (sigaction(sigs[i], NULL, &old) != 0 || (old.sa_flags & SA_SIGINFO) || old.sa_handler != SIG_DFL) {
+            continue;  // someone else handles it: leave that alone
+        }
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = fle_crash_handler;
+        sa.sa_flags     = SA_SIGINFO | SA_RESETHAND;
+        sigemptyset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, NULL);
+    }
+}
+#endif
+
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -213,6 +314,21 @@ typedef pthread_t ggml_thread_t;
 #endif
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
+    [GGML_TYPE_IQ4_KT] = {
+        .vec_dot                  = ggml_vec_dot_iq4_kt_q8_K,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ3_KT] = {
+        .vec_dot                  = ggml_vec_dot_iq3_kt_q8_K,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_IQ2_KT] = {
+        .vec_dot                  = ggml_vec_dot_iq2_kt_q8_K,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
@@ -1641,15 +1757,72 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // llama MoE expert cache: when src[3] is set it is an I32 table mapping
+        // expert id -> device cache slot, with op_params[0] holding the "not
+        // cached" dummy value. Cached ids are served by the device-side cache
+        // chain, so this op skips them and zeroes their dst rows instead.
+        const int32_t * moe_tbl   = NULL;
+        int32_t         moe_dummy = 0;
+        if (dst->src[3]) {
+            moe_tbl   = (const int32_t *) dst->src[3]->data;
+            moe_dummy = ggml_get_op_params_i32(dst, 0);
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                // FLE Patch 51: checked in release builds too. An id outside [0, n_as) would read weights outside
+                // src0 (and moe_tbl); upstream's plain assert is compiled out with NDEBUG.
+                if (i02 < 0 || i02 >= n_as) {
+                    GGML_ABORT("%s: expert id %d outside [0, %d) (token %lld, slot %d of %d)",
+                            src0->name, i02, n_as, (long long) iid1, id, n_ids);
+                }
+
+                if (moe_tbl && moe_tbl[i02] != moe_dummy) {
+                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    continue;
+                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
+            }
+        }
+
+        // MoE routing observation for the llama expert cache
+        {
+            void * moe_obs_ud = NULL;
+            ggml_moe_obs_cb_t moe_obs_cb = ggml_get_moe_obs_callback(&moe_obs_ud);
+            if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
+                moe_obs_cb(src0->name, ids, moe_obs_ud);
+            }
+        }
+
+        // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
+        // mul_mat_id to the file named by the env var. Diagnostic only; the
+        // whole block is inert unless GGML_MOE_LOG is set at first use.
+        {
+            static FILE * moe_log_file  = NULL;
+            static int    moe_log_state = -1;
+            if (moe_log_state == -1) {
+                const char * moe_log_path = getenv("GGML_MOE_LOG");
+                if (moe_log_path && moe_log_path[0]) {
+                    moe_log_file = fopen(moe_log_path, "a");
+                }
+                moe_log_state = moe_log_file ? 1 : 0;
+            }
+            if (moe_log_state == 1 && strstr(src0->name, "ffn_gate_exps")) {
+                flockfile(moe_log_file);
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                    fprintf(moe_log_file, "%s", src0->name);
+                    for (int id = 0; id < n_ids; ++id) {
+                        const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        fprintf(moe_log_file, " %d", i02);
+                    }
+                    fputc('\n', moe_log_file);
+                }
+                funlockfile(moe_log_file);
             }
         }
     }
@@ -2101,6 +2274,22 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_FLE_HC_GATE_MEAN:
+            {
+                ggml_compute_forward_fle_hc_gate_mean(params, tensor);
+            } break;
+        case GGML_OP_FLE_HC_COMBINE:
+            {
+                ggml_compute_forward_fle_hc_combine(params, tensor);
+            } break;
+        case GGML_OP_FLE_HC_LR_A:
+            {
+                ggml_compute_forward_fle_hc_lr_a(params, tensor);
+            } break;
+        case GGML_OP_FLE_HC_LR_B:
+            {
+                ggml_compute_forward_fle_hc_lr_b(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2284,6 +2473,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_FLE_HC_GATE_MEAN:
+        case GGML_OP_FLE_HC_COMBINE:
+        case GGML_OP_FLE_HC_LR_A:
+        case GGML_OP_FLE_HC_LR_B:
             {
                 n_tasks = n_threads;
             } break;
@@ -3140,6 +3333,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
+#ifdef FLE_CRASH_REPORT
+        fle_crash_node = node;
+        fle_crash_ith  = state->ith;
+#endif
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3157,6 +3354,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
     }
+#ifdef FLE_CRASH_REPORT
+    fle_crash_node = NULL;
+#endif
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-done cplan %p\n", state->ith, (const void *)cplan);
@@ -3869,6 +4069,9 @@ void ggml_cpu_init(void) {
     static bool is_first_call = true;
 
     if (is_first_call) {
+#ifdef FLE_CRASH_REPORT
+        fle_crash_install();
+#endif
         // initialize GELU, Quick GELU, SILU and EXP F32 tables
         {
             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);

@@ -1,3 +1,5 @@
+> **FLE fork:** This is a private project: I build it for my own machine and publish it as it is. Hints, findings and bug reports are always welcome; acting on them, reviewing and merging can take a while, and there is no support promise. The guidelines below are the upstream llama.cpp ones.
+
 # Contributors
 
 The project differentiates between 3 levels of contributors:

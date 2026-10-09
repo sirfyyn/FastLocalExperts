@@ -383,6 +383,18 @@ extern "C" {
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
+        // GPU-resident LRU cache for host-offloaded MoE expert weights [EXPERIMENTAL]
+        int32_t  n_moe_cache_slots;   // cache slots per host-resident expert layer (0 = disabled)
+        int32_t  n_moe_cache_inserts; // max expert uploads per layer per decode step
+
+        // FLE: fewer routed experts / cache-aware routing while decoding [EXPERIMENTAL, qwen4exp only]
+        int32_t  n_moe_active_experts;    // routed experts per token (k1); 0 = the trained k
+        int32_t  n_moe_active_ref;        // reference set of the renormalisation denominator (k2); 0 = the trained k
+        float    moe_active_scale;        // fixed weight factor instead of the k2 reference; 0 = off
+        float    moe_cache_bias;          // additive routing bonus for experts resident in the MoE cache; 0 = off
+        int32_t  n_moe_active_max_tokens; // apply the settings above to ubatches of at most this many tokens; 0 = 8
+        const char * moe_active_layers;   // per-layer routed experts, "0-3:10,4-45:6"; nullptr = none
+
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
@@ -579,7 +591,16 @@ extern "C" {
     DEPRECATED(LLAMA_API int32_t llama_n_vocab    (const struct llama_vocab * vocab), "use llama_vocab_n_tokens instead");
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
+
+    // Replicates the tok_embd/output shared from the target onto the device of
+    // ctx_dft if that differs from the target device (cross-device speculation).
+    // No-op if the device is the same. Returns true on success (or no-op).
+    LLAMA_API bool llama_context_replicate_shared_tensors(struct llama_context * ctx_dft,
+                                                          struct llama_context * ctx_tgt);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
+
+    // true if this memory shares its KV cells with another context's memory
+    LLAMA_API bool llama_memory_has_shared_cells(llama_memory_t mem);
     LLAMA_API  enum llama_pooling_type   llama_pooling_type(const struct llama_context * ctx); // TODO: rename to llama_get_pooling_type
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
@@ -1055,6 +1076,10 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+
+    // FLE eagle3/DFlash: per-layer input hidden-state capture
+    LLAMA_API void    llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+    LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE

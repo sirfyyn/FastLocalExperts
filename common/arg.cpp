@@ -1,4 +1,5 @@
 #include "arg.h"
+#include <cstdlib>
 
 #include "build-info.h"
 #include "chat.h"
@@ -249,6 +250,11 @@ std::vector<std::string> common_arg::get_env() const {
 //
 
 // Helper function to parse tensor buffer override strings
+// Pager buffer-type factory (symbol in libggml-cuda, FLE_EXPORT, resolved at runtime). Forward declaration instead of an include (no include path needed).
+namespace fle { namespace pager {
+ggml_backend_buffer_type_t pager_buffer_type(int device, size_t vram_budget_bytes);
+} }
+
 static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
     ggml_backend_load_all();
 
@@ -258,6 +264,23 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         auto * buft = ggml_backend_dev_buffer_type(dev);
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
+        }
+    }
+
+    // Opt-in PAGER buffer type (only if FLE_PAGER_VRAM_MB is set). The factory is lazy
+    // (no VRAM until a tensor is bound via -ot ...=PAGER). This then activates the pager hooks.
+    if (const char * fle_vm = std::getenv("FLE_PAGER_VRAM_MB")) {
+        const size_t fle_budget = (size_t) std::atoll(fle_vm) * 1024ull * 1024ull;
+        ggml_backend_buffer_type_t fle_pbt = fle::pager::pager_buffer_type(0, fle_budget);
+        if (fle_pbt) {
+            buft_list["PAGER"] = fle_pbt;
+            buft_list["PAGER0"] = fle_pbt;
+        }
+        // Multi-device pool: second GPU pager via FLE_PAGER_VRAM_MB1 -> -ot ...=PAGER1
+        if (const char * fle_vm1 = std::getenv("FLE_PAGER_VRAM_MB1")) {
+            const size_t b1 = (size_t) std::atoll(fle_vm1) * 1024ull * 1024ull;
+            ggml_backend_buffer_type_t pbt1 = fle::pager::pager_buffer_type(1, b1);
+            if (pbt1) buft_list["PAGER1"] = pbt1;
         }
     }
 
@@ -2540,6 +2563,62 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
         }
     ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
+    add_opt(common_arg(
+        {"--moe-expert-cache"}, "N",
+        string_format("GPU cache slots per host-resident MoE expert layer, 0 = disabled (default: %d)", params.n_moe_cache_slots),
+        [](common_params & params, int value) {
+            params.n_moe_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-inserts"}, "N",
+        string_format("max expert uploads per layer per decode step for the MoE expert cache (default: %d)", params.n_moe_cache_inserts),
+        [](common_params & params, int value) {
+            params.n_moe_cache_inserts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
+    add_opt(common_arg(
+        {"--moe-active-experts"}, "K1[,K2]",
+        "routed experts per token while decoding (qwen4exp); the optional K2 sets the reference set of the "
+        "renormalisation denominator (default: the trained k). 0 = the trained k (default: 0)",
+        [](common_params & params, const std::string & value) {
+            const auto comma = value.find(',');
+            params.n_moe_active_experts = std::stoi(value.substr(0, comma));
+            params.n_moe_active_ref     = comma == std::string::npos ? 0 : std::stoi(value.substr(comma + 1));
+        }
+    ).set_env("LLAMA_ARG_MOE_ACTIVE_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-active-scale"}, "S",
+        "fixed factor on the renormalised expert weights when fewer experts are active, replaces the K2 reference "
+        "(default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_active_scale = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_ACTIVE_SCALE"));
+    add_opt(common_arg(
+        {"--moe-cache-bias"}, "G",
+        "routing bonus, in probability units, for experts resident in the MoE expert cache; it only steers the "
+        "selection, the weights stay unbiased (default: 0 = off)",
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_bias = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_BIAS"));
+    add_opt(common_arg(
+        {"--moe-active-max-tokens"}, "N",
+        "ubatches of at most N tokens (decode, draft verification) use --moe-active-experts and --moe-cache-bias; "
+        "larger ones (prompt processing) keep the trained routing (default: 8)",
+        [](common_params & params, int value) {
+            params.n_moe_active_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_ACTIVE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--moe-active-layers"}, "SPEC",
+        "routed experts per token for single layers while decoding, \"0-3:10,4-45:6\" (from-to:k or layer:k); layers "
+        "without an entry use --moe-active-experts",
+        [](common_params & params, const std::string & value) {
+            params.moe_active_layers = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_ACTIVE_LAYERS"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
@@ -2800,6 +2879,95 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+    // Two distinct options, not two versions of the same one: -ngmoe distributes MoE
+    // weights over GPUs of unequal size, -ncffn places the dense FFN of the first N
+    // layers on the CPU.
+        {"-ngmoe", "--n-gpu-moe"}, "N0[,N1,...]",
+        "MoE weights per GPU: counts (15,7 = layers 0-14 on GPU0, 15-21 on GPU1) or "
+        "explicit ranges (4-18,19-25); combine with -cmoe for the remainder",
+        [](common_params & params, const std::string & value) {
+            // Counterpart to -ncmoe for MULTIPLE GPUs of unequal size. Without it the split
+            // had to be written by hand as an `-ot` regex
+            // (`blk\.(0|1|...|14)\.ffn_.*_exps\.=CUDA0,...`) - error-prone, and a
+            // typo in the regex strikes silently: the alternative then matches the empty
+            // string and ALL layers end up on one card, while the run name claims
+            // something else.
+            std::vector<ggml_backend_buffer_type_t> gpu_bufts;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    gpu_bufts.push_back(ggml_backend_dev_buffer_type(dev));
+                }
+            }
+            if (gpu_bufts.empty()) {
+                throw std::invalid_argument("-ngmoe: no GPU device found");
+            }
+            // Two forms per entry, because a plain count contains an assumption that
+            // is wrong for some models: it ALWAYS distributes starting at layer 0. For
+            // Qwen3.8-Flash-Next the N-gram embedding is fed in at block 1, and
+            // its table (`per_layer_token_embd`, 50 GiB) necessarily lives on the CPU.
+            // If the experts of that block are on the GPU, it costs a forced
+            // transfer per token in the middle of the first hybrid block. Without a range
+            // specification, "skip the first block" cannot be expressed at all.
+            //
+            //   count:  -ngmoe 15,7        layers 0..14 on GPU0, 15..21 on GPU1
+            //   range:  -ngmoe 4-18,19-25  layers 4..18 on GPU0, 19..25 on GPU1
+            std::vector<std::pair<int,int>> ranges;   // [from, to] inclusive
+            {
+                int next_layer = 0;
+                size_t pos = 0;
+                while (pos <= value.size()) {
+                    size_t comma = value.find(',', pos);
+                    std::string part = value.substr(pos, comma == std::string::npos
+                                                        ? std::string::npos : comma - pos);
+                    if (part.empty()) {
+                        throw std::invalid_argument("-ngmoe: empty entry in list");
+                    }
+                    size_t dash = part.find('-');
+                    if (dash != std::string::npos) {
+                        int a = std::stoi(part.substr(0, dash));
+                        int b = std::stoi(part.substr(dash + 1));
+                        if (a < 0 || b < a) {
+                            throw std::invalid_argument("-ngmoe: invalid range '" + part + "'");
+                        }
+                        ranges.emplace_back(a, b);
+                        next_layer = b + 1;
+                    } else {
+                        int n = std::stoi(part);
+                        if (n < 0) {
+                            throw std::invalid_argument("-ngmoe: negative count");
+                        }
+                        if (n > 0) ranges.emplace_back(next_layer, next_layer + n - 1);
+                        else       ranges.emplace_back(0, -1);   // empty: skip this GPU
+                        next_layer += n;
+                    }
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+            }
+            std::vector<int> counts(ranges.size(), 0);
+            if (ranges.size() > gpu_bufts.size()) {
+                throw std::invalid_argument(string_format(
+                    "-ngmoe: %zu entries given but only %zu GPU device(s) present",
+                    ranges.size(), gpu_bufts.size()));
+            }
+            // Insert at the FRONT, do not append: the first matching entry wins, and
+            // a `-cmoe` would otherwise catch everything depending on the order on the
+            // command line. This way -ngmoe works regardless of where it appears.
+            std::vector<llama_model_tensor_buft_override> front;
+            for (size_t g = 0; g < ranges.size(); ++g) {
+                for (int layer = ranges[g].first; layer <= ranges[g].second; ++layer) {
+                    static std::list<std::string> ngmoe_regexes;
+                    ngmoe_regexes.push_back(llm_ffn_block_regex(layer, LLM_FFN_EXPS_REGEX));
+                    front.push_back({ ngmoe_regexes.back().c_str(), gpu_bufts[g] });
+                }
+            }
+            (void) counts;
+            params.tensor_buft_overrides.insert(params.tensor_buft_overrides.begin(),
+                                                front.begin(), front.end());
+        }
+    ).set_env("LLAMA_ARG_N_GPU_MOE"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

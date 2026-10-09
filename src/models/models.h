@@ -1281,6 +1281,16 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 int il) const;
 
+        // DSpark context channel: main_x is built ONCE in the graph and projected to KV by each
+        // draft layer with its OWN wkv (reference semantics). main_x is cached, not the KV --
+        // so there is no shared KV storage that could be reused by mistake. The model is carried
+        // along so that the layer weights are reachable without a signature change.
+        mutable ggml_tensor      * dspark_main_x   = nullptr;
+        mutable ggml_tensor      * dspark_ctx_mask = nullptr;
+        mutable ggml_tensor      * dspark_ctx_pos  = nullptr;
+        mutable ggml_tensor      * dspark_main_kv  = nullptr;  // rebuilt per layer, never shared
+        mutable const llama_model * dspark_model   = nullptr;
+
         ggml_tensor * build_raw_attention(
                 llm_graph_input_dsv4_raw * inp_attn,
                 ggml_tensor * q,
@@ -1305,6 +1315,16 @@ struct llama_model_deepseek4 : public llama_model_base {
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
+// FLE: DSpark drafter as its OWN architecture (create a proper category instead of masquerading).
+// Inherits the verified building blocks (build_hc_pre/post/head, build_attention) from deepseek4,
+// but brings its own tensor contract (no compress/tid2eid requirement) and its own graph.
+struct llama_model_dspark_draft : public llama_model_deepseek4 {
+    llama_model_dspark_draft(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+};
+
 
 
 struct llama_model_deepseek2ocr : public llama_model_base {
@@ -1969,6 +1989,7 @@ struct llama_model_hy_v3 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // Hy3 MTP/NextN forward graph (gated LLM_GRAPH_TYPE_DECODER_MTP)
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
     };
@@ -2194,8 +2215,14 @@ struct llama_model_minimax_m2 : public llama_model_base {
         graph(const llama_model & model, const llm_graph_params & params);
     };
 
+    // NextN/MTP forward graph (gated by DECODER_MTP)
+    struct graph_mtp : public llm_graph_context {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
+    };
+
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
+
 
 struct msa_params {
     int blk;
@@ -2341,6 +2368,14 @@ struct llama_model_qwen35 : public llama_model_base {
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
+    // PLE predecessors are absent from a decode ubatch, so remember them here
+    // (vLLM's ngram_context). next_pos guards it: a mismatch means the sequence
+    // was reset or rewound, and the hash falls back to EOS padding.
+    struct ple_history {
+        llama_pos                next_pos = -1;
+        std::vector<llama_token> toks;
+    };
+    mutable std::unordered_map<llama_seq_id, ple_history> ple_hist;
     class llm_graph_input_qsa;
 
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -2348,7 +2383,11 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2438,6 +2477,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

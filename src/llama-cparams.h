@@ -21,6 +21,14 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // FLE: fewer routed experts / cache-aware routing while decoding (llama_context_params)
+    int32_t  n_moe_active_experts    = 0;
+    int32_t  n_moe_active_ref        = 0;
+    float    moe_active_scale        = 0.0f;
+    float    moe_cache_bias          = 0.0f;
+    int32_t  n_moe_active_max_tokens = 0;
+    std::vector<int32_t> moe_active_layers;   // per layer k1, 0 = --moe-active-experts
+
     float rope_freq_base;
     float rope_freq_scale;
 
@@ -54,7 +62,10 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
-    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    // [n_layer() + 1]: the last entry is the FINAL STATE (lid == n_layer),
+    // not a layer. DFlash `target_layers` ends there. The size is n_layer() + 1,
+    // see llama-context.cpp.
+    std::vector<bool> embeddings_layer_inp;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
@@ -64,4 +75,9 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+
+    // Cross-device DFlash: device-local copies of the tensors shared by the target
+    // (tok_embd/output). nullptr = shared within the device (default, no replica).
+    struct ggml_tensor * replica_tok_embd = nullptr;
+    struct ggml_tensor * replica_output   = nullptr;
 };

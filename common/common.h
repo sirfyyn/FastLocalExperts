@@ -336,6 +336,10 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // combined spec-types: when an external draft model is combined with draft-mtp,
+    // ctx_dft belongs to the external draft model and ctx_mtp is the MTP context on the target model
+    llama_context * ctx_mtp = nullptr;
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -450,6 +454,14 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    int32_t n_moe_cache_slots     = 0;    // GPU cache slots per host-resident MoE expert layer (0 = disabled)
+    int32_t n_moe_cache_inserts   = 2;    // max expert uploads per layer per decode step
+    int32_t n_moe_active_experts  = 0;    // routed experts per token while decoding (k1), 0 = the trained k [qwen4exp]
+    int32_t n_moe_active_ref      = 0;    // reference set of the renormalisation denominator (k2), 0 = the trained k
+    float   moe_active_scale      = 0.0f; // fixed weight factor instead of the k2 reference, 0 = off
+    float   moe_cache_bias        = 0.0f; // additive routing bonus for experts resident in the MoE cache, 0 = off
+    int32_t n_moe_active_max_tokens = 0;  // ubatches up to this size use k1 / the bias, 0 = 8
+    std::string moe_active_layers;        // per-layer routed experts, "0-3:10,4-45:6"
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

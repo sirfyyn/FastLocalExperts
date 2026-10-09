@@ -81,12 +81,29 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     // optional interleaved sliding-window attention with per-layer pattern array.
     // DFlash has a single rope, so the SWA rope == main rope.
+    // Union of both approaches, not either-or.
+    // Upstream provides the clean path when the GGUF carries the keys, plus the
+    // rope_*_train_swa fields that were missing here.
+    // Our fallback stays as the else branch: the DFlash export omits
+    // sliding_window (config.json: all 6 layers are sliding_attention, window 512).
+    // Without it the draft KV would be allocated as FULL attention -- ~6.4 GB at 256k and
+    // OOM next to the target's KV reserve.
     if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
         hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
         ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
         hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
         hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+    } else {
+        hparams.n_swa    = 512;
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+        if (!ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer(), false)) {
+            std::fill_n(hparams.is_swa_impl.begin(), hparams.n_layer(), 1u);
+        }
     }
+    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
 
     type = LLM_TYPE_UNKNOWN;
 }
@@ -152,6 +169,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     fc_s            = create_tensor(tn(LLM_TENSOR_FC,              "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
     output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), { n_embd }, 0); // encoder hidden_norm (after fc)
     output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,    "weight"), { n_embd }, 0); // decoder final norm
+    // Laguna-DFlash (optional): one RMS weight set per source layer before fc
+    dflash_aux_norm = create_tensor(tn(LLM_TENSOR_DFLASH_AUX_NORM, "weight"), { n_embd, n_embd_inp / n_embd }, TENSOR_NOT_REQUIRED);
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab drafts can share the target's via ctx_other
     // a draft with its own embeddings + head references no target tensors and can run on devices the target does not use (e.g. -devd with a tensor-split target)
@@ -219,6 +238,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), { n_embd_head_k }, 0);
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
+        // Laguna-DFlash (optional): per-head softplus Output-Gate
+        layer.wqkv_gate   = create_tensor(tn(LLM_TENSOR_ATTN_GATE,   "weight", i), { n_embd, n_head }, TENSOR_NOT_REQUIRED);
 
         // optional per-head attention sinks (e.g. Nemotron DSpark)
         layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, "weight", i), { n_head }, TENSOR_NOT_REQUIRED);
@@ -276,6 +297,20 @@ template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = build_inp_embd_enc();
 
+    if (model.dflash_aux_norm) {
+        // Laguna: RMS-normalise each source-layer slice [n_embd] separately,
+        // then scale with the layer's own weight set (enc.aux_norm).
+        const int64_t n_e   = model.dflash_aux_norm->ne[0];
+        const int64_t n_aux = model.dflash_aux_norm->ne[1];
+        const int64_t n_tok = cur->ne[1];
+        cur = ggml_reshape_3d(ctx0, cur, n_e, n_aux, n_tok);
+        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+        cur = ggml_mul(ctx0, cur, model.dflash_aux_norm);
+        cur = ggml_reshape_2d(ctx0, cur, n_e * n_aux, n_tok);
+        cb(cur, "enc_aux_norm", -1);
+    }
+
+    // upstream: pass fc_s (scale) -- the third parameter was missing here.
     cur = build_lora_mm(model.fc, cur, model.fc_s);
     cb(cur, "fc_out", -1);
 
@@ -676,7 +711,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         const auto * model_other = llama_get_model(cparams.ctx_other);
 
         GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        tok_embd = cparams.replica_tok_embd ? cparams.replica_tok_embd : model_other->tok_embd;
     }
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
@@ -722,10 +757,35 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Kcur, "Kcur", il);
         cb(Vcur, "Vcur", il);
 
-        // cache-aware, non-causal attention
+        // Laguna-DFlash: gate projection from the pre-QKV hidden state (as in laguna.cpp)
+        ggml_tensor * gate = nullptr;
+        if (layer.wqkv_gate) {
+            gate = build_lora_mm(layer.wqkv_gate, noise_norm);
+            cb(gate, "attn_gate_proj", il);
+        }
+
+        // cache-aware, non-causal attention (o_proj deferred when gating)
+        ggml_tensor * wo_now = gate ? NULL : layer.wo;
+        ggml_tensor * wo_s_now = gate ? NULL : layer.wo_s;
+        // wo_s belongs to wo: if it is deferred, the gating has to apply it.
+        // Today dflash.cpp creates no wo_s -- if someone adds one, this should
+        // fail LOUDLY instead of silently swallowing the scale.
+        GGML_ASSERT(!(gate && layer.wo_s) && "dflash: wo_s together with attention gating is untested");
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo_now, NULL, wo_s_now, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo_now, NULL, wo_s_now, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+
+        if (gate) {
+            gate = ggml_softplus(ctx0, gate);
+            cb(gate, "attn_gate_softplus", il);
+            const int64_t n_tok = cur->ne[1];
+            cur  = ggml_reshape_3d(ctx0, cur,  n_embd_head, n_head, n_tok);
+            gate = ggml_reshape_3d(ctx0, gate, 1,           n_head, n_tok);
+            cur  = ggml_mul(ctx0, cur, gate);
+            cur  = ggml_reshape_2d(ctx0, cur, n_embd_head * n_head, n_tok);
+            cur  = build_lora_mm(layer.wo, cur);
+            cb(cur, "attn_gated_o", il);
+        }
 
         if (attn_dynamic) {
             cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
@@ -776,7 +836,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         GGML_ASSERT(cparams.ctx_other != nullptr);
         const auto * model_other = llama_get_model(cparams.ctx_other);
         GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output   = model_other->output;
+        // Union: our replica for cross-device DFlash stays,
+        // upstream's output_s is added.
+        output   = cparams.replica_output ? cparams.replica_output : model_other->output;
         output_s = model_other->output_s;
     }
 

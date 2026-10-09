@@ -1423,6 +1423,39 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
+
+            // FLE_PLE_NVME: keep named tensors on disk instead of pulling them into RAM
+            // with MAP_POPULATE. Intended for the PLE n-gram table
+            // (per_layer_token_embd, 50.66 GiB) - a lookup table with
+            // 170-byte rows, for which both read-ahead and residency are wrong.
+            // Default off. The value is a list of name fragments, comma separated.
+            if (const char * pattern = std::getenv("FLE_PLE_NVME")) {
+                const uint16_t idx_file = (uint16_t) mappings.size();
+                std::vector<std::string> parts;
+                { std::string s(pattern), t; std::istringstream is(s);
+                  while (std::getline(is, t, ',')) { if (!t.empty()) { parts.push_back(t); } } }
+                size_t n_matched = 0, bytes = 0;
+                for (const auto & kv : weights_map) {
+                    const auto & w = kv.second;
+                    if (w.idx != idx_file) { continue; }
+                    bool matches = false;
+                    for (const auto & t : parts) {
+                        if (kv.first.find(t) != std::string::npos) { matches = true; break; }
+                    }
+                    if (!matches) { continue; }
+                    const size_t n = ggml_nbytes(w.tensor);
+                    mapping->keep_on_disk(w.offs, w.offs + n, file->file_id());
+                    n_matched++; bytes += n;
+                }
+                // Reference count: without it "nothing matched" and "not set"
+                // look the same.
+                LLAMA_LOG_INFO("[fle-ple] FLE_PLE_NVME='%s': %zu tensors matched, %.2f GiB\n",
+                        pattern, n_matched, bytes / 1073741824.0);
+                if (n_matched == 0) {
+                    LLAMA_LOG_WARN("[fle-ple] WARNING: no tensor matched '%s' - switch has no effect\n", pattern);
+                }
+            }
+
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());

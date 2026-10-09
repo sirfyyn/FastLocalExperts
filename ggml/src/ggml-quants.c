@@ -2740,6 +2740,135 @@ void dequantize_row_iq4_nl(const block_iq4_nl * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ==== Adapted from ik_llama.cpp (MIT), https://github.com/ikawrakow/ik_llama.cpp: trellis quants (QTIP 3INST) — IQ2_KT scalar dequant ====
+static const int8_t iq2kt_iq4k_values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+static inline void iq2_kt_set_values(uint32_t i, float * result, float scale) {
+    uint32_t x = i + 4096;                 // offset
+    const uint32_t ka = 0xCBAC1FED;        // QTIP 3INST multiplier
+    uint32_t s;
+    const int8_t * i8 = (const int8_t *)&s;
+    for (int k = 0; k < 8; ++k) {          // kGroupSize
+        x = ka*x;
+        s = x & 0x3f3f3f3f;
+        result[k] = scale*(i8[0] + i8[1] + i8[2] + i8[3] - 126.f);
+    }
+}
+void dequantize_row_iq2_kt(const block_iq2_kt * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    const float * dptr = (const float *)x;
+    const float d = *dptr;                 // kScale = 1.0
+    x = (const block_iq2_kt *)(dptr + 1);
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        float * yl = y + ibl*QK_K;
+        float * yh = yl + QK_K/2;
+        const uint16_t * ql = (const uint16_t *)x[ibl].ql;
+        const uint16_t * qh = ql + 16;     // kNg*kNblock/2 = 4*8/2
+        for (int ib = 0; ib < 4; ++ib) {   // kNblock/2
+            const float sl = d * iq2kt_iq4k_values[x[ibl].scales[ib] & 0xf];
+            const float sh = d * iq2kt_iq4k_values[x[ibl].scales[ib] >>  4];
+            for (int ig = 0; ig < 4; ++ig) { // kNg
+                iq2_kt_set_values(ql[ig], yl, sl);
+                iq2_kt_set_values(qh[ig], yh, sh);
+                yl += 8; yh += 8;
+            }
+            ql += 4; qh += 4;
+        }
+    }
+}
+void quantize_row_iq2_kt_ref(const float * GGML_RESTRICT x, block_iq2_kt * GGML_RESTRICT y, int64_t k) {
+    (void)x; (void)y; (void)k;
+    GGML_ABORT("quantize_row_iq2_kt_ref not yet ported (dequant-only increment)");
+}
+
+// ==== IQ3_KT scalar dequant (adapted from ik_llama.cpp, MIT): int-abs trellis + qh sign bits ====
+static inline void iq3_kt_set_values_abs(uint32_t i, float * result, float scale) {
+    uint32_t x = i + 4096;
+    const uint32_t ka = 0xCBAC1FED;
+    uint32_t s;
+    const int8_t * i8 = (const int8_t *)&s;
+    for (int k = 0; k < 8; ++k) {
+        x = ka*x;
+        s = x & 0x3f3f3f3f;
+        float v = (float)(i8[0]+i8[1]+i8[2]+i8[3]) - 126.f;
+        result[k] = scale*(v < 0 ? -v : v);       // is_abs
+    }
+}
+void dequantize_row_iq3_kt(const block_iq3_kt * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    const float * dptr = (const float *)x;
+    const float d = *dptr;                          // kScale=1.0
+    x = (const block_iq3_kt *)(dptr + 1);
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        float * yl = y + ibl*QK_K;
+        float * yh = yl + QK_K/2;
+        const uint16_t * qll = (const uint16_t *)x[ibl].ql;
+        const uint16_t * qlh = qll + 16;            // kNumGroups/2 = 32/2
+        int jj = 0;
+        for (int ib = 0; ib < 4; ++ib) {            // kNblock/2
+            const float sl = d * (x[ibl].scales[ib] & 0xf);   // RAW nibble
+            const float sh = d * (x[ibl].scales[ib] >>  4);
+            const uint8_t l_mask = 1 << ib;
+            const uint8_t h_mask = l_mask << 4;     // kNblock/2
+            for (int ig = 0; ig < 4; ++ig) {        // kNg
+                iq3_kt_set_values_abs(qll[jj], yl, sl);
+                iq3_kt_set_values_abs(qlh[jj], yh, sh);
+                for (int j = 0; j < 8; ++j) {       // kGroupSize
+                    if (x[ibl].qh[ig*8+j] & l_mask) yl[j] = -yl[j];
+                    if (x[ibl].qh[ig*8+j] & h_mask) yh[j] = -yh[j];
+                }
+                yl += 8; yh += 8; ++jj;
+            }
+        }
+    }
+}
+void quantize_row_iq3_kt_ref(const float * GGML_RESTRICT x, block_iq3_kt * GGML_RESTRICT y, int64_t k) {
+    (void)x; (void)y; (void)k; GGML_ABORT("quantize_row_iq3_kt_ref not yet ported");
+}
+
+// ==== IQ4_KT scalar dequant (adapted from ik_llama.cpp, MIT): int-nonabs trellis, kGroupSize=4, 15-bit idx, offset toggle ====
+static inline void iq4_kt_set_values(uint32_t i, float * result, float scale, int offset) {
+    uint32_t x = i + (uint32_t)offset;
+    const uint32_t ka = 0xCBAC1FED;
+    uint32_t s;
+    const int8_t * i8 = (const int8_t *)&s;
+    for (int k = 0; k < 4; ++k) {              // kGroupSize=4
+        x = ka*x;
+        s = x & 0x3f3f3f3f;
+        result[k] = scale*((float)(i8[0]+i8[1]+i8[2]+i8[3]) - 126.f);
+    }
+}
+void dequantize_row_iq4_kt(const block_iq4_kt * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = k / QK_K;
+    const float * dptr = (const float *)x;
+    const float d = *dptr;                      // kScale=1.0
+    x = (const block_iq4_kt *)(dptr + 1);
+    float * yy = y;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const uint32_t * shb = x[ibl].qs;
+        const uint8_t * ql = (const uint8_t *)(shb + 8);   // kNblock
+        const uint8_t * qh = ql + 64;                       // kNumGroups
+        for (int ib = 0; ib < 8; ++ib) {        // kNblock
+            const int offset = (shb[ib] & 1) ? (32768 + 4096) : 4096;
+            const int ls = (int)((shb[ib] & 0xff) >> 1) - 64;
+            const float sl = d * ls;
+            for (int ig = 0; ig < 8; ++ig) {    // kNg
+                const int jj = ib*8 + ig;
+                const uint16_t idx = (uint16_t)( (uint32_t)ql[jj]
+                    | (((uint32_t)qh[jj % 32] << (8 - 4*(jj/32))) & 0xf00)
+                    | ((((uint32_t)shb[ib] >> (8 + 3*ig)) & 7u) << 12) );
+                iq4_kt_set_values(idx, yy, sl, offset);
+                yy += 4;                        // kGroupSize
+            }
+        }
+    }
+}
+void quantize_row_iq4_kt_ref(const float * GGML_RESTRICT x, block_iq4_kt * GGML_RESTRICT y, int64_t k) {
+    (void)x; (void)y; (void)k; GGML_ABORT("quantize_row_iq4_kt_ref not yet ported");
+}
+
 void dequantize_row_iq4_xs(const block_iq4_xs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;

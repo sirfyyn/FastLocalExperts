@@ -1,0 +1,5 @@
+set(TARGET fle-kernel-bench)
+add_executable(${TARGET} fle_kernel_bench.cpp)
+install(TARGETS ${TARGET} RUNTIME)
+target_link_libraries(${TARGET} PRIVATE ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)

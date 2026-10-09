@@ -140,7 +140,8 @@ enum llm_type {
     LLM_TYPE_124B_A5_1B, // Ling-3.0-flash
     LLM_TYPE_196B_A11B, // Step3.5-Flash
     LLM_TYPE_230B_A10B, // Minimax M2
-    LLM_TYPE_428B_A23B, // Minimax M3
+    LLM_TYPE_428B_A23B, // Minimax M3 (upstream corrected our earlier 456B, a wrong parameter count)
+    LLM_TYPE_295B_A21B, // Hunyuan-V3 (Hy3), used in hy_v3.cpp
     LLM_TYPE_235B_A22B,
     LLM_TYPE_288B_A19B, // dots3-note
     LLM_TYPE_300B_A47B, // Ernie MoE big
@@ -224,10 +225,17 @@ struct llama_layer_nextn {
     struct ggml_tensor * embed_tokens          = nullptr;
     struct ggml_tensor * enorm                 = nullptr;
     struct ggml_tensor * hnorm                 = nullptr;
+    struct ggml_tensor * hc_norm               = nullptr;
+    struct ggml_tensor * hc_down               = nullptr;
+    struct ggml_tensor * hc_up                 = nullptr;
     struct ggml_tensor * shared_head_head      = nullptr;
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -557,7 +565,8 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
-    // MSA
+    // MSA, and also the DSA indexer fields:
+    // upstream carries the same four names.
     struct ggml_tensor * index_q_proj = nullptr;
     struct ggml_tensor * index_k_proj = nullptr;
     struct ggml_tensor * index_q_norm = nullptr;
@@ -641,6 +650,13 @@ struct llama_model {
     struct ggml_tensor * nextn_proj_post = nullptr;
 
     // DeepSeek-V4
+    // dspark-draft: context combiner. The Markov head (dspark_markov_w1/w2)
+    // lives further below in upstream's dspark block; upstream carries those two fields itself.
+    struct ggml_tensor * dspark_main_proj = nullptr;
+    struct ggml_tensor * dspark_main_norm = nullptr;
+
+    // Laguna-DFlash: per-source-layer RMS weights of the encoder [n_embd, n_aux]
+    struct ggml_tensor * dflash_aux_norm = nullptr;
     struct ggml_tensor * hc_head_fn    = nullptr;
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
@@ -668,7 +684,10 @@ struct llama_model {
 
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
-    struct ggml_tensor * fc_s = nullptr;
+    struct ggml_tensor * fc_s = nullptr;  // upstream; used in dflash.cpp
+    // FLE: per-target-layer RMS-norm before the fusion (MiniMax-M3 EAGLE3 variant),
+    // used in eagle3.cpp, registered in llama-arch.cpp
+    struct ggml_tensor * fc_norm[3] = {nullptr, nullptr, nullptr};
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark

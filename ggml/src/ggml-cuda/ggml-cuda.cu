@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "fle/pager_wire.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -90,6 +91,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <chrono>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -1815,6 +1817,22 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+extern "C" void fle_mmv_kt_launch(int type, const void * vx, const float * vy, float * dst,
+        int ncols, int ncols_y, int nrows, int64_t row_size, cudaStream_t stream);
+
+// KT matmul on the GPU via custom kernels (row-meta capable). src1/dst = F32 (guard above).
+static void ggml_cuda_mul_mat_fle_kt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);          // 2D weight (MoE runs separately via mul_mat_id)
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+    const int type    = src0->type == GGML_TYPE_IQ2_KT ? 2 : (src0->type == GGML_TYPE_IQ3_KT ? 3 : 4);
+    const int ncols   = src0->ne[0];
+    const int nrows   = src0->ne[1];
+    const int ncols_y = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    const int64_t row_size = ggml_row_size(src0->type, src0->ne[0]);
+    fle_mmv_kt_launch(type, src0->data, (const float *)src1->data, (float *)dst->data,
+                      ncols, ncols_y, nrows, row_size, ctx.stream());
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1830,6 +1848,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (src0->type == GGML_TYPE_IQ2_KT || src0->type == GGML_TYPE_IQ3_KT || src0->type == GGML_TYPE_IQ4_KT) {
+        ggml_cuda_mul_mat_fle_kt(ctx, src0, src1, dst);   // KT matmul on the GPU
         return;
     }
 
@@ -1871,6 +1894,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// Pager hook. The wrapper derives src0/src1/ids + guarded via is_pager_buffer
+// (no-op without a bound pager buffer -> default path byte-identical). Original body -> _dispatch.
+static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -1906,6 +1933,34 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+    if (fle::pager::is_pager_buffer(src0->buffer)) {
+        ggml_tensor src0_pager; ggml_tensor ids_pager;
+        const ggml_tensor * src0_disp = src0;
+        const ggml_tensor * ids_disp  = ids;
+        const int32_t * ids_remapped = nullptr;
+        int n_experts_staged = 0;
+        void * pool_base = fle::pager::pager_stage_and_remap(src0->buffer, src0, ids, &ids_remapped, ctx.stream(), src1, dst, &n_experts_staged);
+        if (pool_base && ids_remapped) {
+            src0_pager = *src0; src0_pager.data = pool_base;             src0_disp = &src0_pager;
+            // The prefill path puts ONLY the experts used in the call into
+            // the scratch. If ne[2] stayed at n_expert, the tensor would claim more bytes to
+            // every kernel than the scratch holds — measured 338 MiB beyond it;
+            // the regions of other tensors would then be read.
+            if (n_experts_staged > 0) {
+                src0_pager.ne[2] = n_experts_staged;
+                src0_pager.nb[3] = src0_pager.nb[2] * (size_t) n_experts_staged;
+            }
+            ids_pager  = *ids;  ids_pager.data  = (void *) ids_remapped; ids_disp  = &ids_pager;
+        }
+        ggml_cuda_mul_mat_id_dispatch(ctx, src0_disp, src1, ids_disp, dst);
+        // CRITICAL INVARIANT: the ORIGINAL src0 (host_backing) goes to finalize -- the CPU miss path reads weights CPU-side.
+        fle::pager::pager_cpu_miss_finalize(src0->buffer, src0, src1, dst, ctx.stream());
+    } else {
+        ggml_cuda_mul_mat_id_dispatch(ctx, src0, src1, ids, dst);
+    }
+}
+
+static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
@@ -1918,7 +1973,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            const bool src0_is_kt = src0->type == GGML_TYPE_IQ2_KT || src0->type == GGML_TYPE_IQ3_KT || src0->type == GGML_TYPE_IQ4_KT;
+            if (ggml_is_quantized(src0->type) && !src0_is_kt) {   // KT MoE goes through the per-expert dense path
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
@@ -2385,6 +2441,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
+            break;
+        case GGML_OP_FLE_HC_GATE_MEAN:
+            ggml_cuda_op_fle_hc_gate_mean(ctx, dst);
+            break;
+        case GGML_OP_FLE_HC_COMBINE:
+            ggml_cuda_op_fle_hc_combine(ctx, dst);
+            break;
+        case GGML_OP_FLE_HC_LR_A:
+            ggml_cuda_op_fle_hc_lr_a(ctx, dst);
+            break;
+        case GGML_OP_FLE_HC_LR_B:
+            ggml_cuda_op_fle_hc_lr_b(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -4408,6 +4476,23 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
         }
     }
 
+    // Evidence line (2026-08-28). An earlier measurement showed "graphs on" and "graphs off" identical and could not
+    // say why: "graphs reused" in the server timings is
+    // llama_perf_context.n_reused, i.e. the GGML graph, NOT the CUDA graph — this number
+    // cannot answer the question at all. Without this line "the latch costs
+    // nothing" cannot be told apart from "the latch never arrived".
+    // Deliberately HERE and not in common.cuh: that header is included by 97 files.
+    {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            const bool env_set = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+            fprintf(stderr, "[fle-graph] CUDA graphs %s  (GGML_CUDA_DISABLE_GRAPHS %s, GPU arch %s)\n",
+                    graph->is_enabled() ? "ON" : "OFF",
+                    env_set ? "set" : "not set",
+                    graph->disable_due_to_gpu_arch ? "blocks" : "allows");
+        }
+    }
     return graph->is_enabled();
 }
 #endif // USE_CUDA_GRAPH
@@ -5495,6 +5580,22 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_FLE_HC_GATE_MEAN:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        case GGML_OP_FLE_HC_COMBINE:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && op->src[2]->nb[0] == sizeof(float);
+        case GGML_OP_FLE_HC_LR_A:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_Q8_0 && op->src[2]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= 8 && op->src[0]->ne[0] % 32 == 0 && op->src[1]->ne[1] % 4 == 0 && op->src[2]->ne[1] <= 4 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
+        case GGML_OP_FLE_HC_LR_B:
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_Q8_0 &&
+                op->type == GGML_TYPE_F32 && op->src[0]->ne[1] <= 8 && op->src[2]->ne[0] <= 512 && op->src[2]->ne[0] % 32 == 0 &&
+                ggml_get_op_params_i32(op, 0) <= 4 &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]) && op->src[1]->nb[0] == sizeof(float);
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
@@ -5515,10 +5616,42 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 }
 
+// May device A read the memory of device B? Determined once, then remembered.
+static bool fle_peer_readable(int dev_from, int dev_to) {
+    static std::map<std::pair<int,int>, bool> known;
+    const auto key = std::make_pair(dev_from, dev_to);
+    auto it = known.find(key);
+    if (it != known.end()) { return it->second; }
+    int can = 0;
+    if (cudaDeviceCanAccessPeer(&can, dev_from, dev_to) != cudaSuccess) { can = 0; }
+    GGML_LOG_INFO("[fle-peer] device %d reads device %d: %s\n",
+            dev_from, dev_to, can ? "YES" : "NO");
+    known[key] = can != 0;
+    return can != 0;
+}
+
+// REFUTED on 2026-08-31: the branch DOUBLES the transitions
+// (52270 -> 100031 over 529 blocks) and costs -27.6 % short / -42.9 % long.
+// Reason: supports_buft does not pin the computation to the reading device, it makes
+// the other device a PERMISSIBLE TARGET for placement. More targets = more
+// switches. Default OFF, stays in the tree as evidence.
+// REQUIRED with it: GGML_CUDA_P2P — VMM allocations do not become peer-accessible
+// through cudaDeviceEnablePeerAccess alone (see the comment at the VMM handling above).
+static bool fle_peer_cache_on() {
+    static const bool on = [] {
+        const char * e = std::getenv("FLE_MOECACHE_PEER");
+        const bool v = e && *e && *e != '0';
+        if (v) { GGML_LOG_INFO("[fle-peer] peer cache REQUESTED (FLE_MOECACHE_PEER)\n"); }
+        return v;
+    }();
+    return on;
+}
+
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft))
+        || (fle::pager::is_pager_buffer_type(buft) && buft->device == dev);  // the PAGER buft runs on the CUDA backend (scheduler assignment)
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {

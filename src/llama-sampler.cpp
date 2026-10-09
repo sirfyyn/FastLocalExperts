@@ -2954,6 +2954,40 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
+    // FLE: fast path. If the candidate list is in vocabulary order (data[t].id == t, as at the start of the chain), it suffices to change the at most
+    // penalty_last_n tokens from token_count directly; the loop below instead looks up each of the ~248k candidates in the hash table
+    // (2 to 3 ms per sample, measured as the remainder per generated token in the server). The result is identical: both change exactly the candidates whose id is in
+    // token_count (ids are unique); if even a single token deviates from the order, the old path applies.
+    {
+        bool identity = true;
+        for (const auto & tc : ctx->token_count) {
+            const llama_token t = tc.first;
+            if (t < 0 || (size_t) t >= cur_p->size || cur_p->data[t].id != t) {
+                identity = false;
+                break;
+            }
+        }
+        if (identity) {
+            for (const auto & tc : ctx->token_count) {
+                auto & d = cur_p->data[tc.first];
+                const int count = tc.second;
+
+                assert(count > 0 && count <= ctx->penalty_last_n);
+
+                if (d.logit <= 0) {
+                    d.logit *= ctx->penalty_repeat;
+                } else {
+                    d.logit /= ctx->penalty_repeat;
+                }
+
+                d.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+            }
+
+            cur_p->sorted = false;
+            return;
+        }
+    }
+
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
         const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
