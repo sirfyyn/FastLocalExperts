@@ -7,7 +7,7 @@ How to read the tables:
 
 - **Default** is the behaviour when the variable is unset. "off" means the feature is disabled.
 - **Ref.** is the value used in the reference configuration (the setup used for the measurements in the technical
-  report; see the placeholder in [README-FLE.md](../../README-FLE.md)). "-" means it is not set there.
+  report, <https://sirfyyn.github.io/FastLocalExperts/>). "-" means it is not set there.
 - Flag-like variables ("on") are usually enabled by any non-empty value that does not start with `0`; where the code
   checks existence only, the table says "set". Numeric variables are parsed with `atoi`/`atoll`/`atof`.
 - Variables marked **experimental** are research switches that may change or disappear. **Obsolete** variables were

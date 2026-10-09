@@ -1,5 +1,7 @@
 > **FLE - Fast Local Experts** is a llama.cpp fork for running large MoE models on one 32 GB GPU plus CPU experts.
 > This README is the upstream llama.cpp README; for what the fork adds, see [README-FLE.md](README-FLE.md).
+> Technical report: <https://sirfyyn.github.io/FastLocalExperts/>; model files:
+> <https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF>.
 >
 > This is a private project: I build it for my own machine and publish it as it is. Hints, findings and bug reports are always welcome; acting on them, reviewing and merging can take a while, and there is no support promise.
 

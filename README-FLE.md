@@ -6,8 +6,9 @@ the bulk of the routed experts stays in host RAM and is computed on the CPU when
 
 Everything not described here is llama.cpp; see [README.md](README.md) and the upstream documentation.
 
-> Benchmark numbers, ablations and the evaluation setup are not part of this repository.
-> See the technical report (placeholder: link follows with the paper).
+> Benchmark numbers, ablations and the evaluation setup are not part of this repository; they are in the technical
+> report: <https://sirfyyn.github.io/FastLocalExperts/> (also as [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf)).
+> The model files for Qwen3.8-Flash-Next are at <https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF>.
 
 ## Project status
 
@@ -36,7 +37,7 @@ The full list is in [docs/fle/ENV.md](docs/fle/ENV.md).
 
 ## Making Rhea fast: eight short films
 
-Eight short films (English, subtitles burned in, 30 to 60 s each, 7 min in total) show how FLE was measured on one machine
+Eight short films (English, subtitles burned in, 33 to 63 s each, 7 min in total) show how FLE was measured on one machine
 and what did and did not work. Every number in them comes from the measurement database behind the technical report
 (6,130 measurements, state of 2026-10-08); where a film and the report differ, the report is the reference. GitHub does
 not play videos from repository files, so the posters below link to the films on Hugging Face. All eight are also on
@@ -50,14 +51,14 @@ YouTube as one playlist: <https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ>.
 <td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-4.png" alt="Film 4: The expert cache"></a><br><b>4 · The expert cache</b> (0:59)</td>
 </tr>
 <tr>
-<td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.png" alt="Film 5: Draft and verify"></a><br><b>5 · Draft and verify</b> (0:57)</td>
+<td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-5.png" alt="Film 5: Draft and verify"></a><br><b>5 · Draft and verify</b> (1:00)</td>
 <td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.png" alt="Film 6: What did not work"></a><br><b>6 · What did not work</b> (0:56)</td>
 <td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-7.png" alt="Film 7: The rebench"></a><br><b>7 · The rebench</b> (0:58)</td>
 <td width="25%"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.mp4"><img src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-8.png" alt="Film 8: Why we do this"></a><br><b>8 · Why we do this</b> (0:58)</td>
 </tr>
 </table>
 
-All eight in one file: [making-rhea-fast-complete.mp4](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4) (6:56).
+All eight in one file: [making-rhea-fast-complete.mp4](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4) (6:59).
 The model, the MTP head and the films live in
 [sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF).
 
