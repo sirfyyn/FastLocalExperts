@@ -148,14 +148,19 @@ def main():
             for m in bad:
                 errors.append("ldd %s: %s => not found" % (f.name, m))
         if args.cudart_present:
-            # the CUDA runtime must now resolve from the package directory itself
+            # the CUDA runtime that the CUDA module loads must now resolve from the package directory itself
+            # (libcudart may be linked into the module statically, then it does not show up; cuBLAS must)
             rc, out = sh(["ldd", str(next(p for p in files if p.name.startswith("libggml-cuda")))], env=env)
-            for lib in cuda_runtime:
+            for lib in sorted(cuda_runtime):
                 m = re.search(r"^\s*%s => (\S+)" % re.escape(lib), out, re.M)
-                if not m or not m.group(1).startswith(str(root)):
-                    errors.append("%s does not resolve to the package directory (%s)" % (lib, m.group(1) if m else "not found"))
-                else:
+                if m and m.group(1).startswith(str(root)):
                     print("[elf] %s -> %s" % (lib, m.group(1)), flush=True)
+                elif m:
+                    errors.append("%s does not resolve to the package directory (%s)" % (lib, m.group(1)))
+                elif lib.startswith("libcublas."):
+                    errors.append("%s is not loaded by the CUDA module" % lib)
+                else:
+                    print("[elf] %s is not loaded by the CUDA module (linked in statically, or not needed)" % lib, flush=True)
 
     if errors:
         fail(errors)
