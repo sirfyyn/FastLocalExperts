@@ -1,0 +1,52 @@
+{
+  "upload_type": "software",
+  "title": "FLE: Fast Local Experts — an 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU",
+  "version": "1.0.1",
+  "creators": [
+    {
+      "name": "Bitzer, Max"
+    }
+  ],
+  "description": "<p>We run Qwen3.8-Flash-Next, a 512-expert Mixture-of-Experts (MoE) language model, on a single workstation with one 32 GB GPU, 120 GB of system RAM and 16 CPU cores. Two pieces make this practical. First, <strong>FLE-IQ3_M</strong> (internally G3), a hybrid quantization that combines the Unsloth UD-IQ4_XS release with expert layers from ISTA-DASLab's GSQ-RCO release: 88.87 GB instead of 93.68 GB, with a KL divergence against BF16 that stays within the measurement noise on three texts, one of them held out. Second, <strong>FLE</strong>, a fork of llama.cpp that borrows ideas and some code from ik_llama.cpp, FreeToken, KTransformers and Strata (Section 8): a GPU expert cache with frequency-gated admission and oldest-first eviction, overlap of GPU cache hits with CPU work on cache misses, fused CUDA kernels, and speculative decoding with the model's own multi-token-prediction (MTP) head, its experts requantized to IQ4_NL. Against current upstream llama.cpp (commit <code>a8c9a4e7c</code>, newer than FLE's base), with the same FLE-IQ3_M file, the same card and the same 16 threads (no expert cache, no MTP), the final FLE configuration decodes <strong>2.49 times as fast</strong> as upstream with micro-batch 1024 (−59.9 % [95 % CI −61.2 .. −58.5] for upstream in a paired bracket, B1e) and 2.78 times as fast as upstream with micro-batch 4096 (−64.0 % [−65.2 .. −62.9]); FLE runs at about 100 tokens/s on these prompts. Prefill is where FLE still loses: upstream with micro-batch 4096 processes 4k and 8.6k prompts 24 % and 12 % faster, and Strata, the closest public engine, 2.3 to 2.7 times as fast, while FLE decodes 23 % faster than Strata. Against our own previous production setup (stock build with Unsloth UD-IQ4_XS, ~56 tokens/s) FLE was +58.5 % faster [+55.8 .. +61.6] already before the last steps (bracket END2). On three benchmarks from Qwen's model card, one run each, FLE-IQ3_M on FLE is level with the card on IFBench (80.3 strict / 83.0 loose against 81.3) and GPQA Diamond (88.9 against 91.7, inside the 95 % interval) and below it on LiveCodeBench v6 (85.5 against 91.9, outside the interval; 10 of the 19 failures are answers cut off at the 81,920-token limit). Besides FLE-IQ3_M we release two smaller hybrids and FLE-IQ3_M-REAP448, with 64 of 512 experts per layer pruned by REAP; a 400-question MKQA knowledge probe shows that KLD on a few texts understates what pruning removes (at 384 experts per layer the KLD rose moderately, while correct answers fell by 5.8 / 11.8 points in German / English). We report the negative results as well: expert prefetching by pre-gating, n-gram drafting, low-rank kernels and fully self-made quantizations all lost in our measurements, and so did copying part of the cache misses over PCIe as Strata does (−4.5 %) and a rebase of the fork onto current upstream (−5.7 %). A re-trained MTP head (recursive self-distillation) gained +4.54 % only on the tasks its training corpus contained; on 16 unseen tasks the untrained head was +2.95 % [+1.96 .. +3.93] faster than it, so the release ships the untrained head. The speed numbers above were measured with the re-trained head c2 (Section 4.3).</p><p>This archive holds release v1.0.1 of the FLE engine together with the technical report (<code>docs/fle/fle-paper-v1.0.1.pdf</code>). FLE is a fork of <a href=\"https://github.com/ggml-org/llama.cpp\">llama.cpp</a> (MIT, copyright the ggml authors); it takes code from ik_llama.cpp and Strata and re-implements parts of FreeToken (see the NOTICE files). The engine code is identical to v1.0 (commit <code>b3f2544ca</code>); v1.0.1 adds the report and links.</p><p>Report with films (HTML): <a href=\"https://sirfyyn.github.io/FastLocalExperts/\">https://sirfyyn.github.io/FastLocalExperts/</a><br>Model files (GGUF): <a href=\"https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF\">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF</a><br>Films “Making Rhea Fast”: <a href=\"https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ\">https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ</a></p>",
+  "access_right": "open",
+  "license": "mit",
+  "language": "eng",
+  "keywords": [
+    "Mixture of Experts",
+    "llama.cpp",
+    "GGUF",
+    "quantization",
+    "expert offloading",
+    "expert cache",
+    "speculative decoding",
+    "multi-token prediction",
+    "local LLM inference",
+    "Qwen3.8-Flash-Next"
+  ],
+  "notes": "AI assistance: engine patches, measurement scripts and the report were written together with Claude (Anthropic, Claude Code). The author takes responsibility for every claim and number.",
+  "related_identifiers": [
+    {
+      "identifier": "https://sirfyyn.github.io/FastLocalExperts/",
+      "relation": "isDocumentedBy",
+      "resource_type": "publication-report",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+      "relation": "isSupplementedBy",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ",
+      "relation": "isSupplementedBy",
+      "resource_type": "video",
+      "scheme": "url"
+    },
+    {
+      "identifier": "https://github.com/ggml-org/llama.cpp",
+      "relation": "isDerivedFrom",
+      "resource_type": "software",
+      "scheme": "url"
+    }
+  ]
+}

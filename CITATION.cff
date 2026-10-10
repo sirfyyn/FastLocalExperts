@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use FLE or the FLE-IQ3_M files, please cite the technical report."
+title: "FLE: Fast Local Experts — an 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU"
+type: software
+authors:
+  - family-names: Bitzer
+    given-names: Max
+version: 1.0.1
+date-released: 2026-10-10
+license: MIT
+repository-code: "https://github.com/sirfyyn/FastLocalExperts"
+url: "https://sirfyyn.github.io/FastLocalExperts/"
+keywords:
+  - Mixture of Experts
+  - llama.cpp
+  - GGUF
+  - quantization
+  - expert offloading
+  - speculative decoding
+preferred-citation:
+  type: report
+  title: "FLE: Fast Local Experts — an 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU"
+  authors:
+    - family-names: Bitzer
+      given-names: Max
+  year: 2026
+  month: 10
+  url: "https://sirfyyn.github.io/FastLocalExperts/"
+  notes: "Version 1.0.1. Engine: https://github.com/sirfyyn/FastLocalExperts. Model files: https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF"
