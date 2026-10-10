@@ -5824,12 +5824,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_get_features;
     }
     // FLE expert pager. With GGML_BACKEND_DL this backend is a module loaded at run time (dlopen / LoadLibrary), its
-    // symbols are not visible to libllama and libllama-common: they reach the pager through these two entries.
+    // symbols are not visible to libllama and libllama-common: they reach the pager through these entries.
     if (strcmp(name, "fle_pager_buffer_type") == 0) {
         return (void *)fle::pager::pager_buffer_type;
     }
     if (strcmp(name, "fle_pager_register_router") == 0) {
         return (void *)fle::pager::pager_register_router;
+    }
+    if (strcmp(name, "fle_pager_set_cpu_traits") == 0) {
+        return (void *)fle::pager::pager_set_cpu_traits;
     }
     return nullptr;
 }

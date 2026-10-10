@@ -66,20 +66,29 @@ static const char * getenv_alias(const char * name, const char * deprecated_name
 }
 
 // ggml_get_type_traits_cpu lives in the CPU backend. With GGML_BACKEND_DL that backend is a separate module that this
-// one cannot link to: the function is looked up in the loaded CPU backend instead (ggml_backend_reg_get_proc_address).
-// nullptr = no CPU backend loaded; the callers handle that (the CPU miss compute is then skipped for the type).
+// one cannot link to: the host hands the function over (pager_set_cpu_traits, called by the code that asks for the
+// pager buffer type); without that the loaded CPU backend is asked for it (ggml_backend_reg_get_proc_address), where the
+// registry can be reached (not on Windows: libggml.dll is not linked to this module).
+// nullptr = no CPU backend known; the callers handle that (the CPU miss compute is then skipped for the type).
+typedef const struct ggml_type_traits_cpu * (*pager_traits_fn_t)(enum ggml_type);
+static std::atomic<pager_traits_fn_t> g_cpu_traits_fn{nullptr};
+
+void pager_set_cpu_traits(void * fn) {
+    g_cpu_traits_fn.store((pager_traits_fn_t) fn, std::memory_order_release);
+}
+
 static const struct ggml_type_traits_cpu * pager_type_traits_cpu(enum ggml_type type) {
 #ifdef GGML_BACKEND_DL
-    typedef const struct ggml_type_traits_cpu * (*traits_fn_t)(enum ggml_type);
-    static std::atomic<traits_fn_t> cached{nullptr};
-    traits_fn_t fn = cached.load(std::memory_order_acquire);
+    pager_traits_fn_t fn = g_cpu_traits_fn.load(std::memory_order_acquire);
+#ifndef _WIN32
     if (!fn) {
         ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
-        fn = reg ? (traits_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_get_type_traits_cpu") : nullptr;
+        fn = reg ? (pager_traits_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_get_type_traits_cpu") : nullptr;
         if (fn) {
-            cached.store(fn, std::memory_order_release);
+            g_cpu_traits_fn.store(fn, std::memory_order_release);
         }
     }
+#endif
     return fn ? fn(type) : nullptr;
 #else
     return ggml_get_type_traits_cpu(type);

@@ -256,9 +256,21 @@ std::vector<std::string> common_arg::get_env() const {
 // the loaded backend hands out the factory (ggml_backend_reg_get_proc_address). nullptr without a CUDA backend.
 static ggml_backend_buffer_type_t fle_pager_buffer_type(int device, size_t vram_budget_bytes) {
     typedef ggml_backend_buffer_type_t (*factory_t)(int, size_t);
+    typedef void (*set_traits_t)(void *);
     ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
     factory_t fn = reg ? (factory_t) ggml_backend_reg_get_proc_address(reg, "fle_pager_buffer_type") : nullptr;
-    return fn ? fn(device, vram_budget_bytes) : nullptr;
+    if (!fn) {
+        return nullptr;
+    }
+    // The CUDA module cannot reach the registry or the CPU backend by itself on every platform (Windows): hand it the
+    // type traits of the loaded CPU backend (CPU miss compute of the pager) before the first buffer type is created.
+    set_traits_t set_traits = (set_traits_t) ggml_backend_reg_get_proc_address(reg, "fle_pager_set_cpu_traits");
+    ggml_backend_reg_t cpu_reg = ggml_backend_reg_by_name("CPU");
+    void * traits = cpu_reg ? ggml_backend_reg_get_proc_address(cpu_reg, "ggml_get_type_traits_cpu") : nullptr;
+    if (set_traits && traits) {
+        set_traits(traits);
+    }
+    return fn(device, vram_budget_bytes);
 }
 #else
 namespace fle { namespace pager {
