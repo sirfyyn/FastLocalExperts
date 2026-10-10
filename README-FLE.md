@@ -8,7 +8,10 @@ Everything not described here is llama.cpp; see [README.md](README.md) and the u
 
 > Benchmark numbers, ablations and the evaluation setup are not part of this repository; they are in the technical
 > report: <https://sirfyyn.github.io/FastLocalExperts/> (also as [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf)).
-> The model files for Qwen3.8-Flash-Next are at <https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF>.
+> The release with the report is archived on Zenodo: [doi:10.5281/zenodo.23272400](https://doi.org/10.5281/zenodo.23272400).
+> The model files for Qwen3.8-Flash-Next are at <https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF>; the pruned
+> FLE-IQ3_M-REAP448 (448 of 512 experts per layer) has its own repo:
+> <https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF>.
 
 ## Project status
 
@@ -59,8 +62,9 @@ YouTube as one playlist: <https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ>.
 </table>
 
 All eight in one file: [making-rhea-fast-complete.mp4](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4) (6:59).
-The model, the MTP head and the films live in
-[sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF).
+The models, the MTP head and the films live in
+[sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF), the pruned
+FLE-IQ3_M-REAP448 in [sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF).
 
 ## Inspirations and third-party code
 

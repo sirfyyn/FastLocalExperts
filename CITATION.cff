@@ -7,6 +7,14 @@ authors:
     given-names: Max
 version: 1.0.1
 date-released: 2026-10-10
+doi: 10.5281/zenodo.23272400
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23272400
+    description: "Zenodo, all versions"
+  - type: doi
+    value: 10.5281/zenodo.23272401
+    description: "Zenodo, version 1.0.1"
 license: MIT
 repository-code: "https://github.com/sirfyyn/FastLocalExperts"
 url: "https://sirfyyn.github.io/FastLocalExperts/"
@@ -25,5 +33,6 @@ preferred-citation:
       given-names: Max
   year: 2026
   month: 10
+  doi: 10.5281/zenodo.23272400
   url: "https://sirfyyn.github.io/FastLocalExperts/"
-  notes: "Version 1.0.1. Engine: https://github.com/sirfyyn/FastLocalExperts. Model files: https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF"
+  notes: "Version 1.0.2. Engine: https://github.com/sirfyyn/FastLocalExperts (tag v1.0.1). Model files: https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF and https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF"
