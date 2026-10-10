@@ -17,7 +17,9 @@
 // v1 = correctness first: synchronous ids D2H (async P2b later), residency LRU kept local
 //   (predictive prefetch attaches to exactly these slot maps later).
 // ============================================================================================
-#include <omp.h>   // omp_get_max_threads
+#ifdef _OPENMP
+#include <omp.h>   // omp_get_max_threads (only used inside the OpenMP pragmas below)
+#endif
 #include <unordered_set>
 #include "pager_wire.h"
 
@@ -28,9 +30,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#ifndef _WIN32
 #include <sys/mman.h>  // FLE_PAGER_MMAP_FILE cold-tier first-cut
 #include <fcntl.h>
 #include <unistd.h>
+#else
+#include <malloc.h>    // _aligned_malloc / _aligned_free (the FLE_PAGER_MMAP_FILE tier does not exist on Windows)
+#endif
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
@@ -42,7 +48,13 @@
 #include "ggml-cuda.h"
 #include "ggml-cpu.h"   // S3: ggml_get_type_traits_cpu (vec_dot/from_float) for CPU miss compute
 
+#if defined(_WIN32)
+// Windows is built with GGML_BACKEND_DL only: libllama / the tools reach the functions through
+// ggml_backend_reg_get_proc_address (ggml_backend_cuda_reg_get_proc_address), nothing is exported by name.
+#define FLE_EXPORT
+#else
 #define FLE_EXPORT __attribute__((visibility("default")))
+#endif
 
 namespace fle {
 namespace pager {
@@ -388,9 +400,16 @@ static void pager_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (ctx->vram_pool)    { cudaFree(ctx->vram_pool); }
     if (ctx->host_backing) {
         if (ctx->host_registered_bytes) { cudaHostUnregister(ctx->host_backing); ctx->host_registered_bytes = 0; }
+#ifndef _WIN32
         if (ctx->host_mmap)        { munmap(ctx->host_backing, ctx->host_bytes); if (ctx->mmap_fd >= 0) close(ctx->mmap_fd); }
-        else if (ctx->host_pinned) cudaFreeHost(ctx->host_backing);
+        else
+#endif
+        if (ctx->host_pinned) cudaFreeHost(ctx->host_backing);
+#ifdef _WIN32
+        else                       _aligned_free(ctx->host_backing);
+#else
         else                       free(ctx->host_backing);
+#endif
     }
     delete ctx;
 }
@@ -459,6 +478,12 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
     if (mf && *mf) {
         // NVMe mmap host tier (first-cut cold store): 135 GB fits via the page cache (reclaimable),
         // no pinned-RAM OOM. Staging-only path -> FLE_PAGER_NO_UVA=1 needed (pageable H2D).
+#ifdef _WIN32
+        // open/ftruncate/mmap are POSIX: no mmap tier on Windows. Fail loud instead of silently running without it.
+        std::fprintf(stderr, "[fle-pager] FLE_PAGER_MMAP_FILE is not supported on Windows\n");
+        delete ctx;
+        return nullptr;
+#else
         char mfpath[4096]; snprintf(mfpath, sizeof(mfpath), "%s.dev%d", mf, ctx->device);  // per-device file (multi-device pool 2026-07-18): otherwise O_TRUNC clobber + SIGBUS
         int fd = open(mfpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) { std::fprintf(stderr, "[fle-pager] MMAP open %s failed\n", mfpath); delete ctx; return nullptr; }
@@ -468,6 +493,7 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
         ctx->host_backing = (uint8_t*) p;
         ctx->host_mmap = true; ctx->mmap_fd = fd; ctx->host_pinned = false;
         std::fprintf(stderr, "[fle-pager] MMAP-BACKING: %s (%zu MB, NVMe page-cache reclaimable)\n", mfpath, size >> 20);
+#endif
 
         // FLE_PAGER_HOST_REGISTER — pin the mmap'd file after the fact.
         //
@@ -525,7 +551,12 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
             return nullptr;
         }
     } else {
+#ifdef _WIN32
+        ctx->host_backing = (uint8_t*) _aligned_malloc(size, 4096);
+        if (!ctx->host_backing) {
+#else
         if (posix_memalign((void**)&ctx->host_backing, 4096, size) != 0) {
+#endif
             delete ctx;
             return nullptr;
         }
