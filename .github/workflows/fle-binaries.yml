@@ -1,0 +1,23 @@
+name: FLE binaries
+
+# Portable binary packages of the FLE engine (CUDA, Linux and Windows).
+# Workflow artifacts only: no release, no tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag or commit) of FastLocalExperts to build'
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  skeleton:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Echo the requested ref
+        run: echo "ref=${{ inputs.ref }} sha=${{ github.sha }}"
