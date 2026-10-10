@@ -149,23 +149,31 @@ def check_help(server):
     log("OK  --help lists %s (FLE build)" % ", ".join(FLE_OPTIONS))
 
 
+# The messages of the backend loader ("load_backend: loaded CPU backend from ...") are library messages: the
+# log setting of the tools shows them from verbosity 4 on. The option has to come before --list-devices, which
+# prints and exits as soon as it is parsed.
+VERBOSE = ["-lv", "4"]
+
+
 def check_backends(server):
     """The backends are modules in the package directory: at least one CPU variant must load."""
-    rc, out = run([server, "--list-devices"])
+    rc, out = run([server] + VERBOSE + ["--list-devices"])
     show(out)
     if rc != 0:
         fail("--list-devices (rc=%d)" % rc)
-    if "loaded CPU backend" not in out:
+    cpu = [ln for ln in out.splitlines() if "loaded CPU backend" in ln]
+    if not cpu:
         fail("no CPU backend module was loaded from the package directory")
+    variant = cpu[0].rsplit(os.sep, 1)[-1].rsplit("/", 1)[-1].strip()
     cuda = "loaded" if "loaded CUDA backend" in out else "not loaded (expected without an NVIDIA driver)"
-    log("OK  CPU backend variant loaded; CUDA module: %s" % cuda)
+    log("OK  CPU backend variant loaded (%s); CUDA module: %s" % (variant, cuda))
 
 
 def check_cuda_module_loads(server, stub_dir):
     """With a stub libcuda.so.1 the CUDA module can be dlopen()ed even without a GPU."""
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = str(stub_dir)
-    rc, out = run([server, "--list-devices"], env=env)
+    rc, out = run([server] + VERBOSE + ["--list-devices"], env=env)
     show(out)
     if "loaded CUDA backend" not in out:
         fail("the CUDA backend module did not load with a stub driver (unresolved symbols or missing libraries?)")
@@ -175,8 +183,8 @@ def check_cuda_module_loads(server, stub_dir):
 def check_server(server, model, log_path, n_predict):
     port = free_port()
     base = "http://127.0.0.1:%d" % port
-    cmd = [server, "-m", model, "--host", "127.0.0.1", "--port", str(port),
-           "-c", "256", "-np", "1", "-ngl", "0", "-t", "2", "--no-warmup"]
+    cmd = [server] + VERBOSE + ["-m", model, "--host", "127.0.0.1", "--port", str(port),
+                                "-c", "256", "-np", "1", "-ngl", "0", "-t", "2", "--no-warmup"]
     log("start: " + " ".join(str(c) for c in cmd))
     logf = open(log_path, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([str(c) for c in cmd], stdout=logf, stderr=subprocess.STDOUT,
