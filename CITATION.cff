@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Bitzer
     given-names: Max
-version: 1.0.1
-date-released: 2026-10-10
+version: 1.1.0
+date-released: 2026-10-11
 doi: 10.5281/zenodo.23272400
 identifiers:
   - type: doi
@@ -15,6 +15,9 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.23272401
     description: "Zenodo, version 1.0.1"
+  - type: doi
+    value: 10.5281/zenodo.23288917
+    description: "Zenodo, version 1.1.0"
 license: MIT
 repository-code: "https://github.com/sirfyyn/FastLocalExperts"
 url: "https://sirfyyn.github.io/FastLocalExperts/"
