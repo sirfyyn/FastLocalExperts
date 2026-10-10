@@ -173,7 +173,23 @@ The FLE model files are standard GGUF and also load in upstream llama.cpp, for e
 `llama-server -m <file> -cmoe -ngl 99 -c 32768 --jinja`, without the MTP head. With the same file, FLE decoded 2.49
 times as fast as upstream in bracket B1e.
 
-<!-- studio-media: screenshots and video go here -->
+### FLE Studio: the same engine in a browser window
+
+[FLE Studio](https://github.com/sirfyyn/fle-studio) is a local app for macOS, Linux and Windows that runs FLE or plain
+llama.cpp for you: a chat with the live numbers beside it (decode and prefill speed, MTP drafts accepted, expert-cache
+hits, GPU use), a model loader for the files below that checks each download against its SHA-256, launch profiles that
+show the full command before it runs, and a short repeatable speed test. It can download the portable FLE builds from
+this repository's releases, or attach to a llama-server that already runs, also as a systemd service.
+
+<a href="https://github.com/sirfyyn/fle-studio/blob/main/docs/media/fle-studio.mp4"><img alt="FLE Studio running Rhea (FLE-IQ3_M with its MTP head): a question, the answer streaming, the live data. Click for the full video." src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/fle-studio.gif"></a>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-dark.png">
+  <img alt="The engine view of FLE Studio attached to a systemd service running FLE" src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-light.png">
+</picture>
+
+Recorded on the reference machine against the running service. The speeds in the recording are single answers right
+after a restart, not measurements; the measured numbers are in [Results](#results).
 
 ## Model files
 
