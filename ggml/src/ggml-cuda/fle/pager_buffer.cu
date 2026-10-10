@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include "pager_wire.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -50,6 +51,27 @@ namespace pager {
 static const char * getenv_alias(const char * name, const char * deprecated_name) {
     const char * e = std::getenv(name);
     return e ? e : std::getenv(deprecated_name);
+}
+
+// ggml_get_type_traits_cpu lives in the CPU backend. With GGML_BACKEND_DL that backend is a separate module that this
+// one cannot link to: the function is looked up in the loaded CPU backend instead (ggml_backend_reg_get_proc_address).
+// nullptr = no CPU backend loaded; the callers handle that (the CPU miss compute is then skipped for the type).
+static const struct ggml_type_traits_cpu * pager_type_traits_cpu(enum ggml_type type) {
+#ifdef GGML_BACKEND_DL
+    typedef const struct ggml_type_traits_cpu * (*traits_fn_t)(enum ggml_type);
+    static std::atomic<traits_fn_t> cached{nullptr};
+    traits_fn_t fn = cached.load(std::memory_order_acquire);
+    if (!fn) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        fn = reg ? (traits_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_get_type_traits_cpu") : nullptr;
+        if (fn) {
+            cached.store(fn, std::memory_order_release);
+        }
+    }
+    return fn ? fn(type) : nullptr;
+#else
+    return ggml_get_type_traits_cpu(type);
+#endif
 }
 
 // One stage/remap/finalize at a time (slot/graph parallelism; shared by stage_and_remap and cpu_miss_finalize).
@@ -1785,9 +1807,9 @@ FLE_EXPORT void * pager_stage_and_remap(ggml_backend_buffer_t buffer,
     rt.cpu_pre_stride = 0;
     if (cpu_miss_mode && !rt.cpu_misses.empty() && src1) {
         const int64_t Kc = src0->ne[0];
-        const struct ggml_type_traits_cpu * trc = ggml_get_type_traits_cpu(src0->type);
+        const struct ggml_type_traits_cpu * trc = pager_type_traits_cpu(src0->type);
         const enum ggml_type vdtc = trc ? trc->vec_dot_type : GGML_TYPE_F32;
-        const struct ggml_type_traits_cpu * vtrc = ggml_get_type_traits_cpu(vdtc);
+        const struct ggml_type_traits_cpu * vtrc = pager_type_traits_cpu(vdtc);
         const size_t nm = rt.cpu_misses.size();
         if (trc && vtrc && vtrc->from_float && Kc > 0 && rt.ensure_xin(nm * (size_t) Kc)) {
             const size_t xqb = ggml_row_size(vdtc, Kc);
@@ -1996,7 +2018,7 @@ FLE_EXPORT void pager_cpu_miss_finalize(ggml_backend_buffer_t buffer,
     const int64_t N = dst->ne[0];     // output dim (n_ff for gate/up, n_embd for down)
     if (K <= 0 || N <= 0) { s3_exit("4: K or N <= 0"); rt.cpu_misses.clear(); return; }
 
-    const struct ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(src0->type);
+    const struct ggml_type_traits_cpu * tr = pager_type_traits_cpu(src0->type);
     if (!tr || !tr->vec_dot) { s3_exit("5: no vec_dot for this type"); rt.cpu_misses.clear(); return; }
     const uint8_t * w_base = (const uint8_t *) src0->data;   // host_backing = CPU-readable
 
