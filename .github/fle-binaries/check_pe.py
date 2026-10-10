@@ -27,9 +27,12 @@ MACHINE_AMD64 = 0x8664
 
 
 def load(path):
-    # llama-common.dll exports every symbol of the library (tens of thousands of C++ names); pefile stops at
-    # 0x2000 exports / imports per file unless the sanity limits are lifted
+    # llama-common.dll exports every symbol of the library (tens of thousands of C++ names). pefile's sanity limits
+    # would cut that table: 0x2000 exports / imports per file, and names longer than 512 bytes (C++ template names
+    # are) are truncated, so different long names end up identical. The limits are module globals / a parameter.
     pefile.MAX_IMPORT_SYMBOLS = 0x400000
+    pefile.MAX_SYMBOL_NAME_LENGTH = 0x2000
+    pefile.MAX_IMPORT_NAME_LENGTH = 0x2000
     pe = pefile.PE(str(path), fast_load=True, max_symbol_exports=0x400000)
     pe.parse_data_directories(directories=[
         pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
