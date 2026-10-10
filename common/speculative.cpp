@@ -641,7 +641,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * L = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     double s2 = 0; for (int j = 0; j < (int) n_embd_tgt; ++j) s2 += (double) L[j]*L[j];
-                    fprintf(stderr, "[SPEC-DBG] call %d layer[%u]=%u L2(tok0)=%.1f ntok=%d\n", _dc, k, target_layer_ids[k], __builtin_sqrt(s2), n_tokens);
+                    fprintf(stderr, "[SPEC-DBG] call %d layer[%u]=%u L2(tok0)=%.1f ntok=%d\n", _dc, k, target_layer_ids[k], std::sqrt(s2), n_tokens);
                 }
             }
         }
@@ -702,7 +702,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             if (_gc++ < 4) {
                 for (int tt = 0; tt < 3 && tt < n_tokens; ++tt) {
                     double s2=0; for (int j=0;j<n_embd_dec;++j){double v=g_embd[(size_t)tt*n_embd_dec+j]; s2+=v*v;}
-                    fprintf(stderr, "[SPEC-DBG-G] call %d g_embd[tok%d] L2=%.1f\n", _gc, tt, __builtin_sqrt(s2));
+                    fprintf(stderr, "[SPEC-DBG-G] call %d g_embd[tok%d] L2=%.1f\n", _gc, tt, std::sqrt(s2));
                 }
             }
         }
@@ -2096,7 +2096,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             _t_read   / _n_steps, 100.0 * _t_read   / g);
                     }
                 }
-                { static int _dn=0; if (h_row && _dn++==0) { double _s=0; for(int _z=0;_z<n_embd;_z++) _s+=(double)h_row[_z]*h_row[_z]; fprintf(stderr,"[NORMED-DBG] ggml normed(pre-lmhead) L2=%.4f [0..2]=%.4f %.4f %.4f\n", __builtin_sqrt(_s), h_row[0],h_row[1],h_row[2]); } }
+                { static int _dn=0; if (h_row && _dn++==0) { double _s=0; for(int _z=0;_z<n_embd;_z++) _s+=(double)h_row[_z]*h_row[_z]; fprintf(stderr,"[NORMED-DBG] ggml normed(pre-lmhead) L2=%.4f [0..2]=%.4f %.4f %.4f\n", std::sqrt(_s), h_row[0],h_row[1],h_row[2]); } }
 
                 llama_token id;
                 float       p_id;
