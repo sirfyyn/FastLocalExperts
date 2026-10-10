@@ -25,6 +25,7 @@
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
