@@ -74,8 +74,9 @@ def main():
 
     root = Path(args.dir).resolve()
     system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+    # lower case: the names of the import tables are compared in lower case
     cuda_runtime = {"cudart64_%s.dll" % args.cuda_major, "cublas64_%s.dll" % args.cuda_major,
-                    "cublasLt64_%s.dll" % args.cuda_major}
+                    "cublaslt64_%s.dll" % args.cuda_major}
     files = sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in (".dll", ".exe"))
     by_name = {p.name.lower(): p for p in files}
     print("[pe] %d exe/dll files in %s" % (len(files), root), flush=True)
