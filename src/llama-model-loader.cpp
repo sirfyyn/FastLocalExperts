@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <sstream>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
