@@ -251,9 +251,23 @@ std::vector<std::string> common_arg::get_env() const {
 
 // Helper function to parse tensor buffer override strings
 // Pager buffer-type factory (symbol in libggml-cuda, FLE_EXPORT, resolved at runtime). Forward declaration instead of an include (no include path needed).
+#ifdef GGML_BACKEND_DL
+// GGML_BACKEND_DL: the CUDA backend is a module loaded at run time and its symbols are not visible here:
+// the loaded backend hands out the factory (ggml_backend_reg_get_proc_address). nullptr without a CUDA backend.
+static ggml_backend_buffer_type_t fle_pager_buffer_type(int device, size_t vram_budget_bytes) {
+    typedef ggml_backend_buffer_type_t (*factory_t)(int, size_t);
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    factory_t fn = reg ? (factory_t) ggml_backend_reg_get_proc_address(reg, "fle_pager_buffer_type") : nullptr;
+    return fn ? fn(device, vram_budget_bytes) : nullptr;
+}
+#else
 namespace fle { namespace pager {
 ggml_backend_buffer_type_t pager_buffer_type(int device, size_t vram_budget_bytes);
 } }
+static ggml_backend_buffer_type_t fle_pager_buffer_type(int device, size_t vram_budget_bytes) {
+    return fle::pager::pager_buffer_type(device, vram_budget_bytes);
+}
+#endif
 
 static void parse_tensor_buffer_overrides(const std::string & value, std::vector<llama_model_tensor_buft_override> & overrides) {
     ggml_backend_load_all();
@@ -271,7 +285,7 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     // (no VRAM until a tensor is bound via -ot ...=PAGER). This then activates the pager hooks.
     if (const char * fle_vm = std::getenv("FLE_PAGER_VRAM_MB")) {
         const size_t fle_budget = (size_t) std::atoll(fle_vm) * 1024ull * 1024ull;
-        ggml_backend_buffer_type_t fle_pbt = fle::pager::pager_buffer_type(0, fle_budget);
+        ggml_backend_buffer_type_t fle_pbt = fle_pager_buffer_type(0, fle_budget);
         if (fle_pbt) {
             buft_list["PAGER"] = fle_pbt;
             buft_list["PAGER0"] = fle_pbt;
@@ -279,7 +293,7 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         // Multi-device pool: second GPU pager via FLE_PAGER_VRAM_MB1 -> -ot ...=PAGER1
         if (const char * fle_vm1 = std::getenv("FLE_PAGER_VRAM_MB1")) {
             const size_t b1 = (size_t) std::atoll(fle_vm1) * 1024ull * 1024ull;
-            ggml_backend_buffer_type_t pbt1 = fle::pager::pager_buffer_type(1, b1);
+            ggml_backend_buffer_type_t pbt1 = fle_pager_buffer_type(1, b1);
             if (pbt1) buft_list["PAGER1"] = pbt1;
         }
     }
