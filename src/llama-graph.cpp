@@ -5,6 +5,7 @@ const float * llama_get_dspark_aux(int32_t layer, int64_t * n_tokens_out);
 const float * llama_get_dspark_ring(int32_t layer, int64_t before_pos, int32_t n_win,
                                     int64_t * n_out, int64_t * pos_base_out);
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include "llama-moecache.h"
 
@@ -1951,9 +1952,32 @@ ggml_tensor * llm_graph_context::build_ffn(
 }
 
 // Pager router registration (symbol in libggml-cuda, FLE_EXPORT, resolved at runtime via NEEDED). Forward declaration instead of an include (include-path free).
+#ifdef GGML_BACKEND_DL
+// GGML_BACKEND_DL: the CUDA backend is a module loaded at run time and its symbols are not visible here:
+// the loaded backend hands out the function (ggml_backend_reg_get_proc_address). No-op without a CUDA backend.
+static void fle_pager_register_router(const struct ggml_tensor * gate_exps, const struct ggml_tensor * gate_inp, const struct ggml_tensor * exp_probs_b, int n_expert_used) {
+    typedef void (*register_fn_t)(const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *, int);
+    static std::atomic<register_fn_t> cached{nullptr};
+    register_fn_t fn = cached.load(std::memory_order_acquire);
+    if (!fn) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        fn = reg ? (register_fn_t) ggml_backend_reg_get_proc_address(reg, "fle_pager_register_router") : nullptr;
+        if (fn) {
+            cached.store(fn, std::memory_order_release);
+        }
+    }
+    if (fn) {
+        fn(gate_exps, gate_inp, exp_probs_b, n_expert_used);
+    }
+}
+#else
 namespace fle { namespace pager {
 void pager_register_router(const struct ggml_tensor * gate_exps, const struct ggml_tensor * gate_inp, const struct ggml_tensor * exp_probs_b, int n_expert_used);
 } }
+static void fle_pager_register_router(const struct ggml_tensor * gate_exps, const struct ggml_tensor * gate_inp, const struct ggml_tensor * exp_probs_b, int n_expert_used) {
+    fle::pager::pager_register_router(gate_exps, gate_inp, exp_probs_b, n_expert_used);
+}
+#endif
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
@@ -2029,7 +2053,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
     // Register the pager's L+1 prediction (self-guarded no-op without the pager env).
-    fle::pager::pager_register_router(gate_exps, gate_inp, exp_probs_b, n_expert_used);
+    fle_pager_register_router(gate_exps, gate_inp, exp_probs_b, n_expert_used);
 
     // [FLE_MOE_K] Fewer active experts while decoding (training-free, arXiv 2609.04575, Sep 2026).
     // The selection stays top-k1; the denominator of the renormalisation takes either the probability mass

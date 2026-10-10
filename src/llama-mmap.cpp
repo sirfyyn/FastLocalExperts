@@ -657,6 +657,13 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    // FLE: madvise/fadvise have no counterpart here, nothing to keep on disk.
+    void keep_on_disk(size_t first, size_t last, int fd) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        GGML_UNUSED(fd);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -686,6 +693,13 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
 
         throw std::runtime_error("mmap not supported");
+    }
+
+    // FLE: nothing to keep on disk without mmap.
+    void keep_on_disk(size_t first, size_t last, int fd) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        GGML_UNUSED(fd);
     }
 #endif
 

@@ -101,7 +101,7 @@ static bool fle_mtp_dump_cb(struct ggml_tensor * tt, bool ask, void * ud) {
     std::vector<float> b(m);
     ggml_backend_tensor_get(tt, b.data(), 0, m*sizeof(float));
     double s2=0; for (size_t i=0;i<m;i++) s2+=(double)b[i]*b[i];
-    fprintf(stderr, "[MTP-CB] %-14s L2(f%zu)=%.4f [0..2]=%.4f %.4f %.4f\n", tt->name, m, __builtin_sqrt(s2), b[0],b[1],b[2]);
+    fprintf(stderr, "[MTP-CB] %-14s L2(f%zu)=%.4f [0..2]=%.4f %.4f %.4f\n", tt->name, m, std::sqrt(s2), b[0],b[1],b[2]);
     return true;
 }
 

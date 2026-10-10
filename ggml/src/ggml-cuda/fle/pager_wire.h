@@ -51,5 +51,10 @@ void pager_register_router(const struct ggml_tensor * gate_exps,
 // Factory (loader binding, step B): pager buffer type per device.
 ggml_backend_buffer_type_t pager_buffer_type(int device, size_t vram_budget_bytes);
 
+// GGML_BACKEND_DL: the host hands over ggml_get_type_traits_cpu of the loaded CPU backend (a function pointer, passed as
+// void *) before the first pager buffer type is requested. This module cannot look it up itself on every platform: the
+// backend registry lives in libggml, which a backend module does not link to (Windows needs every import at link time).
+void pager_set_cpu_traits(void * fn);
+
 } // namespace pager
 } // namespace fle

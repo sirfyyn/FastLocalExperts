@@ -173,7 +173,11 @@ if (CUDAToolkit_FOUND)
             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
         endif()
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
-        target_link_libraries(ggml-cuda PRIVATE ggml-cpu) # expert pager: the CPU miss fallback needs ggml_get_type_traits_cpu
+        if (NOT GGML_BACKEND_DL)
+            target_link_libraries(ggml-cuda PRIVATE ggml-cpu) # expert pager: the CPU miss fallback needs ggml_get_type_traits_cpu
+        endif()
+        # With GGML_BACKEND_DL the CPU backend is a MODULE (loaded at run time, cannot be linked to):
+        # pager_buffer.cu then asks the loaded CPU backend for ggml_get_type_traits_cpu.
     endif()
 
     if (GGML_CUDA_NO_VMM)

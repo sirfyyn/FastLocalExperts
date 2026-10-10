@@ -17,19 +17,26 @@
 // v1 = correctness first: synchronous ids D2H (async P2b later), residency LRU kept local
 //   (predictive prefetch attaches to exactly these slot maps later).
 // ============================================================================================
-#include <omp.h>   // omp_get_max_threads
+#ifdef _OPENMP
+#include <omp.h>   // omp_get_max_threads (only used inside the OpenMP pragmas below)
+#endif
 #include <unordered_set>
 #include "pager_wire.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#ifndef _WIN32
 #include <sys/mman.h>  // FLE_PAGER_MMAP_FILE cold-tier first-cut
 #include <fcntl.h>
 #include <unistd.h>
+#else
+#include <malloc.h>    // _aligned_malloc / _aligned_free (the FLE_PAGER_MMAP_FILE tier does not exist on Windows)
+#endif
 #include <cmath>
 #include <mutex>
 #include <unordered_map>
@@ -41,7 +48,13 @@
 #include "ggml-cuda.h"
 #include "ggml-cpu.h"   // S3: ggml_get_type_traits_cpu (vec_dot/from_float) for CPU miss compute
 
+#if defined(_WIN32)
+// Windows is built with GGML_BACKEND_DL only: libllama / the tools reach the functions through
+// ggml_backend_reg_get_proc_address (ggml_backend_cuda_reg_get_proc_address), nothing is exported by name.
+#define FLE_EXPORT
+#else
 #define FLE_EXPORT __attribute__((visibility("default")))
+#endif
 
 namespace fle {
 namespace pager {
@@ -50,6 +63,36 @@ namespace pager {
 static const char * getenv_alias(const char * name, const char * deprecated_name) {
     const char * e = std::getenv(name);
     return e ? e : std::getenv(deprecated_name);
+}
+
+// ggml_get_type_traits_cpu lives in the CPU backend. With GGML_BACKEND_DL that backend is a separate module that this
+// one cannot link to: the host hands the function over (pager_set_cpu_traits, called by the code that asks for the
+// pager buffer type); without that the loaded CPU backend is asked for it (ggml_backend_reg_get_proc_address), where the
+// registry can be reached (not on Windows: libggml.dll is not linked to this module).
+// nullptr = no CPU backend known; the callers handle that (the CPU miss compute is then skipped for the type).
+typedef const struct ggml_type_traits_cpu * (*pager_traits_fn_t)(enum ggml_type);
+static std::atomic<pager_traits_fn_t> g_cpu_traits_fn{nullptr};
+
+void pager_set_cpu_traits(void * fn) {
+    g_cpu_traits_fn.store((pager_traits_fn_t) fn, std::memory_order_release);
+}
+
+static const struct ggml_type_traits_cpu * pager_type_traits_cpu(enum ggml_type type) {
+#ifdef GGML_BACKEND_DL
+    pager_traits_fn_t fn = g_cpu_traits_fn.load(std::memory_order_acquire);
+#ifndef _WIN32
+    if (!fn) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+        fn = reg ? (pager_traits_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_get_type_traits_cpu") : nullptr;
+        if (fn) {
+            g_cpu_traits_fn.store(fn, std::memory_order_release);
+        }
+    }
+#endif
+    return fn ? fn(type) : nullptr;
+#else
+    return ggml_get_type_traits_cpu(type);
+#endif
 }
 
 // One stage/remap/finalize at a time (slot/graph parallelism; shared by stage_and_remap and cpu_miss_finalize).
@@ -366,9 +409,16 @@ static void pager_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     if (ctx->vram_pool)    { cudaFree(ctx->vram_pool); }
     if (ctx->host_backing) {
         if (ctx->host_registered_bytes) { cudaHostUnregister(ctx->host_backing); ctx->host_registered_bytes = 0; }
+#ifndef _WIN32
         if (ctx->host_mmap)        { munmap(ctx->host_backing, ctx->host_bytes); if (ctx->mmap_fd >= 0) close(ctx->mmap_fd); }
-        else if (ctx->host_pinned) cudaFreeHost(ctx->host_backing);
+        else
+#endif
+        if (ctx->host_pinned) cudaFreeHost(ctx->host_backing);
+#ifdef _WIN32
+        else                       _aligned_free(ctx->host_backing);
+#else
         else                       free(ctx->host_backing);
+#endif
     }
     delete ctx;
 }
@@ -437,6 +487,12 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
     if (mf && *mf) {
         // NVMe mmap host tier (first-cut cold store): 135 GB fits via the page cache (reclaimable),
         // no pinned-RAM OOM. Staging-only path -> FLE_PAGER_NO_UVA=1 needed (pageable H2D).
+#ifdef _WIN32
+        // open/ftruncate/mmap are POSIX: no mmap tier on Windows. Fail loud instead of silently running without it.
+        std::fprintf(stderr, "[fle-pager] FLE_PAGER_MMAP_FILE is not supported on Windows\n");
+        delete ctx;
+        return nullptr;
+#else
         char mfpath[4096]; snprintf(mfpath, sizeof(mfpath), "%s.dev%d", mf, ctx->device);  // per-device file (multi-device pool 2026-07-18): otherwise O_TRUNC clobber + SIGBUS
         int fd = open(mfpath, O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) { std::fprintf(stderr, "[fle-pager] MMAP open %s failed\n", mfpath); delete ctx; return nullptr; }
@@ -446,6 +502,7 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
         ctx->host_backing = (uint8_t*) p;
         ctx->host_mmap = true; ctx->mmap_fd = fd; ctx->host_pinned = false;
         std::fprintf(stderr, "[fle-pager] MMAP-BACKING: %s (%zu MB, NVMe page-cache reclaimable)\n", mfpath, size >> 20);
+#endif
 
         // FLE_PAGER_HOST_REGISTER — pin the mmap'd file after the fact.
         //
@@ -503,7 +560,12 @@ static ggml_backend_buffer_t pager_buffer_type_alloc_buffer(ggml_backend_buffer_
             return nullptr;
         }
     } else {
+#ifdef _WIN32
+        ctx->host_backing = (uint8_t*) _aligned_malloc(size, 4096);
+        if (!ctx->host_backing) {
+#else
         if (posix_memalign((void**)&ctx->host_backing, 4096, size) != 0) {
+#endif
             delete ctx;
             return nullptr;
         }
@@ -1785,9 +1847,9 @@ FLE_EXPORT void * pager_stage_and_remap(ggml_backend_buffer_t buffer,
     rt.cpu_pre_stride = 0;
     if (cpu_miss_mode && !rt.cpu_misses.empty() && src1) {
         const int64_t Kc = src0->ne[0];
-        const struct ggml_type_traits_cpu * trc = ggml_get_type_traits_cpu(src0->type);
+        const struct ggml_type_traits_cpu * trc = pager_type_traits_cpu(src0->type);
         const enum ggml_type vdtc = trc ? trc->vec_dot_type : GGML_TYPE_F32;
-        const struct ggml_type_traits_cpu * vtrc = ggml_get_type_traits_cpu(vdtc);
+        const struct ggml_type_traits_cpu * vtrc = pager_type_traits_cpu(vdtc);
         const size_t nm = rt.cpu_misses.size();
         if (trc && vtrc && vtrc->from_float && Kc > 0 && rt.ensure_xin(nm * (size_t) Kc)) {
             const size_t xqb = ggml_row_size(vdtc, Kc);
@@ -1996,7 +2058,7 @@ FLE_EXPORT void pager_cpu_miss_finalize(ggml_backend_buffer_t buffer,
     const int64_t N = dst->ne[0];     // output dim (n_ff for gate/up, n_embd for down)
     if (K <= 0 || N <= 0) { s3_exit("4: K or N <= 0"); rt.cpu_misses.clear(); return; }
 
-    const struct ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(src0->type);
+    const struct ggml_type_traits_cpu * tr = pager_type_traits_cpu(src0->type);
     if (!tr || !tr->vec_dot) { s3_exit("5: no vec_dot for this type"); rt.cpu_misses.clear(); return; }
     const uint8_t * w_base = (const uint8_t *) src0->data;   // host_backing = CPU-readable
 
