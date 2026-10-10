@@ -155,6 +155,35 @@ def check_help(server):
 VERBOSE = ["-lv", "4"]
 
 
+def diagnose_cpu_modules(server):
+    """Why did no CPU backend module load? The loader of a release build is silent about it, so ask the modules."""
+    import ctypes
+
+    bin_dir = Path(server).parent
+    modules = sorted(p for p in bin_dir.iterdir() if p.is_file() and "ggml-cpu-" in p.name
+                     and p.suffix.lower() in (".dll", ".so"))
+    log("diagnosis: %d CPU backend modules in %s" % (len(modules), bin_dir))
+    for m in modules:
+        try:
+            lib = ctypes.CDLL(str(m))
+        except OSError as exc:
+            log("    %-34s cannot be loaded: %s" % (m.name, exc))
+            continue
+        try:
+            score = lib.ggml_backend_score
+            score.restype = ctypes.c_int
+            log("    %-34s loads, ggml_backend_score() = %d" % (m.name, score()))
+        except AttributeError:
+            log("    %-34s loads, but it does not export ggml_backend_score" % m.name)
+    if modules:
+        # the loader reports errors for a backend that is named explicitly
+        env = dict(os.environ)
+        env["GGML_BACKEND_PATH"] = str(modules[0])
+        rc, out = run([server] + VERBOSE + ["--list-devices"], env=env)
+        log("diagnosis: GGML_BACKEND_PATH=%s" % modules[0].name)
+        show(out)
+
+
 def check_backends(server):
     """The backends are modules in the package directory: at least one CPU variant must load."""
     rc, out = run([server] + VERBOSE + ["--list-devices"])
@@ -163,6 +192,7 @@ def check_backends(server):
         fail("--list-devices (rc=%d)" % rc)
     cpu = [ln for ln in out.splitlines() if "loaded CPU backend" in ln]
     if not cpu:
+        diagnose_cpu_modules(server)
         fail("no CPU backend module was loaded from the package directory")
     variant = cpu[0].rsplit(os.sep, 1)[-1].rsplit("/", 1)[-1].strip()
     cuda = "loaded" if "loaded CUDA backend" in out else "not loaded (expected without an NVIDIA driver)"
