@@ -16,7 +16,9 @@ name: FLE binaries
 # assets, so the builds do not download anything for it. If that job fails, the engine builds fall
 # back to the prebuilt UI of the llama.cpp project, and without it to no embedded UI.
 #
-# Start:  gh workflow run fle-binaries.yml --ref <branch of this workflow> -f ref=<what to build>
+# Start:  gh workflow run fle-binaries.yml -f ref=<what to build> [-f platforms=linux|windows]
+#         (--ref <branch> picks the branch the workflow file is taken from; the input "ref" picks the
+#         source to build and defaults to main)
 # The helper scripts (.github/fle-binaries) are taken from the built ref.
 
 on:
@@ -27,17 +29,18 @@ on:
         required: false
         default: main
         type: string
-  # TEMPORARY, only while this workflow exists on this branch alone: dispatching needs the file on the
-  # default branch, a push run registers it. Removed before the branch is merged.
-  push:
-    branches: [studio/binaries]
+      platforms:
+        description: 'Which packages to build (both is the default; one of them is for a quick re-run)'
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - linux
+          - windows
 
 permissions:
   contents: read
-
-concurrency:
-  group: fle-binaries-${{ inputs.ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   SRC_REF: ${{ inputs.ref || github.sha }}
@@ -48,6 +51,10 @@ jobs:
     name: web-ui
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # the commit to build is resolved here once: all other jobs check out exactly this commit, even if the
+    # branch moves while the builds run
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
     steps:
       - name: Check out tools/ui
         uses: actions/checkout@v6
@@ -56,6 +63,12 @@ jobs:
           fetch-depth: 0
           filter: blob:none
           sparse-checkout: tools/ui
+
+      - name: Resolve the commit
+        id: src
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "building $SRC_REF = $(git rev-parse HEAD)"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -100,6 +113,7 @@ jobs:
   linux:
     name: ubuntu-cuda-12.8-x64
     needs: [ui]
+    if: ${{ inputs.platforms != 'windows' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     # Ubuntu 22.04 on purpose: the oldest glibc (2.35) and libstdc++ the package needs, so it runs on
@@ -126,7 +140,7 @@ jobs:
       - name: Check out the source
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.SRC_REF }}
+          ref: ${{ needs.ui.outputs.sha }}
           fetch-depth: 0
           filter: blob:none
 
@@ -181,7 +195,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DBUILD_SHARED_LIBS=ON \
             -DGGML_CUDA=ON \
+            -DGGML_CUDA_NCCL=OFF \
             -DGGML_NATIVE=OFF \
             -DGGML_BACKEND_DL=ON \
             -DGGML_CPU_ALL_VARIANTS=ON \
@@ -290,6 +306,7 @@ jobs:
   windows:
     name: win-cuda-13.4-x64
     needs: [ui]
+    if: ${{ inputs.platforms != 'linux' }}
     runs-on: windows-2022
     timeout-minutes: 330
     env:
@@ -309,7 +326,7 @@ jobs:
       - name: Check out the source
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.SRC_REF }}
+          ref: ${{ needs.ui.outputs.sha }}
           fetch-depth: 0
           filter: blob:none
 
@@ -376,7 +393,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=cl `
             -DCMAKE_CXX_COMPILER=cl `
+            -DBUILD_SHARED_LIBS=ON `
             -DGGML_CUDA=ON `
+            -DGGML_CUDA_NCCL=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_BACKEND_DL=ON `
             -DGGML_CPU_ALL_VARIANTS=ON `
@@ -484,7 +503,7 @@ jobs:
   # package, nothing else. Can be re-run alone (gh run rerun --job), the package comes from the build job.
   verify-linux:
     name: verify ubuntu-cuda-12.8-x64 (plain runner + upstream cudart)
-    needs: [linux]
+    needs: [ui, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -495,7 +514,7 @@ jobs:
       - name: Check out the helper scripts
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.SRC_REF }}
+          ref: ${{ needs.ui.outputs.sha }}
           sparse-checkout: .github/fle-binaries
 
       - name: Download the package
@@ -539,7 +558,7 @@ jobs:
 
   verify-windows:
     name: verify win-cuda-13.4-x64 (plain runner + upstream cudart)
-    needs: [windows]
+    needs: [ui, windows]
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -554,7 +573,7 @@ jobs:
       - name: Check out the helper scripts
         uses: actions/checkout@v6
         with:
-          ref: ${{ env.SRC_REF }}
+          ref: ${{ needs.ui.outputs.sha }}
           sparse-checkout: .github/fle-binaries
 
       - name: Download the package
