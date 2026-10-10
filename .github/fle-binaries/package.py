@@ -119,6 +119,24 @@ def vc_redist_files():
     return [Path(f) for f in files]
 
 
+def needed_vc_runtime(files, candidates):
+    """Only the runtime DLLs that a file of the package imports, directly or through another runtime DLL.
+
+    The redist folder holds a dozen DLLs (WinRT, parallel runtime, ...) that nothing in the package uses.
+    A DLL name appears as plain ASCII in the import table of every file that imports it.
+    """
+    by_name = {c.name.lower(): c for c in candidates}
+    needed = set()
+    queue = list(files)
+    while queue:
+        data = queue.pop().read_bytes().lower()
+        for name, cand in by_name.items():
+            if name not in needed and name.encode("ascii") in data:
+                needed.add(name)
+                queue.append(cand)
+    return [by_name[n] for n in sorted(needed)]
+
+
 def readme(platform, name, info):
     major = info["cuda_major"]
     sass = ", ".join(info["cuda_sass"]) or "?"
@@ -158,8 +176,8 @@ def readme(platform, name, info):
             "* The CUDA %(m)s runtime DLLs cudart64_%(m)s.dll, cublas64_%(m)s.dll and cublasLt64_%(m)s.dll.\n"
             "  They are not part of this package. Unpack the matching upstream package into this directory:\n"
             "      cudart-llama-bin-win-cuda-%(r)s-x64.zip  from  https://github.com/ggml-org/llama.cpp/releases\n"
-            "* The Visual C++ runtime DLLs (msvcp140*.dll, vcruntime140*.dll, vcomp140.dll) are included\n"
-            "  (app-local deployment), nothing needs to be installed for them.\n"
+            "* The Visual C++ runtime DLLs the programs import (msvcp140*.dll, vcruntime140*.dll, vcomp140.dll)\n"
+            "  are included (app-local deployment), nothing needs to be installed for them.\n"
             "* Windows 10 or newer, x64.\n\n"
         ) % {"m": major, "r": info["cuda_release"]}
     tail = (
@@ -264,9 +282,11 @@ def main():
     for f in sorted((repo / "licenses").glob("*")):
         extras.append((f, "licenses/" + f.name))
     if args.platform == "windows":
-        for f in vc_redist_files():
-            if f.name not in {p.name for p in files}:
-                extras.append((f, f.name))
+        have = {p.name.lower() for p in files}
+        candidates = [f for f in vc_redist_files() if f.name.lower() not in have]
+        used = needed_vc_runtime(files, candidates)
+        log("Visual C++ runtime: %d of %d DLLs of the redistributable are used" % (len(used), len(candidates)))
+        extras += [(f, f.name) for f in used]
 
     tc = toolchain(args.platform)
     sass, ptx = cuda_archs(args.cuobjdump, module)
