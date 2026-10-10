@@ -103,6 +103,15 @@ def main():
         if len(names) < declared:
             errors.append("%s: only %d of the %d exported names could be read (the check would give false results)"
                           % (name, len(names), declared))
+    # the backend modules are found by the loader through two exported functions (a module without them is skipped
+    # silently): ggml_backend_init (every module) and ggml_backend_score (the CPU variants)
+    modules = sorted(n for n in exports if re.match(r"^ggml-(cuda|cpu-[a-z0-9_]+)\.dll$", n))
+    print("[pe] backend modules: %s" % ", ".join(modules), flush=True)
+    for n in modules:
+        wanted = ["ggml_backend_init"] + (["ggml_backend_score"] if n.startswith("ggml-cpu-") else [])
+        missing = [w for w in wanted if w not in exports[n][0]]
+        if missing:
+            errors.append("%s does not export %s, the engine could not use this module" % (n, ", ".join(missing)))
     external = {}   # dll -> importing files
     checked_symbols = 0
     for name, pe in sorted(parsed.items()):
