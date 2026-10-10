@@ -155,13 +155,17 @@ footer { margin-top: 4em; padding-top: 1.1em; font-size: .8rem; line-height: 1.5
 <p><em>AI assistance: engine patches, measurement scripts and this text were written together with Claude (Anthropic,
 Claude Code). arXiv does not accept an AI system as an author; the author takes responsibility for every claim and number.</em></p>
 <blockquote>
-<p>Version 1.0, 2026-10-09 (final configuration <code>p49-ring</code>; final measurement series of 2026-10-06: B1e against
+<p>Version 1.0.2, 2026-10-10: version 1.0 of 2026-10-09 with film 6 corrected (<a class="ref" href="#appendix-b">Appendix B</a>, version 1.0.1), the archive
+DOI and FLE-IQ3_M-REAP448 in its own model repository (Availability, <a class="ref" href="#s9">Section 9</a>); the text is unchanged otherwise.
+(Final configuration <code>p49-ring</code>; final measurement series of 2026-10-06: B1e against
 upstream, B3e1–B3e5 all quantizations, S against Strata; expert pruning and MKQA knowledge probe of 2026-10-08;
 FLE-IQ3_M-REAP448 speed, bracket B3e6, of 2026-10-09). Rules for this text: every number is a measurement on our
 own setup, paired inside one measurement bracket where speed is concerned, with raw data, script and build named in
 the evidence table (<a class="ref" href="#appendix-a">Appendix A</a>); every paired bracket is listed in <a class="ref" href="#appendix-c">Appendix C</a>. Estimates and readings that were not
 measured are marked as such.</p>
 </blockquote>
+<p><em>Cite as:</em> Max Bitzer (sirfyyn). FLE: Fast Local Experts — an 89 GB Mixture-of-Experts model at ~90 tokens/s on one
+32 GB GPU. Technical report, 2026. doi:10.5281/zenodo.23272400, <a href="https://doi.org/10.5281/zenodo.23272400">https://doi.org/10.5281/zenodo.23272400</a>.</p>
 </div>
 <nav class="actions" aria-label="Downloads and links"><a class="primary" href="fle-paper.pdf">PDF</a><a href="#film-complete">Films (6:59)</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF">Model files</a><a href="https://github.com/sirfyyn/FastLocalExperts">Engine source</a></nav>
 <details class="toc-top"><summary>Contents</summary>
@@ -1078,7 +1082,7 @@ three benchmarks were re-run on the fixed server.</p>
 <h2 id="s6"><span class="num">6</span> Negative results</h2>
 <figure class="film" id="film-6">
 <div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-6.jpg" aria-label="Film 6: What did not work"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4">making-rhea-fast-6.mp4</a></video></div>
-<figcaption><span class="film-head">Film 6/8 · What did not work · 0:56</span><span class="film-text">Retells <a class="ref" href="#s6">Section 6</a>.</span><span class="film-links"><a href="https://youtu.be/-C8z5JmGRGE">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4">MP4, 4.2 MB</a></span></figcaption>
+<figcaption><span class="film-head">Film 6/8 · What did not work · 0:56</span><span class="film-text">Retells <a class="ref" href="#s6">Section 6</a>.</span><span class="film-links"><a href="https://youtu.be/EQAw5UroaSs">YouTube</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-6.mp4">MP4, 4.2 MB</a></span></figcaption>
 </figure>
 <p><strong>Pre-gating prefetch</strong> (router top-K of layer l+1 on the input of layer l, asynchronous loads): a trace simulation
 gave +18 .. +25 % for a single stream (+24 .. +35 % with two parallel slots), assuming free room for the prefetch
@@ -1383,9 +1387,13 @@ files, FLE-IQ3_M and FLE-IQ3_XXS, not on FLE-IQ2_M or the public files. Builds,
 patches, scripts and raw data are listed in <a class="ref" href="#appendix-a">Appendix A</a>; the gaps found in the inventory are listed there too.</p>
 <p><strong>Availability.</strong> The engine is published as FastLocalExperts at <a href="https://github.com/sirfyyn/FastLocalExperts">https://github.com/sirfyyn/FastLocalExperts</a> under
 the MIT license of llama.cpp; tag <code>v1.0</code> is the configuration measured here (final profile <code>p49-ring</code>) plus the slot
-fix of patch 50 and the crash report of patch 51, neither of which changes the computation. The GGUF files, the MTP
-head, the films and the SHA-256 of every file are at <a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF</a>,
-under the Qwen Community License 1.0 of the base model. The raw measurement data are not part of this release.</p>
+fix of patch 50 and the crash report of patch 51, neither of which changes the computation. Tag <code>v1.0.1</code> has the same
+engine code plus version 1.0.1 of this report and its archive metadata; Zenodo archives it as doi:10.5281/zenodo.23272400
+(<a href="https://doi.org/10.5281/zenodo.23272400">https://doi.org/10.5281/zenodo.23272400</a>, all versions). FLE-IQ3_M, FLE-IQ3_XXS, FLE-IQ2_M, the MTP head, the films
+and the SHA-256 of every file are at <a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF</a>; FLE-IQ3_M-REAP448
+and its SHA-256 are at <a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF</a> (moved there on 2026-10-10
+so that the Hub lists it on its own). All model files are under the Qwen Community License 1.0 of the base model. The
+raw measurement data are not part of this release.</p>
 <h2 id="appendix-a">Appendix A: evidence table</h2>
 <p>State of the inventory of 2026-10-03, extended 2026-10-07. Paths are on the measurement machine unless they start with <code>docs/</code> or
 <code>scripts/</code> (this repository). Snapshot of the scripts: <code>scripts/fle/titan-stand-20261003/</code>.</p>
@@ -1727,8 +1735,8 @@ under the Qwen Community License 1.0 of the base model. The raw measurement data
 <h2 id="appendix-b">Appendix B: supplementary films</h2>
 <p>Eight short films, <em>Making Rhea Fast</em> (English, subtitles burned in, 6 min 59 s in total), retell <a class="ref" href="#s2-4">Sections 2.4</a> to 6 for
 readers who prefer to watch. They were generated from the measurement database (6,130 measurements, state of
-2026-10-08) and contain no number that is not in this paper or its evidence, except for the two corrections to film 6
-below; where a film words or rounds a number differently, the text and <a class="ref" href="#appendix-a">Appendix A</a> are the reference. Files and SHA-256 are in the model repository under <code>media/</code>
+2026-10-08) and contain no number that is not in this paper or its evidence; where a film words or rounds a number
+differently, the text and <a class="ref" href="#appendix-a">Appendix A</a> are the reference. Files and SHA-256 are in the model repository under <code>media/</code>
 (<a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/tree/main/media">https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/tree/main/media</a>); the same films are on YouTube as one
 playlist (<a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ</a>).</p>
 <div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>
@@ -1789,12 +1797,13 @@ playlist (<a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">https://
 </table></div>
 <figure class="film" id="film-complete">
 <div class="screen"><video controls preload="none" playsinline width="1920" height="1080" poster="media/making-rhea-fast-1.jpg" aria-label="All 8 films in one file"><source src="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4" type="video/mp4"><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4">making-rhea-fast-complete.mp4</a></video></div>
-<figcaption><span class="film-head">All 8 films in one file · 6:59</span><span class="film-links"><a href="https://youtu.be/XORhN-U4mNM">YouTube</a><a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">Playlist</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4">MP4, 43.1 MB</a></span></figcaption>
+<figcaption><span class="film-head">All 8 films in one file · 6:59</span><span class="film-links"><a href="https://youtu.be/gmiTfn5Qaj4">YouTube</a><a href="https://www.youtube.com/playlist?list=PLMYhpsBSEhIQ">Playlist</a><a href="https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF/resolve/main/media/making-rhea-fast-complete.mp4">MP4, 43.1 MB</a></span></figcaption>
 </figure>
-<p>Corrections to film 6, found when the paper was checked against the raw data after the films were made: the film
-shows the simulated gain of pre-gating as +18 … +35 %, but +35 % holds only for two parallel slots, a single stream
-gives +18 .. +25 % (<a class="ref" href="#s6">Section 6</a>); and it shows a forecast of ±1.5 % for copying misses over PCIe, while the forecast
-written down before that measurement was +3 .. +10 % (<a class="ref" href="#s5-3">Section 5.3</a>).</p>
+<p>Film 6 was corrected on 2026-10-10. Checking the paper against the raw data after the films were made found two
+errors in its first version: it gave the simulated gain of pre-gating as +18 … +35 %, but +35 % holds only for two
+parallel slots, a single stream gives +18 .. +25 % (<a class="ref" href="#s6">Section 6</a>); and it gave a forecast of ±1.5 % for copying misses
+over PCIe, while the forecast written down before that measurement was +3 .. +10 % (<a class="ref" href="#s5-3">Section 5.3</a>). Film 6 and the
+complete film now show +18 .. +25 % and +3 .. +10 %.</p>
 <h2 id="appendix-c">Appendix C: all paired brackets</h2>
 <p>Every paired bracket whose evaluation is in <code>docs/fle/paper/belege/</code>, in the order of measurement. <em>Speed</em> is the
 paired change in decode speed of the candidate against the reference (positive = faster) with its bootstrap 95 %
@@ -2695,7 +2704,7 @@ paired brackets and are not listed.</p>
 </table></div>
 <!-- klammer_tabelle:end -->
 </article>
-<footer><p>Generated on 2026-10-09 from <code>fle-paper.md</code> (SHA-256 79dec6b3cd0d). The PDF has the same text; the films are in <a class="ref" href="#appendix-b">Appendix B</a>.</p></footer>
+<footer><p>Generated on 2026-10-10 from <code>fle-paper.md</code> (SHA-256 8cad25e7d058). The PDF has the same text; the films are in <a class="ref" href="#appendix-b">Appendix B</a>.</p></footer>
 </main>
 </div>
 <script>
