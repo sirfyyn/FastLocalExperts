@@ -27,7 +27,10 @@ MACHINE_AMD64 = 0x8664
 
 
 def load(path):
-    pe = pefile.PE(str(path), fast_load=True)
+    # llama-common.dll exports every symbol of the library (tens of thousands of C++ names); pefile stops at
+    # 0x2000 exports / imports per file unless the sanity limits are lifted
+    pefile.MAX_IMPORT_SYMBOLS = 0x400000
+    pe = pefile.PE(str(path), fast_load=True, max_symbol_exports=0x400000)
     pe.parse_data_directories(directories=[
         pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
         pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
@@ -48,14 +51,17 @@ def imports_of(pe):
 
 
 def exports_of(pe):
+    """(names, ordinals, number of names the export table declares)"""
     names, ordinals = set(), set()
+    declared = 0
     exp = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
     if exp:
+        declared = exp.struct.NumberOfNames
         for sym in exp.symbols:
             if sym.name:
                 names.add(sym.name.decode("ascii", "replace"))
             ordinals.add(sym.ordinal)
-    return names, ordinals
+    return names, ordinals, declared
 
 
 def main():
@@ -87,12 +93,18 @@ def main():
             errors.append("%s: machine type 0x%x, expected x64" % (p.name, pe.FILE_HEADER.Machine))
 
     exports = {name: exports_of(pe) for name, pe in parsed.items()}
+    for name, (names, _, declared) in sorted(exports.items()):
+        if declared > 1000:
+            print("[pe] %-28s exports %d names (export table declares %d)" % (name, len(names), declared), flush=True)
+        if len(names) < declared:
+            errors.append("%s: only %d of the %d exported names could be read (the check would give false results)"
+                          % (name, len(names), declared))
     external = {}   # dll -> importing files
     checked_symbols = 0
     for name, pe in sorted(parsed.items()):
         for dll, func, ordinal in imports_of(pe):
             if dll in by_name:
-                names, ordinals = exports.get(dll, (set(), set()))
+                names, ordinals, _ = exports.get(dll, (set(), set(), 0))
                 checked_symbols += 1
                 if func is not None and func not in names:
                     errors.append("%s imports %s from %s, which that DLL does not export" % (name, func, dll))
