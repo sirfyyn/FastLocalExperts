@@ -17,6 +17,7 @@ Only the Python standard library is used.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -184,30 +185,61 @@ def diagnose_cpu_modules(server):
         show(out)
 
 
-def check_backends(server):
-    """The backends are modules in the package directory: at least one CPU variant must load."""
-    rc, out = run([server] + VERBOSE + ["--list-devices"])
+def list_devices(server, env=None, want=None, tries=3):
+    """--list-devices prints and exits at once. The log is written by a thread of its own and can be cut when the
+    process exits (seen on Windows: the line "loaded CPU backend from ..." stopped after its time stamp), so a
+    missing line is asked for again."""
+    out = ""
+    for attempt in range(1, tries + 1):
+        rc, out = run([server] + VERBOSE + ["--list-devices"], env=env)
+        if rc != 0:
+            fail("--list-devices (rc=%d)" % rc)
+        if want is None or want in out:
+            break
+        log("no '%s' in the output (attempt %d of %d; the log can be cut when the process exits)" % (want, attempt, tries))
     show(out)
-    if rc != 0:
-        fail("--list-devices (rc=%d)" % rc)
+    return out
+
+
+def check_backends(server):
+    """The backends are modules in the package directory. --list-devices only lists GPUs and the like; the loader
+    messages show which modules were loaded. The server run below is the proof that a CPU backend works."""
+    out = list_devices(server, want="loaded CPU backend")
     cpu = [ln for ln in out.splitlines() if "loaded CPU backend" in ln]
-    if not cpu:
-        diagnose_cpu_modules(server)
-        fail("no CPU backend module was loaded from the package directory")
-    variant = cpu[0].rsplit(os.sep, 1)[-1].rsplit("/", 1)[-1].strip()
     cuda = "loaded" if "loaded CUDA backend" in out else "not loaded (expected without an NVIDIA driver)"
-    log("OK  CPU backend variant loaded (%s); CUDA module: %s" % (variant, cuda))
+    if cpu:
+        variant = cpu[0].rsplit(os.sep, 1)[-1].rsplit("/", 1)[-1].strip()
+        log("OK  CPU backend variant loaded (%s); CUDA module: %s" % (variant, cuda))
+    else:
+        log("note: the loader message of the CPU backend was not shown, the server run decides; CUDA module: %s" % cuda)
 
 
 def check_cuda_module_loads(server, stub_dir):
     """With a stub libcuda.so.1 the CUDA module can be dlopen()ed even without a GPU."""
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = str(stub_dir)
-    rc, out = run([server] + VERBOSE + ["--list-devices"], env=env)
-    show(out)
+    out = list_devices(server, env=env, want="loaded CUDA backend")
     if "loaded CUDA backend" not in out:
         fail("the CUDA backend module did not load with a stub driver (unresolved symbols or missing libraries?)")
     log("OK  CUDA backend module loads with a stub driver (all symbols resolve)")
+
+
+def check_ui(base):
+    """Information (and a warning in the CI log): is the web UI embedded? The assets are gzip-compressed in the
+    binary, the server answers 415 to a client that does not accept gzip."""
+    req = urllib.request.Request(base + "/", headers={"Accept-Encoding": "gzip"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            status, ctype, body = resp.status, resp.headers.get("Content-Type", ""), resp.read()
+            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+                body = gzip.decompress(body)
+    except urllib.error.HTTPError as exc:
+        return "missing (HTTP %d)" % exc.code
+    except Exception as exc:  # noqa: BLE001 - this check only informs
+        return "unknown (%s)" % exc
+    if status == 200 and "html" in ctype.lower() and b"<html" in body[:4096].lower():
+        return "embedded (%d bytes of HTML)" % len(body)
+    return "missing (status %d, %s)" % (status, ctype)
 
 
 def check_server(server, model, log_path, n_predict):
@@ -259,18 +291,10 @@ def check_server(server, model, log_path, n_predict):
                 log("note: %d tokens instead of %d (stopped early)" % (n_tok, n_predict))
 
         if err is None:
-            # information only: is the web UI embedded?
-            try:
-                status, ctype, body = http("GET", base + "/", timeout=10)
-                if status == 200 and "html" in ctype.lower():
-                    ui = "embedded (%d bytes)" % len(body)
-                else:
-                    ui = "missing (status %d, %s)" % (status, ctype)
-            except urllib.error.HTTPError as exc:
-                ui = "missing (HTTP %d)" % exc.code
-            except (urllib.error.URLError, OSError) as exc:
-                ui = "unknown (%s)" % exc
+            ui = check_ui(base)
             log("web UI: %s" % ui)
+            if not ui.startswith("embedded") and os.environ.get("GITHUB_ACTIONS"):
+                print("::warning::the web UI is not embedded in this build: %s" % ui, flush=True)
             ok = True
     finally:
         proc.terminate()
@@ -285,9 +309,26 @@ def check_server(server, model, log_path, n_predict):
         log("server log, key lines (%d of %d):" % (min(len(picked), 80), len(text.splitlines())))
         show("\n".join(picked), limit=80)
     if not ok:
+        diagnose_cpu_modules(server)
         fail(err or "server test")
-    log("OK  server /health + /completion on the CPU")
-    return ui
+    sysinfo = next((ln for ln in text.splitlines() if "system_info:" in ln), "")
+    if "CPU :" not in sysinfo:
+        diagnose_cpu_modules(server)
+        fail("the server log names no CPU backend in system_info: %r" % sysinfo)
+    features = cpu_features(sysinfo)
+    log("OK  server /health + /completion on the CPU (CPU backend features: %s)" % " ".join(features))
+    return ui, features
+
+
+def cpu_features(sysinfo):
+    """Names of the CPU features the backend in use reports ("CPU : SSE3 = 1 | AVX2 = 1 | ... |")."""
+    part = sysinfo.split("CPU :", 1)[1] if "CPU :" in sysinfo else ""
+    out = []
+    for item in part.split("|"):
+        name, _, value = item.partition("=")
+        if value.strip() == "1":
+            out.append(name.strip())
+    return out
 
 
 def main():
@@ -321,15 +362,16 @@ def main():
     check_backends(server)
     model = work / "stories15M-q4_0.gguf"
     fetch_model(model)
-    ui = check_server(server, model, work / "server.log", args.n_predict)
+    ui, features = check_server(server, model, work / "server.log", args.n_predict)
     if args.cuda_stub_dir:
         check_cuda_module_loads(server, Path(args.cuda_stub_dir).resolve())
     log("ALL OK")
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as f:
-            f.write("- smoke test: version, FLE options, CPU backend, CPU server (/health, /completion, %d tokens) OK; "
-                    "web UI %s%s\n" % (args.n_predict, ui,
-                                       "; CUDA module loads with a stub driver" if args.cuda_stub_dir else ""))
+            f.write("- smoke test: version, FLE options, CPU server (/health, /completion, %d tokens) OK; "
+                    "CPU backend features: %s; web UI %s%s\n" % (
+                        args.n_predict, " ".join(features), ui,
+                        "; CUDA module loads with a stub driver" if args.cuda_stub_dir else ""))
 
 
 if __name__ == "__main__":
