@@ -1,7 +1,23 @@
 name: FLE binaries
 
-# Portable binary packages of the FLE engine (CUDA, Linux and Windows).
-# Workflow artifacts only: no release, no tag.
+# Portable binary packages of the FLE engine (the llama.cpp fork with the expert pager), built from
+# source on GitHub-hosted runners. Workflow artifacts only: no release, no tag, no secrets.
+#
+#   ubuntu-cuda-12.8-x64   fle-<sha8>-bin-ubuntu-cuda-12.8-x64.tar.gz
+#   win-cuda-13.4-x64      fle-<sha8>-bin-win-cuda-13.4-x64.zip
+#
+# Both are built with GGML_BACKEND_DL=ON and GGML_CPU_ALL_VARIANTS=ON: the CUDA backend and 9 to 14
+# CPU variants are separate modules next to llama-server. Without an NVIDIA driver the CUDA module
+# is skipped and the best CPU variant computes, which is what the smoke test in each job checks.
+# The CUDA runtime (cudart, cublas, cublasLt) is not part of the packages: the launcher puts the
+# matching upstream llama.cpp cudart package next to them (same CUDA major version).
+#
+# The web UI is built once from tools/ui (job "web-ui") and put into the engine builds as prebuilt
+# assets, so the builds do not download anything for it. If that job fails, the engine builds fall
+# back to the prebuilt UI of the llama.cpp project, and without it to no embedded UI.
+#
+# Start:  gh workflow run fle-binaries.yml --ref <branch of this workflow> -f ref=<what to build>
+# The helper scripts (.github/fle-binaries) are taken from the built ref.
 
 on:
   workflow_dispatch:
@@ -11,13 +27,571 @@ on:
         required: false
         default: main
         type: string
+  # TEMPORARY, only while this workflow exists on this branch alone: dispatching needs the file on the
+  # default branch, a push run registers it. Removed before the branch is merged.
+  push:
+    branches: [studio/binaries]
 
 permissions:
   contents: read
 
+concurrency:
+  group: fle-binaries-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+env:
+  SRC_REF: ${{ inputs.ref || github.sha }}
+
 jobs:
-  skeleton:
+  # ---------------------------------------------------------------------------------------------
+  ui:
+    name: web-ui
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - name: Echo the requested ref
-        run: echo "ref=${{ inputs.ref }} sha=${{ github.sha }}"
+      - name: Check out tools/ui
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SRC_REF }}
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout: tools/ui
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: tools/ui/package-lock.json
+
+      - name: Install dependencies
+        id: npm_ci
+        continue-on-error: true
+        working-directory: tools/ui
+        run: npm ci
+
+      - name: Build the UI
+        id: npm_build
+        if: steps.npm_ci.outcome == 'success'
+        continue-on-error: true
+        working-directory: tools/ui
+        run: |
+          export LLAMA_BUILD_NUMBER="b$(git rev-list --count HEAD)"
+          npm run build
+
+      - name: Report
+        run: |
+          if [ -f tools/ui/dist/index.html ]; then
+            echo "UI built: $(find tools/ui/dist -type f | wc -l) files"
+          else
+            echo "::warning::the web UI could not be built; the engine builds fall back to the prebuilt UI download, or to no embedded UI"
+          fi
+
+      - name: Upload the UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: fle-ui-dist
+          path: tools/ui/dist/
+          retention-days: 1
+          if-no-files-found: warn
+          overwrite: true
+
+  # ---------------------------------------------------------------------------------------------
+  linux:
+    name: ubuntu-cuda-12.8-x64
+    needs: [ui]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    # Ubuntu 22.04 on purpose: the oldest glibc (2.35) and libstdc++ the package needs, so it runs on
+    # Ubuntu 22.04 and newer, Debian 12 and newer and on every newer distribution.
+    container:
+      image: nvidia/cuda:12.8.2-devel-ubuntu22.04
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+      file: ${{ steps.package.outputs.file }}
+      sha8: ${{ steps.package.outputs.sha8 }}
+    steps:
+      - name: Install the build tools
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential ninja-build ccache curl python3 python3-pip libssl-dev zstd xz-utils
+          # the CMake of Ubuntu 22.04 (3.22) is older than what the CUDA architecture list needs (120a-real)
+          pip3 install --no-cache-dir cmake==3.31.10
+
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SRC_REF }}
+          fetch-depth: 0
+          filter: blob:none
+
+      # checkout runs as the host user, the steps in the container as root: mark the workspace as safe
+      # (GITHUB_WORKSPACE is the path inside the container, github.workspace the one on the host)
+      - name: Git safe directory
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "SRC_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Download the web UI
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: fle-ui-dist
+          path: tools/ui/dist
+
+      - name: Configure ccache
+        run: |
+          {
+            echo "CCACHE_DIR=$GITHUB_WORKSPACE/.ccache"
+            echo "CCACHE_MAXSIZE=3G"
+            echo "CCACHE_COMPRESS=1"
+            echo "CCACHE_COMPILERCHECK=content"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: fle-ccache-linux-cuda12.8-u2204-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fle-ccache-linux-cuda12.8-u2204-
+
+      - name: Show the toolchain
+        run: |
+          echo "source: $SRC_REF = $SRC_SHA"
+          nvcc --version
+          gcc --version
+          cmake --version
+          ninja --version
+          ccache --version
+          python3 --version
+          echo "cpus: $(nproc)"
+          free -m
+          df -h /
+          ls tools/ui/dist | head -n 20 || true
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_ALL_WARNINGS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_APP=OFF 2>&1 | tee configure.log
+
+      - name: Build
+        id: build
+        run: |
+          ccache --zero-stats
+          rc=0
+          # -k 0: keep going after an error, so one run shows every error and fills the cache
+          cmake --build build -j "$(nproc)" -- -k 0 2>&1 | tee build.log || rc=$?
+          echo "seconds=$SECONDS" >> "$GITHUB_OUTPUT"
+          exit $rc
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Package
+        id: package
+        run: |
+          python3 .github/fle-binaries/package.py \
+            --platform linux \
+            --bin-dir build/bin \
+            --out-dir dist \
+            --label ubuntu-cuda-12.8-x64 \
+            --commit "$SRC_SHA" \
+            --ref "$SRC_REF" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --build-os "Ubuntu 22.04 (glibc 2.35)" \
+            --cuobjdump "$(command -v cuobjdump)" \
+            --cmake-cache build/CMakeCache.txt \
+            --configure-log configure.log
+
+      - name: Unpack the package (as a user would)
+        run: |
+          mkdir -p check
+          tar -xzf "dist/${{ steps.package.outputs.file }}" -C check
+          ls -l "check/${{ steps.package.outputs.name }}"
+
+      - name: Static checks (libraries, RPATH, glibc baseline)
+        run: |
+          python3 .github/fle-binaries/check_elf.py \
+            --dir "check/${{ steps.package.outputs.name }}" \
+            --cuda-major 12 \
+            --max-glibc 2.35 \
+            --ldd
+
+      - name: Smoke test (CPU only, no GPU, no driver)
+        run: |
+          # the CUDA toolkit ships a stub libcuda.so: with it the CUDA module can be loaded without a GPU,
+          # which proves that every symbol of the module resolves
+          mkdir -p stub
+          cp -L /usr/local/cuda/lib64/stubs/libcuda.so stub/libcuda.so.1
+          python3 .github/fle-binaries/smoke_test.py \
+            --bin-dir "check/${{ steps.package.outputs.name }}" \
+            --work-dir smoke \
+            --expect-commit "$SRC_SHA" \
+            --cuda-stub-dir stub \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/${{ steps.package.outputs.file }}
+          archive: false
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Build time
+        if: always()
+        run: |
+          echo "- compile time of the engine build (cmake --build): ${{ steps.build.outputs.seconds }} s" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: fle-ccache-linux-cuda12.8-u2204-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-linux
+          path: |
+            configure.log
+            build.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/CMakeFiles/CMakeError.log
+            build/CMakeFiles/CMakeOutput.log
+          retention-days: 7
+          if-no-files-found: ignore
+          overwrite: true
+
+  # ---------------------------------------------------------------------------------------------
+  windows:
+    name: win-cuda-13.4-x64
+    needs: [ui]
+    runs-on: windows-2022
+    timeout-minutes: 330
+    env:
+      # redist manifest that pins every CUDA component (13.4 update 1), installed like the upstream workflow does
+      CUDA_REDIST_VERSION: '13.4.1'
+      FLE_CUDA_ROOT: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+      CCACHE_VERSION: '4.13.6'
+      CCACHE_SHA256: '3d7cebb05850ad704e197b3f1d3f0f924ab6c9fdfc561578e146184fe9d89380'
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+      file: ${{ steps.package.outputs.file }}
+      sha8: ${{ steps.package.outputs.sha8 }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SRC_REF }}
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Resolve the commit
+        run: Add-Content -Path $env:GITHUB_ENV -Value "SRC_SHA=$(git rev-parse HEAD)"
+
+      - name: Download the web UI
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: fle-ui-dist
+          path: tools/ui/dist
+
+      - name: Install the CUDA toolkit ${{ env.CUDA_REDIST_VERSION }}
+        run: .\.github\fle-binaries\install_cuda_windows.ps1 -Version $env:CUDA_REDIST_VERSION -Destination $env:FLE_CUDA_ROOT
+
+      - name: Install Ninja, ccache and pefile
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            python -m pip install --disable-pip-version-check ninja==1.13.0
+            if ($LASTEXITCODE -ne 0) { throw 'cannot install ninja' }
+          }
+          python -m pip install --disable-pip-version-check pefile==2024.8.26
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install pefile' }
+
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          curl.exe --fail --silent --show-error --location --retry 5 --retry-delay 5 --retry-all-errors -o $zip "https://github.com/ccache/ccache/releases/download/v$env:CCACHE_VERSION/ccache-$env:CCACHE_VERSION-windows-x86_64.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'cannot download ccache' }
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:CCACHE_SHA256) { throw "ccache SHA-256 mismatch: $hash" }
+          7z x -y "-o$env:RUNNER_TEMP" $zip | Out-Null
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP "ccache-$env:CCACHE_VERSION-windows-x86_64")
+          Add-Content -Path $env:GITHUB_ENV -Value "CCACHE_DIR=$env:GITHUB_WORKSPACE\.ccache"
+          Add-Content -Path $env:GITHUB_ENV -Value 'CCACHE_MAXSIZE=3G'
+          Add-Content -Path $env:GITHUB_ENV -Value 'CCACHE_COMPRESS=1'
+          Add-Content -Path $env:GITHUB_ENV -Value 'CCACHE_COMPILERCHECK=content'
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: fle-ccache-windows-cuda13.4.1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fle-ccache-windows-cuda13.4.1-
+
+      - name: Show the toolchain
+        run: |
+          . .\.github\fle-binaries\msvc_env.ps1
+          Write-Host "source: $env:SRC_REF = $env:SRC_SHA"
+          nvcc --version
+          cl 2>&1 | Select-Object -First 1
+          cmake --version
+          ninja --version
+          ccache --version
+          python --version
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[int]($_.Free / 1GB)}}
+          Get-ChildItem tools\ui\dist -ErrorAction SilentlyContinue | Select-Object -First 20 | Format-Table Name
+
+      - name: Configure
+        run: |
+          . .\.github\fle-binaries\msvc_env.ps1
+          $ErrorActionPreference = 'Continue'
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DGGML_CUDA=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DLLAMA_CURL=OFF `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            -DLLAMA_ALL_WARNINGS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_TOOLS=ON `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_APP=OFF 2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        id: build
+        run: |
+          . .\.github\fle-binaries\msvc_env.ps1
+          $ErrorActionPreference = 'Continue'
+          ccache --zero-stats
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          # -k 0: keep going after an error, so one run shows every error and fills the cache
+          cmake --build build -j $env:NUMBER_OF_PROCESSORS -- -k 0 2>&1 | Tee-Object -FilePath build.log
+          $rc = $LASTEXITCODE
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "seconds=$([int]$timer.Elapsed.TotalSeconds)"
+          exit $rc
+
+      - name: ccache statistics
+        if: always()
+        run: ccache --show-stats
+
+      - name: Package
+        id: package
+        run: |
+          . .\.github\fle-binaries\msvc_env.ps1
+          python .github\fle-binaries\package.py `
+            --platform windows `
+            --bin-dir build\bin `
+            --out-dir dist `
+            --label win-cuda-13.4-x64 `
+            --commit $env:SRC_SHA `
+            --ref $env:SRC_REF `
+            --run-url "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID" `
+            --build-os "Windows Server 2022" `
+            --cuobjdump (Get-Command cuobjdump).Source `
+            --cmake-cache build\CMakeCache.txt `
+            --configure-log configure.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Unpack the package (as a user would)
+        run: |
+          7z x -y -opackage-check "dist\${{ steps.package.outputs.file }}" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'cannot unpack the package' }
+          Get-ChildItem package-check | Format-Table Name, Length
+
+      - name: Static checks (imports of every exe and dll)
+        run: python .github\fle-binaries\check_pe.py --dir package-check --cuda-major 13
+
+      - name: Smoke test (CPU only, no GPU, no driver)
+        run: |
+          python .github\fle-binaries\smoke_test.py `
+            --bin-dir package-check `
+            --work-dir smoke `
+            --expect-commit $env:SRC_SHA `
+            --summary $env:GITHUB_STEP_SUMMARY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the package
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/${{ steps.package.outputs.file }}
+          archive: false
+          retention-days: 30
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Build time
+        if: always()
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "- compile time of the engine build (cmake --build): ${{ steps.build.outputs.seconds }} s"
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: fle-ccache-windows-cuda13.4.1-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-windows
+          path: |
+            configure.log
+            build.log
+            build/CMakeFiles/CMakeConfigureLog.yaml
+            build/CMakeFiles/CMakeError.log
+            build/CMakeFiles/CMakeOutput.log
+          retention-days: 7
+          if-no-files-found: ignore
+          overwrite: true
+
+  # ---------------------------------------------------------------------------------------------
+  # Clean-room check on a plain runner (no CUDA, no container): the package plus the upstream cudart
+  # package, nothing else. Can be re-run alone (gh run rerun --job), the package comes from the build job.
+  verify-linux:
+    name: verify ubuntu-cuda-12.8-x64 (plain runner + upstream cudart)
+    needs: [linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # upstream llama.cpp release whose cudart package is unpacked next to the binaries (SHA-256 from the release)
+      CUDART_TAG: b11540
+      CUDART_SHA256: 8f44b435a6739de562b3b709cf2de09cba909adc1f32e3def526aa788b4ef62f
+    steps:
+      - name: Check out the helper scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SRC_REF }}
+          sparse-checkout: .github/fle-binaries
+
+      - name: Download the package
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.linux.outputs.file }}
+          path: dl
+          skip-decompress: true
+
+      - name: Unpack the package and the upstream cudart package
+        run: |
+          ls -l dl
+          mkdir pkg
+          tar -xzf "dl/${{ needs.linux.outputs.file }}" -C pkg --strip-components=1
+          CUDART_FILE="cudart-llama-$CUDART_TAG-bin-ubuntu-cuda-12.8-x64.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 -o "$CUDART_FILE" "https://github.com/ggml-org/llama.cpp/releases/download/$CUDART_TAG/$CUDART_FILE"
+          echo "$CUDART_SHA256  $CUDART_FILE" | sha256sum -c -
+          mkdir cudart
+          tar -xzf "$CUDART_FILE" -C cudart --strip-components=1
+          ls -l cudart
+          cp -a cudart/. pkg/
+          echo "CUDA libraries known to this machine (expected: none):"
+          ldconfig -p | grep -i -E 'libcuda|libcudart|libcublas' || echo "  none"
+
+      - name: Static checks with the dynamic loader
+        run: |
+          python3 .github/fle-binaries/check_elf.py \
+            --dir pkg \
+            --cuda-major 12 \
+            --max-glibc 2.35 \
+            --ldd \
+            --cudart-present
+
+      - name: Smoke test (CPU only)
+        run: |
+          python3 .github/fle-binaries/smoke_test.py \
+            --bin-dir pkg \
+            --work-dir smoke \
+            --expect-commit "$(python3 -c 'import json; print(json.load(open("pkg/fle-build-info.json"))["commit"])')" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+  verify-windows:
+    name: verify win-cuda-13.4-x64 (plain runner + upstream cudart)
+    needs: [windows]
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # upstream llama.cpp release whose cudart package is unpacked next to the binaries (SHA-256 from the release)
+      CUDART_TAG: b11540
+      CUDART_FILE: cudart-llama-bin-win-cuda-13.4-x64.zip
+      CUDART_SHA256: 738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668
+    steps:
+      - name: Check out the helper scripts
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.SRC_REF }}
+          sparse-checkout: .github/fle-binaries
+
+      - name: Download the package
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.windows.outputs.file }}
+          path: dl
+          skip-decompress: true
+
+      - name: Unpack the package and the upstream cudart package
+        run: |
+          Get-ChildItem dl | Format-Table Name, Length
+          7z x -y -opkg "dl\${{ needs.windows.outputs.file }}" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'cannot unpack the package' }
+          curl.exe --fail --silent --show-error --location --retry 5 --retry-delay 5 --retry-all-errors -o $env:CUDART_FILE "https://github.com/ggml-org/llama.cpp/releases/download/$env:CUDART_TAG/$env:CUDART_FILE"
+          if ($LASTEXITCODE -ne 0) { throw 'cannot download the cudart package' }
+          $hash = (Get-FileHash -Path $env:CUDART_FILE -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:CUDART_SHA256) { throw "cudart SHA-256 mismatch: $hash" }
+          7z l $env:CUDART_FILE
+          7z x -y -opkg $env:CUDART_FILE | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'cannot unpack the cudart package' }
+          Write-Host 'CUDA on this machine (expected: nothing):'
+          Get-Command nvcc, nvidia-smi -ErrorAction SilentlyContinue | Format-Table Name, Source
+          Test-Path "$env:SystemRoot\System32\nvcuda.dll"
+
+      - name: Static checks (imports of every exe and dll, with the cudart DLLs next to them)
+        run: |
+          python -m pip install --disable-pip-version-check pefile==2024.8.26
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install pefile' }
+          python .github\fle-binaries\check_pe.py --dir pkg --cuda-major 13 --cudart-present
+
+      - name: Smoke test (CPU only)
+        run: |
+          $commit = (Get-Content pkg\fle-build-info.json -Raw | ConvertFrom-Json).commit
+          python .github\fle-binaries\smoke_test.py `
+            --bin-dir pkg `
+            --work-dir smoke `
+            --expect-commit $commit `
+            --summary $env:GITHUB_STEP_SUMMARY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
