@@ -4,16 +4,21 @@
 
 **An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU.**
 
-A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that keeps the hot experts of a large MoE model in a GPU
+A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork for running large MoE GGUF models locally (local LLM
+inference) that keeps the hot experts of a large MoE model in a GPU
 cache, computes the rest on the CPU, and drafts with the model's own multi-token-prediction head.
 
 [Technical report](https://sirfyyn.github.io/FastLocalExperts/) ·
 [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf) ·
 [Model files](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF) ·
 [Quick start](#quick-start) ·
-[Films](#making-rhea-fast-eight-short-films)
+[Films](#making-rhea-fast-eight-short-films) ·
+[Website](https://sirfyyn.de/en/fle/) ·
+[FLE Studio](https://github.com/sirfyyn/fle-studio) ·
+[YouTube](https://www.youtube.com/@sirfyyn)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23272400.svg)](https://doi.org/10.5281/zenodo.23272400)
+[![Release](https://img.shields.io/github/v/release/sirfyyn/FastLocalExperts)](https://github.com/sirfyyn/FastLocalExperts/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model files on Hugging Face](https://img.shields.io/badge/model%20files-Hugging%20Face-yellow)](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF)
 
