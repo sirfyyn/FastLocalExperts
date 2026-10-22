@@ -205,6 +205,8 @@ hybrids are splices of public quantizations by [Unsloth](https://unsloth.ai) and
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab): whole expert layers, chosen layer by layer by measured sensitivity,
 copied byte for byte.
 
+A dense 27B model that runs on this engine: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF), IQ4_XS, 15.3 GB, with a DFlash2 draft head. Details and measurements: https://sirfyyn.de/en/katy/
+
 | File | Size | KLD vs BF16 (texts E / W / K) | Decode vs FLE-IQ3_M on FLE | In one line |
 |---|---|---|---|---|
 | **FLE-IQ3_M** | 88.87&nbsp;GB | 0.051 / 0.050 / 0.129 | reference | within the noise of Unsloth UD-IQ4_XS (93.7 GB: 0.049 / 0.046 / 0.122) |
