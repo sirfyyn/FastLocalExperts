@@ -565,6 +565,15 @@ struct llama_layer {
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
 
+    // glm5-next k-pool indexer
+    struct ggml_tensor * indexer_kpool_gate = nullptr;
+    struct ggml_tensor * indexer_kpool_ape  = nullptr;
+
+    // deepseek41
+    struct ggml_tensor * engram_kv   = nullptr;
+    struct ggml_tensor * engram_gate = nullptr; // q_weight*k_weight folded
+
+
     // MSA, and also the DSA indexer fields:
     // upstream carries the same four names.
     struct ggml_tensor * index_q_proj = nullptr;

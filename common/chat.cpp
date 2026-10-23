@@ -458,6 +458,41 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
             if (message.contains("tool_call_id")) {
                 msg.tool_call_id = message.at("tool_call_id");
             }
+            {
+                json extra = json::object();
+                for (const auto & [k, v] : message.items()) {
+                    if (k != "role" && k != "content" && k != "tool_calls" && k != "reasoning_content" &&
+                        k != "name" && k != "tool_call_id") {
+                        extra[k] = v;
+                    }
+                }
+                if (has_tool_calls) {
+                    // per tool call: keys besides type/function/id, and function keys besides name/arguments
+                    json tc_extra = json::array();
+                    bool any      = false;
+                    for (const auto & tool_call : message.at("tool_calls")) {
+                        json e = json::object();
+                        for (const auto & [k, v] : tool_call.items()) {
+                            if (k != "type" && k != "function" && k != "id") {
+                                e[k] = v;
+                            }
+                        }
+                        for (const auto & [k, v] : tool_call.at("function").items()) {
+                            if (k != "name" && k != "arguments") {
+                                e["function"][k] = v;
+                            }
+                        }
+                        any = any || !e.empty();
+                        tc_extra.push_back(e);
+                    }
+                    if (any) {
+                        extra["__tool_call_extras"] = tc_extra;
+                    }
+                }
+                if (!extra.empty()) {
+                    msg.extra_json = extra.dump();
+                }
+            }
 
             msgs.push_back(msg);
         }
@@ -544,6 +579,51 @@ static json render_message_to_json(const std::vector<common_chat_msg> & msgs, co
         messages.push_back(msg.to_json_oaicompat(/* concat_typed_text= */ false));
     }
     return messages_inp_normalizer(c).normalize(messages);
+}
+
+// DeepSeek V4.1 reads non-OpenAI message keys and joins content blocks with "\n\n" around images,
+// so keep media markers as separate text parts and restore the extra keys
+static json render_message_to_json_deepseek_v4_1(const std::vector<common_chat_msg> & msgs, const jinja::caps & c) {
+    json messages = json::array();
+    for (const auto & msg : msgs) {
+        json jmsg;
+        if (msg.contains_media()) {
+            common_chat_msg typed = msg;
+            for (auto & part : typed.content_parts) {
+                part.type = "text";
+            }
+            jmsg = typed.to_json_oaicompat(/* concat_typed_text= */ false);
+        } else {
+            jmsg = msg.to_json_oaicompat(/* concat_typed_text= */ false);
+        }
+        if (!msg.extra_json.empty()) {
+            const json extra = json::parse(msg.extra_json);
+            for (const auto & [k, v] : extra.items()) {
+                if (k == "__tool_call_extras") {
+                    if (!jmsg.contains("tool_calls")) {
+                        continue;
+                    }
+                    auto & tcs = jmsg.at("tool_calls");
+                    for (size_t i = 0; i < tcs.size() && i < v.size(); i++) {
+                        for (const auto & [tk, tv] : v[i].items()) {
+                            if (tk == "function") {
+                                for (const auto & [fk, fv] : tv.items()) {
+                                    tcs[i]["function"][fk] = fv;
+                                }
+                            } else {
+                                tcs[i][tk] = tv;
+                            }
+                        }
+                    }
+                } else if (!jmsg.contains(k)) {
+                    jmsg[k] = v;
+                }
+            }
+        }
+        messages.push_back(std::move(jmsg));
+    }
+    // V4.1 templates join typed content parts with "\n\n"; do not collapse them to a string
+    return messages;
 }
 
 // DEPRECATED: only used in tests
@@ -2166,13 +2246,30 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     // non-thinking generation prompt ends with a bare </think> instead of an empty
     // <think></think> pair.
     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+    // V4.1: DSML tag names carry a leading space, e.g. <｜DSML｜ calls>
+    const bool is_v41 = is_v4 && tmpl.source().find("｜DSML｜ calls>") != std::string::npos;
 
     std::optional<json> adjusted_messages;
     if (is_v4) {
         adjusted_messages = deepseek_v4_sort_tool_results(inputs.messages);
     }
 
-    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    // V4.1 can declare tools on a system message instead of top-level "tools": parse calls to those too.
+    json tools = inputs.tools;
+    if (is_v41 && !(tools.is_array() && !tools.empty()) && inputs.messages.is_array()) {
+        for (const auto & msg : inputs.messages) {
+            if (msg.value("role", "") == "system" && msg.contains("tools") && msg.at("tools").is_array()) {
+                if (!tools.is_array()) {
+                    tools = json::array();
+                }
+                for (const auto & tool : msg.at("tools")) {
+                    tools.push_back(tool);
+                }
+            }
+        }
+    }
+
+    auto has_tools           = tools.is_array() && !tools.empty();
     auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
@@ -2181,17 +2278,39 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     if (is_v4 && has_response_format) {
         additional_context = json{ { "response_format", inputs.json_schema } };
     }
+    // V4.1 raises on anything but low/high/max or 1-100: map minimal -> low, xhigh -> max, medium -> default
+    if (is_v41 && inputs.extra_context.is_object() && inputs.extra_context.contains("reasoning_effort") &&
+        inputs.extra_context.at("reasoning_effort").is_string()) {
+        const std::string effort = inputs.extra_context.at("reasoning_effort").get<std::string>();
+        json mapped;
+        if (effort == "minimal") {
+            mapped = "low";
+        } else if (effort == "xhigh") {
+            mapped = "max";
+        } else if (effort == "medium") {
+            mapped = nullptr;
+        }
+        if (effort == "minimal" || effort == "xhigh" || effort == "medium") {
+            LOG_DBG("%s: DeepSeek V4.1 reasoning_effort '%s' -> %s\n", __func__, effort.c_str(),
+                    mapped.is_null() ? "unset (template default)" : mapped.get<std::string>().c_str());
+            if (!additional_context.has_value()) {
+                additional_context = json::object();
+            }
+            (*additional_context)["reasoning_effort"] = mapped;
+        }
+    }
 
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string TAG_SP       = is_v41 ? " " : "";
+    const std::string TC_BLOCK     = is_v41 ? "calls" : is_v4 ? "tool_calls" : "function_calls";
+    const std::string FC_START     = "<" + DSML + TAG_SP + TC_BLOCK + ">";
+    const std::string FC_END       = "</" + DSML + TAG_SP + TC_BLOCK + ">";
+    const std::string INVOKE_START = "<" + DSML + TAG_SP + "invoke";
+    const std::string INVOKE_END   = "</" + DSML + TAG_SP + "invoke>";
+    const std::string PARAM_START  = "<" + DSML + TAG_SP + "parameter";
+    const std::string PARAM_END    = "</" + DSML + TAG_SP + "parameter>";
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
 
@@ -2207,6 +2326,12 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         DSML,
         THINK_START,
         THINK_END,
+    };
+
+    // lets the server find user turns in the prompt and place context checkpoints there
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT },
+        { COMMON_CHAT_ROLE_USER, "<｜User｜>" },
     };
 
     if (inputs.has_continuation()) {
@@ -2237,7 +2362,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         // build tool call section first since we might need it in reasoning
         auto tool_choice = p.choice();
         if (has_tool_calls) {
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 std::string  name     = function.at("name");
                 auto         params   = function.contains("parameters") ? function.at("parameters") : json::object();
@@ -2357,7 +2482,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     if (include_grammar) {
         data.grammar_lazy = has_tools && !require_tools;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
                 builder.resolve_refs(schema);
@@ -3566,11 +3691,13 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
     // The template source contains the token as a variable assignment, not as a literal in markup.
     // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".
-    if (src.find("dsml_token") != std::string::npos &&
-        src.find("DSML") != std::string::npos &&
-        (src.find("function_calls") != std::string::npos ||
-         src.find("tool_calls") != std::string::npos)) {
-        LOG_DBG("Using specialized template: DeepSeek V3.2/V4\n");
+    // V4.1 tag names have a leading space and its template does not name the dsml_token variable.
+    if ((src.find("dsml_token") != std::string::npos &&
+         src.find("DSML") != std::string::npos &&
+         (src.find("function_calls") != std::string::npos ||
+          src.find("tool_calls") != std::string::npos)) ||
+        src.find("｜DSML｜ calls>") != std::string::npos) {
+        LOG_DBG("Using specialized template: DeepSeek V3.2/V4/V4.1\n");
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
     }
 
@@ -3621,7 +3748,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::trim_all_content(trimmed_messages);
         messages_to_render = &trimmed_messages;
     }
-    params.messages              = render_message_to_json(*messages_to_render, tmpl.original_caps());
+    params.messages              = src.find("｜DSML｜ calls>") != std::string::npos ?
+                                       render_message_to_json_deepseek_v4_1(*messages_to_render, tmpl.original_caps()) :
+                                       render_message_to_json(*messages_to_render, tmpl.original_caps());
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
     params.enable_thinking       = inputs.enable_thinking;
