@@ -417,6 +417,9 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
+    // Project Maya's engram keys are read by their literal arch-prefixed names.
+    template bool llama_model_loader::get_arr<uint32_t>(const std::string & key, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<uint64_t>(const std::string & key, std::vector<uint64_t> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {

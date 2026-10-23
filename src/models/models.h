@@ -1364,7 +1364,12 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     std::vector<int32_t>  engram_token_map;
     std::vector<uint64_t> engram_mult;
     std::vector<uint64_t> engram_primes;
-    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in per_layer_token_embd
+    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head), local for split tables
+    std::vector<uint64_t> engram_num_embeddings;
+
+    // Project Maya packs one lazy table per Engram layer (blk.N.engram_embd) instead of llama.cpp's
+    // single per_layer_token_embd. Both layouts are supported; this vector is empty for the single table.
+    std::vector<struct ggml_tensor *> per_layer_tok_embd_layers;
 
     int engram_index(int il) const;
     uint32_t engram_n_cols() const { return (engram_max_ngram - 1)*engram_n_head; }

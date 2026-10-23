@@ -83,17 +83,35 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    // Project Maya's GGUF uses deepseek41.engram.* while the llama.cpp converter writes the PLE keys.
+    // Read either spelling so both containers use the same graph.
+    const std::string arch = ml.get_arch_name();
+    auto get_arr_any = [&](llm_kv kid, const char * alt, auto & out) {
+        if (!ml.get_arr(kid, out, false)) {
+            ml.get_arr(arch + "." + alt, out, true);
+        }
+    };
+    auto get_key_any = [&](llm_kv kid, const char * alt, auto & out) {
+        if (!ml.get_key(kid, out, false)) {
+            ml.get_key(arch + "." + alt, out, true);
+        }
+    };
+
     std::vector<uint32_t> e_layers;
-    ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false);
+    get_arr_any(LLM_KV_PLE_LAYERS, "engram.layers", e_layers);
+    if (e_layers.empty()) {
+        ml.get_arr(arch + ".engram.layer_ids", e_layers, false);
+    }
     if (!e_layers.empty()) {
-        ml.get_key(LLM_KV_PLE_NGRAM_SIZE,             engram_max_ngram);
-        ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM,        engram_n_head);
-        ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, engram_head_dim);
-        ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS,      engram_mult);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,           engram_offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,       engram_primes);
-        ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID,        engram_pad_id);
-        ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP,           engram_token_map);
+        get_key_any(LLM_KV_PLE_NGRAM_SIZE,             "engram.max_ngram_size", engram_max_ngram);
+        get_key_any(LLM_KV_PLE_HEADS_PER_NGRAM,        "engram.head_count",     engram_n_head);
+        get_key_any(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, "engram.head_dim",       engram_head_dim);
+        get_arr_any(LLM_KV_PLE_LAYER_MULTIPLIERS,      "engram.multipliers",    engram_mult);
+        get_arr_any(LLM_KV_PLE_HEAD_OFFSETS,           "engram.offsets",        engram_offsets);
+        get_arr_any(LLM_KV_PLE_HEAD_VOCAB_SIZES,       "engram.primes",         engram_primes);
+        ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID,         engram_pad_id);
+        ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP,            engram_token_map);
+        ml.get_arr(arch + ".engram.num_embeddings",    engram_num_embeddings, false);
 
         const size_t n_e    = e_layers.size();
         const size_t n_cols = engram_n_cols();
@@ -138,21 +156,74 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    // all Engram tables in one lazily read tensor, like the qwen4exp n-gram table
+    // Engram tables: llama.cpp's converter writes one lazily read per_layer_token_embd; Project Maya's
+    // GGUFs write one blk.N.engram_embd per Engram layer. Keep both paths lazy, on the host.
     if (!engram_layers.empty()) {
-        int64_t n_rows = 0;
-        for (size_t c = 0; c < engram_offsets.size(); ++c) {
-            n_rows = std::max(n_rows, (int64_t) (engram_offsets[c] + engram_primes[c]));
-        }
-        const std::string name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * w = ml.get_weight(name.c_str())) {
-            if (w->tensor->ne[1] < n_rows) {
-                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the Engram heads (%" PRId64 ")",
-                                                name.c_str(), w->tensor->ne[1], n_rows));
+        const std::string single_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        if (ml.get_weight(single_name.c_str())) {
+            int64_t n_rows = 0;
+            for (size_t c = 0; c < engram_offsets.size(); ++c) {
+                n_rows = std::max(n_rows, (int64_t) (engram_offsets[c] + engram_primes[c]));
             }
-            n_rows = w->tensor->ne[1];
+            if (const auto * w = ml.get_weight(single_name.c_str())) {
+                if (w->tensor->ne[1] < n_rows) {
+                    throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the Engram heads (%" PRId64 ")",
+                                                    single_name.c_str(), w->tensor->ne[1], n_rows));
+                }
+                n_rows = w->tensor->ne[1];
+            }
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                    {(int64_t) engram_head_dim, n_rows}, TENSOR_READ_LAZY);
+        } else {
+            const size_t n_e    = engram_layers.size();
+            const size_t n_cols = engram_n_cols();
+            const bool   have_counts = engram_num_embeddings.size() == n_e;
+
+            // Maya's offsets are per layer (start at zero). Accept a file that stores them absolute too.
+            bool absolute = false;
+            if (have_counts) {
+                uint64_t base = 0;
+                for (size_t e = 0; e < n_e; ++e) {
+                    uint64_t max_row = 0;
+                    for (size_t c = 0; c < n_cols; ++c) {
+                        max_row = std::max(max_row, engram_offsets[e*n_cols + c] + engram_primes[e*n_cols + c]);
+                    }
+                    if (max_row == base + engram_num_embeddings[e]) {
+                        absolute = e > 0 ? true : absolute;
+                    } else if (max_row != engram_num_embeddings[e]) {
+                        throw std::runtime_error(format("DeepSeek-V4.1 engram layer %zu: %" PRIu64
+                                " rows do not match %" PRIu64 " embeddings", e, max_row, engram_num_embeddings[e]));
+                    }
+                    base += engram_num_embeddings[e];
+                }
+            }
+
+            uint64_t base = 0;
+            per_layer_tok_embd_layers.reserve(n_e);
+            for (size_t e = 0; e < n_e; ++e) {
+                uint64_t n_rows = 0;
+                for (size_t c = 0; c < n_cols; ++c) {
+                    uint64_t & off = engram_offsets[e*n_cols + c];
+                    if (absolute) {
+                        off -= base;
+                    }
+                    n_rows = std::max(n_rows, off + engram_primes[e*n_cols + c]);
+                }
+                if (have_counts && n_rows != engram_num_embeddings[e]) {
+                    throw std::runtime_error(format("DeepSeek-V4.1 engram layer %zu: %" PRIu64
+                            " local rows, %" PRIu64 " embeddings", e, n_rows, engram_num_embeddings[e]));
+                }
+
+                const int32_t il = engram_layers[e];
+                ggml_tensor * table = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", il),
+                        {(int64_t) engram_head_dim, (int64_t) n_rows}, TENSOR_READ_LAZY);
+                per_layer_tok_embd_layers.push_back(table);
+                if (ml.lazy.has(table)) {
+                    can_prefetch.insert(table);
+                }
+                base += n_rows;
+            }
         }
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {(int64_t) engram_head_dim, n_rows}, TENSOR_READ_LAZY);
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -299,7 +370,14 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
             model.engram_hash((int) e, *ubatch, prev, ids[e]);
             all.insert(all.end(), ids[e].begin(), ids[e].end());
         }
-        if (model.can_prefetch.count(model.per_layer_tok_embd)) {
+        if (!model.per_layer_tok_embd_layers.empty()) {
+            for (size_t e = 0; e < engram_ids.size(); ++e) {
+                const ggml_tensor * table = model.per_layer_tok_embd_layers[e];
+                if (table && model.can_prefetch.count(table)) {
+                    llama_prefetch_rows(table, ids[e].data(), ids[e].size());
+                }
+            }
+        } else if (model.can_prefetch.count(model.per_layer_tok_embd)) {
             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
         }
         for (size_t e = 0; e < engram_ids.size(); ++e) {
@@ -369,7 +447,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
 
     ggml_tensor * rows = ids;
     if (ids->type != GGML_TYPE_F32) {
-        rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
+        ggml_tensor * table = model.per_layer_tok_embd;
+        if (!model.per_layer_tok_embd_layers.empty()) {
+            const int e = model.engram_index(il);
+            GGML_ASSERT(e >= 0 && (size_t) e < model.per_layer_tok_embd_layers.size());
+            table = model.per_layer_tok_embd_layers[e];
+        }
+        GGML_ASSERT(table != nullptr);
+        rows = ggml_get_rows(ctx0, table, ids);
         rows = ggml_reshape_2d(ctx0, rows, model.engram_head_dim*model.engram_n_cols(), nt);
     }
     GGML_ASSERT(rows->ne[0] == (int64_t) (model.engram_head_dim*model.engram_n_cols()) && rows->ne[1] == nt);
