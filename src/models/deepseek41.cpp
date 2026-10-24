@@ -1009,4 +1009,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cur = ggml_mul_mat(ctx0, model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+
+    // The V4.1 graph sets t_logits itself instead of relying on the V4 base graph. Expand it
+    // explicitly so the scheduler allocates every input used by the output path (notably
+    // inp_out_ids). Without this, set_inputs() sees an unallocated out_ids tensor.
+    ggml_build_forward_expand(gf, cur);
 }

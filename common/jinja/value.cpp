@@ -367,6 +367,41 @@ const func_builtins & global_builtins() {
             }
             return out;
         }},
+        {"dict", [](const func_args & args) -> value {
+            // Python-style dict(): dict(mapping, **kwargs), dict(iterable_of_pairs, **kwargs),
+            // or dict(**kwargs). The DeepSeek-V4.1 template uses dict(obj, key=value) to
+            // copy a message object while replacing/adding fields.
+            auto out = mk_val<value_object>();
+            for (const auto & arg : args.get_args()) {
+                if (is_val<value_kwarg>(arg)) {
+                    continue;
+                }
+                if (arg->is_none()) {
+                    continue;
+                }
+                if (is_val<value_object>(arg)) {
+                    for (const auto & pair : arg->as_ordered_object()) {
+                        out->insert(pair.first, pair.second);
+                    }
+                } else if (is_val<value_array>(arg)) {
+                    for (const auto & item : arg->as_array()) {
+                        if (!is_val<value_array>(item) || item->as_array().size() != 2) {
+                            throw raised_exception("dict() positional argument must be a mapping or an iterable of key/value pairs");
+                        }
+                        out->insert(item->as_array()[0], item->as_array()[1]);
+                    }
+                } else {
+                    throw raised_exception("dict() positional argument must be a mapping or an iterable of key/value pairs");
+                }
+            }
+            for (const auto & arg : args.get_args()) {
+                if (is_val<value_kwarg>(arg)) {
+                    auto kwarg = cast_val<value_kwarg>(arg);
+                    out->insert(kwarg->key, kwarg->val);
+                }
+            }
+            return out;
+        }},
         {"strftime_now", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string format = args.get_pos(0)->as_string().str();

@@ -319,7 +319,9 @@ namespace GGUFMeta {
 
         bool type_ok = false;
         switch (arr_info.gt) {
-            case GGUF_TYPE_UINT32:
+            case GGUF_TYPE_UINT32:  type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value) ||
+                                              (std::is_same<T,    uint64_t>::value); break;
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
                                               (std::is_same<T,    uint32_t>::value); break;
             case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
@@ -339,6 +341,16 @@ namespace GGUFMeta {
             for (size_t i = 0; i < n_items; i++) {
                 const T value = gguf_get_arr_str(ctx, kid, i);
                 result.emplace_back(value);
+            }
+        } else if constexpr (std::is_same<T, uint64_t>::value) {
+            result.resize(arr_info.length);
+            if (arr_info.gt == GGUF_TYPE_UINT32) {
+                const uint32_t * src = (const uint32_t *) arr_info.data;
+                for (size_t i = 0; i < arr_info.length; i++) {
+                    result[i] = src[i];
+                }
+            } else {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
             }
         } else {
             result.resize(arr_info.length);
