@@ -110,6 +110,14 @@ def test_no_gpu_memory_left_warns(moe_model, machine):
     assert any("No GPU memory is left" in w for w in p.warnings)
 
 
+def test_dense_model_without_gpu_memory_does_not_talk_about_experts(make_model, machine):
+    """A dense model has no experts: no 'experts will run on the CPU' warning, only the note that the cache stays empty."""
+    machine.set_gpu_free(1 * GiB)
+    p = build(make_model(experts=0, layers=2, sidecars=False), machine, "auto")
+    assert not any("expert" in w.lower() for w in p.warnings)
+    assert any("Dense model" in n for n in p.notes)
+
+
 def test_pinned_load_setting(moe_model, machine):
     on = build(moe_model, machine, "auto", settings={"pinned_load": "on"})
     off = build(moe_model, machine, "auto", settings={"pinned_load": "off"})
