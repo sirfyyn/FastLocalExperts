@@ -201,7 +201,7 @@ def _cache_budget(
         cache = min(2048, auto_mib)
     else:
         cache = auto_mib
-    if profile != "off" and base_mib <= 0 and requested <= 0:
+    if profile != "off" and model.experts and base_mib <= 0 and requested <= 0:
         warnings.append("No GPU memory is left for the expert cache; experts will run on the CPU.")
     if profile not in ("off", "nvme") and cache > 0:
         notes.append(
