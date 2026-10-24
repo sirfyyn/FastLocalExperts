@@ -4,16 +4,21 @@
 
 **An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU.**
 
-A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork that keeps the hot experts of a large MoE model in a GPU
+A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork for running large MoE GGUF models locally (local LLM
+inference) that keeps the hot experts of a large MoE model in a GPU
 cache, computes the rest on the CPU, and drafts with the model's own multi-token-prediction head.
 
 [Technical report](https://sirfyyn.github.io/FastLocalExperts/) ·
 [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf) ·
 [Model files](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF) ·
 [Quick start](#quick-start) ·
-[Films](#making-rhea-fast-eight-short-films)
+[Films](#making-rhea-fast-eight-short-films) ·
+[Website](https://sirfyyn.de/en/fle/) ·
+[FLE Studio](https://github.com/sirfyyn/fle-studio) ·
+[YouTube](https://www.youtube.com/@sirfyyn)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23272400.svg)](https://doi.org/10.5281/zenodo.23272400)
+[![Release](https://img.shields.io/github/v/release/sirfyyn/FastLocalExperts)](https://github.com/sirfyyn/FastLocalExperts/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Model files on Hugging Face](https://img.shields.io/badge/model%20files-Hugging%20Face-yellow)](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF)
 
@@ -173,7 +178,23 @@ The FLE model files are standard GGUF and also load in upstream llama.cpp, for e
 `llama-server -m <file> -cmoe -ngl 99 -c 32768 --jinja`, without the MTP head. With the same file, FLE decoded 2.49
 times as fast as upstream in bracket B1e.
 
-<!-- studio-media: screenshots and video go here -->
+### FLE Studio: the same engine in a browser window
+
+[FLE Studio](https://github.com/sirfyyn/fle-studio) is a local app for macOS, Linux and Windows that runs FLE or plain
+llama.cpp for you: a chat with the live numbers beside it (decode and prefill speed, MTP drafts accepted, expert-cache
+hits, GPU use), a model loader for the files below that checks each download against its SHA-256, launch profiles that
+show the full command before it runs, and a short repeatable speed test. It can download the portable FLE builds from
+this repository's releases, or attach to a llama-server that already runs, also as a systemd service.
+
+<a href="https://github.com/sirfyyn/fle-studio/blob/main/docs/media/fle-studio.mp4"><img alt="FLE Studio running Rhea (FLE-IQ3_M with its MTP head): a question, the answer streaming, the live data. Click for the full video." src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/fle-studio.gif"></a>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-dark.png">
+  <img alt="The engine view of FLE Studio attached to a systemd service running FLE" src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-light.png">
+</picture>
+
+Recorded on the reference machine against the running service. The speeds in the recording are single answers right
+after a restart, not measurements; the measured numbers are in [Results](#results).
 
 ## Model files
 
@@ -183,6 +204,8 @@ the pruned file has its own repo,
 hybrids are splices of public quantizations by [Unsloth](https://unsloth.ai) and
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab): whole expert layers, chosen layer by layer by measured sensitivity,
 copied byte for byte.
+
+A dense 27B model that runs on this engine: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF), IQ4_XS, 15.3 GB, with a DFlash2 draft head. Details and measurements: https://sirfyyn.de/en/katy/
 
 | File | Size | KLD vs BF16 (texts E / W / K) | Decode vs FLE-IQ3_M on FLE | In one line |
 |---|---|---|---|---|

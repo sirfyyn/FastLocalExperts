@@ -5,8 +5,8 @@ type: software
 authors:
   - family-names: Bitzer
     given-names: Max
-version: 1.0.1
-date-released: 2026-10-10
+version: 1.1.0
+date-released: 2026-10-11
 doi: 10.5281/zenodo.23272400
 identifiers:
   - type: doi
@@ -15,6 +15,9 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.23272401
     description: "Zenodo, version 1.0.1"
+  - type: doi
+    value: 10.5281/zenodo.23288917
+    description: "Zenodo, version 1.1.0"
 license: MIT
 repository-code: "https://github.com/sirfyyn/FastLocalExperts"
 url: "https://sirfyyn.github.io/FastLocalExperts/"
@@ -25,6 +28,9 @@ keywords:
   - quantization
   - expert offloading
   - speculative decoding
+  - local LLM
+  - MTP
+  - Qwen3.8
 preferred-citation:
   type: report
   title: "FLE: Fast Local Experts — an 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU"
@@ -35,4 +41,4 @@ preferred-citation:
   month: 10
   doi: 10.5281/zenodo.23272400
   url: "https://sirfyyn.github.io/FastLocalExperts/"
-  notes: "Version 1.0.2. Engine: https://github.com/sirfyyn/FastLocalExperts (tag v1.0.1). Model files: https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF and https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF"
+  notes: "Version 1.0.2. Engine: https://github.com/sirfyyn/FastLocalExperts (the report version 1.0.2 belongs to tag v1.0.1; current engine release v1.1.0). Website: https://sirfyyn.de/en/fle/. Model files: https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF and https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF"
