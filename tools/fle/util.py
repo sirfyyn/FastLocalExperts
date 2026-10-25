@@ -135,11 +135,55 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-def is_tty() -> bool:
+def is_tty(stream: Any = None) -> bool:
+    """True when `stream` (default stdout) is a terminal."""
     try:
-        return sys.stdout.isatty()
+        return bool((stream if stream is not None else sys.stdout).isatty())
     except Exception:
         return False
+
+
+# ---- colour ---------------------------------------------------------------------------------------------------
+# Only the human-readable text is coloured, only on a terminal, and never in --json output. No package: plain SGR codes.
+
+COLOR_MODES = ("auto", "always", "never")
+_STYLES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+_color_mode = "auto"
+
+
+def set_color_mode(mode: str | None) -> None:
+    """Set once per run from --color (auto, always, never)."""
+    global _color_mode
+    _color_mode = mode if mode in COLOR_MODES else "auto"
+
+
+def use_color(stream: Any = None) -> bool:
+    """auto: a terminal that wants colour (not NO_COLOR, not TERM=dumb). always/never override the environment."""
+    if _color_mode == "always":
+        return True
+    if _color_mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return is_tty(stream if stream is not None else sys.stdout)
+
+
+def paint(text: str, *styles: str, stream: Any = None) -> str:
+    """`text` wrapped in colour codes when colour is wanted on `stream` (default stdout), else unchanged."""
+    codes = [_STYLES[s] for s in styles if s in _STYLES]
+    if not codes or not text or not use_color(stream):
+        return text
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
+
+
+STATUS_STYLE = {"ok": "green", "warn": "yellow", "fail": "red"}
+
+
+def paint_status(text: str, status: str, stream: Any = None) -> str:
+    style = STATUS_STYLE.get(status)
+    return paint(text, style, stream=stream) if style else text
 
 
 def format_table(rows: list[tuple[str, str]], indent: int = 0) -> str:

@@ -243,7 +243,9 @@ def detect_engine(path: str) -> dict[str, Any]:
     }
 
 
-def check_engine_flags(engine: dict[str, Any], profile: str) -> list[str]:
+def check_engine_flags(engine: dict[str, Any], profile: str, moe: bool | None = None) -> list[str]:
+    """Problems with the engine for this profile. `moe` is whether the model has experts: a dense model never uses
+    -cmoe, so a missing one is only a problem for a MoE model (or when the model is not known yet: None)."""
     if not engine.get("ok"):
         return [f"The engine does not start: {engine.get('problem') or 'unknown error'}."]
     out: list[str] = []
@@ -252,7 +254,7 @@ def check_engine_flags(engine: dict[str, Any], profile: str) -> list[str]:
             out.append("This is not an FLE engine; the FLE cache and profile settings will be ignored or rejected.")
         if not engine.get("has_fit_target"):
             out.append("This engine has no --fit-target; use a newer FLE build.")
-        if not engine.get("has_cmoe"):
+        if not engine.get("has_cmoe") and moe is not False:
             out.append("This engine has no -cmoe; experts would not stay on the CPU.")
     return out
 
