@@ -36,7 +36,17 @@ def human_bytes(n: float | int | None) -> str:
 def human_int(n: int | float | None) -> str:
     if n is None:
         return "?"
-    return f"{int(n):,}".replace(",", ".")
+    return f"{int(n):,}"  # English convention: 32,768
+
+
+def prepare_run_env(env: dict[str, str]) -> None:
+    """Create what a plan's environment points at. Plans only compute; this runs just before a server starts."""
+    target = env.get("FLE_MOE_PROFILE")
+    if target:
+        try:
+            Path(target).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass  # the engine reports an unwritable profile path itself
 
 
 def human_duration(seconds: float | None) -> str:

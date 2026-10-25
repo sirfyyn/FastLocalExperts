@@ -125,9 +125,11 @@ config unset KEY` removes an override.
   downloading shows up as incomplete rather than as a corrupt file.
 - If the experts are larger than RAM, use `--profile nvme`; experts stay memory-mapped and the GPU cache stays small.
   Keep the model on fast local NVMe, not on a network mount.
-- `FLE_MOE_PROFILE` is written under `~/.config/fle/profiles/`. The first run records which experts are used; later runs
-  start warm.
-- The helper never edits another running service. Stop the service before `serve` if it already holds
+- `FLE_MOE_PROFILE` is written under `~/.config/fle/profiles/<model>.bin`. The name is the model's stable alias; when the
+  GGUF name is only a quant type like `Bf16`, a short hash of the model path is appended so two models never share a
+  file. The first run records which experts are used; later runs start warm. Dense models (no experts) get no
+  `FLE_MOE_*` settings and no MoE flags.
+- The helper never edits a running service. Stop the service before `serve` if it already holds
   the GPU.
 
 ## Tests and the shared contract
