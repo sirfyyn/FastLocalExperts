@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import bench, config, doctor, gguf, hardware, plan as plan_mod, report, serve as serve_mod, sidecars as sidecars_mod
-from .util import FleError, as_bool, eprint, human_bytes, human_int, print_json
+from .util import FleError, as_bool, eprint, human_bytes, human_int, prepare_run_env, print_json
 
 VERSION = "0.1"
 
@@ -318,6 +318,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         return _serve_supervised(args, settings, plan)
     env = os.environ.copy()
     env.update(plan.env)
+    prepare_run_env(plan.env)
     try:
         os.execvpe(plan.binary, [plan.binary, *plan.args], env)
     except OSError as exc:

@@ -359,3 +359,102 @@ def test_parallel_with_unified_kv_keeps_the_total(make_model, machine):
     assert p.context_per_slot == 40_000
     assert any("share one unified KV cache" in n for n in p.notes)
     assert not any("--kv-unified" in w for w in p.warnings)
+
+
+# ---- expert profile file name ----------------------------------------------------------------------------
+
+
+def test_profile_path_is_distinct_for_generic_names(make_model, machine):
+    a = make_model(experts=8, name="Bf16", folder="modelA", filename="Alpha-Bf16.gguf")
+    b = make_model(experts=8, name="Bf16", folder="modelB", filename="Beta-Bf16.gguf")
+    pa = build(a, machine, "auto").env["FLE_MOE_PROFILE"]
+    pb = build(b, machine, "auto").env["FLE_MOE_PROFILE"]
+    assert pa != pb
+    assert pa.endswith(".bin") and "Alpha-Bf16-" in pa and "Beta-Bf16-" in pb
+    assert "/" not in pa.rsplit("/", 1)[1]
+
+
+def test_profile_path_same_file_same_name_and_same_name_other_folder_differs(make_model, machine):
+    a = make_model(experts=8, name="Bf16", folder="x", filename="same.gguf")
+    b = make_model(experts=8, name="Bf16", folder="y", filename="same.gguf")
+    assert build(a, machine).env["FLE_MOE_PROFILE"] == build(a, machine).env["FLE_MOE_PROFILE"]
+    assert build(a, machine).env["FLE_MOE_PROFILE"] != build(b, machine).env["FLE_MOE_PROFILE"]
+
+
+def test_profile_path_keeps_a_readable_name_for_a_unique_name(make_model, machine):
+    model = make_model(experts=8, name="Real Name/Q8", folder="z")
+    path = build(model, machine).env["FLE_MOE_PROFILE"]
+    assert path.endswith("/Real-Name-Q8.bin")
+
+
+# ---- dense models ----------------------------------------------------------------------------------------
+
+
+def test_dense_model_gets_no_moe_flags_env_or_expert_notes(make_model, machine):
+    model = make_model(experts=0, sidecars=True)
+    p = build(model, machine, "auto", settings={"pinned_load": "on"})
+    for forbidden in ("-cmoe", "-cmoed", "--cpu-moe", "--moe-expert-cache-inserts"):
+        assert forbidden not in p.args
+    assert not any("MOE" in k or k == "FLE_MC_OVERLAP" for k in p.env)
+    assert p.cache_mib == 0
+    assert not any("expert" in n.lower() and "Dense" not in n for n in p.notes)
+    assert any("Model weights are read into pinned host memory" in n for n in p.notes)
+    # what is still useful for a dense model
+    assert flag(p.args, "-ngl") == "99"
+    assert flag(p.args, "-ctk") == "q8_0"
+    assert "-fit" in p.args and "-t" in p.args
+    assert flag(p.args, "--spec-type") == "draft-mtp"
+    assert p.env["FLE_PREFILL_LEAN"] == "1" and "FLE_MTP_VOCAB" in p.env
+
+
+def test_dense_model_ignores_requested_cache(make_model, machine):
+    p = build(make_model(experts=0), machine, "auto", settings={"gpu_cache_mib": 4096})
+    assert p.cache_mib == 0
+    assert any("dense model" in w for w in p.warnings)
+
+
+def test_moe_model_keeps_moe_flags_and_expert_note(moe_model, machine):
+    p = build(moe_model, machine, "auto", settings={"pinned_load": "on"})
+    assert "-cmoe" in p.args and "--moe-expert-cache-inserts" in p.args
+    assert "FLE_MOE_PROFILE" in p.env and "FLE_MOE_CACHE_BUDGET_FIT" in p.env
+    assert any("Experts are read into pinned host memory" in n for n in p.notes)
+
+
+# ---- no side effects -------------------------------------------------------------------------------------
+
+
+def test_plan_build_has_no_side_effects(moe_model, machine, monkeypatch, tmp_path):
+    import os
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("FLE_CONFIG", str(home / ".config" / "fle" / "config.toml"))
+    before_env = dict(os.environ)
+    before_fs = sorted(p.relative_to(home) for p in home.rglob("*"))
+    p = build(moe_model, machine, "auto", gpu_ids="0")
+    assert dict(os.environ) == before_env
+    assert "CUDA_VISIBLE_DEVICES" not in os.environ
+    assert sorted(x.relative_to(home) for x in home.rglob("*")) == before_fs
+    assert p.env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert "CUDA_VISIBLE_DEVICES=0" in p.command()
+
+
+def test_prepare_run_env_creates_the_profile_directory(tmp_path):
+    from fle.util import prepare_run_env
+
+    target = tmp_path / "a" / "profiles" / "m.bin"
+    prepare_run_env({"FLE_MOE_PROFILE": str(target)})
+    assert target.parent.is_dir()
+    prepare_run_env({})
+
+
+def test_human_int_uses_english_commas():
+    from fle.util import human_int
+
+    assert human_int(32768) == "32,768"
+    assert human_int(1234567) == "1,234,567"
+    assert human_int(12) == "12"
+    assert human_int(None) == "?"

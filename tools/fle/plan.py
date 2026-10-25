@@ -5,6 +5,7 @@ The profile names are the same in the fle CLI and in FLE Studio: off, auto, bala
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -160,14 +161,33 @@ def _extra_parallel(args: list[str]) -> int:
     return 0
 
 
+_GENERIC_NAME = re.compile(r"^(bf16|f16|f32|q[0-9].*|iq[0-9].*|mxfp[0-9].*)$", re.I)
+
+
 def _stable_alias(model: gguf.Model, model_path: str) -> str:
     """A model id that stays useful when the GGUF's general.name is just a quant type."""
     name = str(model.name or "").strip()
-    generic = re.match(r"^(bf16|f16|f32|q[0-9].*|iq[0-9].*|mxfp[0-9].*)$", name, re.I)
+    generic = _GENERIC_NAME.match(name)
     if name and not generic:
         return name
     stem = Path(model_path or model.first).stem.strip()
     return stem or "model"
+
+
+def profile_path(model: gguf.Model, model_path: str) -> Path:
+    """Where the engine keeps its expert-usage profile for this model. Pure: nothing is created here.
+
+    The file name comes from the stable alias (the GGUF name, or the file name when that is only a quant type like
+    Bf16), cleaned to a safe file name. A generic name gets a short hash of the model path, so two different models
+    that are both called "Bf16" never share one profile. The hash is of the path, not of the file contents.
+    """
+    alias = _stable_alias(model, model_path)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", alias).strip("-.") or "model"
+    name = str(model.name or "").strip()
+    if not name or _GENERIC_NAME.match(name):
+        resolved = str(Path(model_path or model.first).expanduser().resolve())
+        safe = f"{safe}-{hashlib.sha1(resolved.encode('utf-8')).hexdigest()[:8]}"
+    return _default_profile_dir() / f"{safe}.bin"
 
 
 def _cache_budget(
@@ -201,6 +221,11 @@ def _cache_budget(
         cache = min(2048, auto_mib)
     else:
         cache = auto_mib
+    if not model.experts and cache > 0:
+        # A dense model has no experts to cache; the memory stays free for weights and KV.
+        if requested > 0:
+            warnings.append(f"--cache-mib {human_int(requested)} is ignored: this is a dense model with no experts to cache.")
+        cache = 0
     if profile != "off" and model.experts and base_mib <= 0 and requested <= 0:
         warnings.append("No GPU memory is left for the expert cache; experts will run on the CPU.")
     if profile not in ("off", "nvme") and cache > 0:
@@ -374,15 +399,19 @@ def build(
     effective_spec = "mtp" if use_mtp else ngram or "none"
 
     args = ["-m", model_path or str(model.first), "-c", str(ctx), "--jinja"]
+    moe = bool(model.experts)
     if engine.get("flavor") == "fle":
-        args += ["-ngl", "99", "-cmoe"]
+        # -cmoe keeps the expert tensors on the CPU; a dense model has none, so it only gets full GPU offload.
+        args += ["-ngl", "99"] + (["-cmoe"] if moe else [])
     elif model.is_moe:
         args += ["--cpu-moe"]
     args += ["--host", host, "--port", str(port), "--metrics", "-t", str(threads)]
     if profile != "off":
         args += ["-ctk", "q8_0", "-ctv", "q8_0"]
     if engine.get("flavor") == "fle" and profile != "off":
-        args += ["-fit", "on", "--fit-target", str(fit_target), "--moe-expert-cache-inserts", "1"]
+        args += ["-fit", "on", "--fit-target", str(fit_target)]
+        if moe:
+            args += ["--moe-expert-cache-inserts", "1"]
     if profile == "debug" and engine.get("log_verbosity", True):
         args += ["--log-verbosity", "4"]
     if use_mtp:
@@ -396,46 +425,44 @@ def build(
             "--spec-draft-p-min",
             "0.5",
             "--no-spec-draft-backend-sampling",
-            "-cmoed",
         ]
+        if moe:
+            args += ["-cmoed"]  # draft experts on the CPU too; a dense draft head has no experts
     if ngram:
         args += ["--spec-type", ngram]
         notes.append(f"Self-speculation: {ngram}. It drafts from the prompt/context; acceptance is prompt-dependent.")
     pinned = _pinned(profile, str(settings.get("pinned_load") or "auto"), model, mem)
     if pinned:
         args += ["--load-mode", "none"]
-        notes.append("Experts are read into pinned host memory (--load-mode none); this needs the expert bytes as free RAM.")
+        if moe:
+            notes.append("Experts are read into pinned host memory (--load-mode none); this needs the expert bytes as free RAM.")
+        else:
+            notes.append("Model weights are read into pinned host memory (--load-mode none); this needs the model size as free RAM.")
     if profile == "nvme":
         args += ["--no-warmup"]
-    if gpu_ids:
-        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
 
     env: dict[str, str] = {}
+    if gpu_ids:
+        env["CUDA_VISIBLE_DEVICES"] = gpu_ids
     if engine.get("flavor") == "fle" and profile != "off":
-        profile_dir = _default_profile_dir()
-        try:
-            profile_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", model.name).strip("-") or "model"
-        env.update(
-            {
-                "FLE_MOE_CACHE_BUDGET_FIT": "1",
-                "FLE_MOE_PROFILE": str(profile_dir / f"{safe_name}.bin"),
-                "FLE_MOE_PROFILE_SAVE_SEC": "600",
-                "FLE_PREFILL_LEAN": "1",
-                "FLE_HC_FUSED": "1",
-                "FLE_SLOT_EARLY_SAVE": "1",
-            }
-        )
-        if cache_mib > 0:
-            env["FLE_MOE_CACHE_BUDGET_MIB"] = str(cache_mib)
-            env["FLE_MC_OVERLAP"] = "2"
-        if profile in ("auto", "max", "debug"):
-            env["FLE_MOE_CACHE_BIAS"] = "0.001"
-        if profile in ("balanced", "max"):
-            env["FLE_MOE_ADMIT_FREQ"] = "2000"
-            env["FLE_MOE_EVICT_OLDEST"] = "32"
+        # Launch-path settings that are not about experts: kept for dense models too.
+        env.update({"FLE_PREFILL_LEAN": "1", "FLE_HC_FUSED": "1", "FLE_SLOT_EARLY_SAVE": "1"})
+        if moe:
+            env.update(
+                {
+                    "FLE_MOE_CACHE_BUDGET_FIT": "1",
+                    "FLE_MOE_PROFILE": str(profile_path(model, model_path or str(model.first))),
+                    "FLE_MOE_PROFILE_SAVE_SEC": "600",
+                }
+            )
+            if cache_mib > 0:
+                env["FLE_MOE_CACHE_BUDGET_MIB"] = str(cache_mib)
+                env["FLE_MC_OVERLAP"] = "2"
+            if profile in ("auto", "max", "debug"):
+                env["FLE_MOE_CACHE_BIAS"] = "0.001"
+            if profile in ("balanced", "max"):
+                env["FLE_MOE_ADMIT_FREQ"] = "2000"
+                env["FLE_MOE_EVICT_OLDEST"] = "32"
         if profile == "debug":
             env["FLE_TIME_PROFILE"] = "20000"
             env["FLE_REUSE_REASON"] = "1"
@@ -464,7 +491,7 @@ def build(
             "tokens and unified KV is off. Add --arg=--kv-unified, or use one slot."
         )
     if not model.experts and profile in ("auto", "balanced", "max", "debug"):
-        notes.append("Dense model: the GPU expert cache stays empty; the FLE launch path still applies.")
+        notes.append("Dense model: no expert cache and no MoE flags; full GPU offload, fit, KV cache and speculation still apply.")
     if profile == "max" and not model.experts:
         notes.append("Max does not add an expert cache for a dense model; auto/off plus --spec ngram-mod is usually the speed lever.")
 

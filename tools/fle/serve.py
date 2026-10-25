@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
 
-from .util import FleError, eprint
+from .util import FleError, eprint, prepare_run_env
 
 READY = "ready"  # /health answered OK
 FAILED = "failed"  # the process ended with a non-zero code before it was ready
@@ -32,6 +32,7 @@ def spawn_process(plan: Any) -> subprocess.Popen[bytes]:
     """Start the plan's server as a child that shares our stdout/stderr."""
     env = os.environ.copy()
     env.update(plan.env)
+    prepare_run_env(plan.env)
     try:
         return subprocess.Popen([plan.binary, *plan.args], env=env)
     except OSError as exc:
