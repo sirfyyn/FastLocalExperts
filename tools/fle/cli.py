@@ -12,15 +12,37 @@ from pathlib import Path
 from typing import Any
 
 from . import bench, config, doctor, gguf, hardware, plan as plan_mod, report, serve as serve_mod, sidecars as sidecars_mod
-from .util import FleError, as_bool, eprint, human_bytes, human_int, prepare_run_env, print_json
+from .util import (
+    COLOR_MODES,
+    FleError,
+    as_bool,
+    eprint,
+    human_bytes,
+    human_int,
+    paint,
+    paint_status,
+    prepare_run_env,
+    print_json,
+    set_color_mode,
+)
 
 VERSION = "0.1"
+
+
+def _add_color(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--color",
+        choices=COLOR_MODES,
+        default="auto",
+        help="colour warnings, errors and status: auto (a terminal, no NO_COLOR, not TERM=dumb), always or never",
+    )
 
 
 def _common() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("model", nargs="?", help="model file, first shard, or folder")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    _add_color(p)
     p.add_argument("--debug", action="store_true", help="show a traceback on unexpected errors")
     p.add_argument("--config", metavar="FILE", help="use another config file")
     p.add_argument("--engine", metavar="FILE", help="path to llama-server")
@@ -29,6 +51,11 @@ def _common() -> argparse.ArgumentParser:
 
 
 def _plan_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--oneline",
+        action="store_true",
+        help="print the start command as before (environment line, then one long command line)",
+    )
     p.add_argument("--host", help="listen address (default 127.0.0.1)")
     p.add_argument("--port", type=int, help="listen port (default 8080)")
     p.add_argument("--context", type=int, help="context tokens (0 = profile default)")
@@ -190,7 +217,9 @@ def _print_inspect(model: gguf.Model, show_tensors: bool = False) -> None:
         print(f"layers:   {human_int(model.layers)}")
     if model.experts:
         print(f"experts:  {human_int(model.experts)} per layer, {human_int(model.experts_used)} used")
-    print(f"experts:  {human_bytes(model.expert_bytes)}")
+        print(f"experts:  {human_bytes(model.expert_bytes)}")
+    else:
+        print("experts:  dense (no experts)")
     print(f"input:    {human_bytes(model.input_bytes)}")
     print(f"gpu:      {human_bytes(model.gpu_bytes)}")
     print(f"kv q8:    {human_bytes(model.kv_bytes_per_token('q8_0', 'q8_0'))} per token")
@@ -210,7 +239,7 @@ def _print_inspect(model: gguf.Model, show_tensors: bool = False) -> None:
                 print(f"  {tensor.name:<60} {tensor.type_name:<10} {human_bytes(tensor.nbytes)}")
 
 
-def _print_plan(plan: plan_mod.Plan) -> None:
+def _print_plan(plan: plan_mod.Plan, oneline: bool = False) -> None:
     print(f"profile:  {plan.profile}  ({plan_mod.PROFILE_HELP.get(plan.profile, '')})")
     print(f"model:    {plan.model.name} ({human_bytes(plan.model.size)})")
     print(f"alias:    {plan.alias}")
@@ -223,7 +252,7 @@ def _print_plan(plan: plan_mod.Plan) -> None:
     print(f"fit:      {human_int(plan.fit_target_mib)} MiB")
     print(f"host:     {plan.host}:{plan.port}")
     print()
-    print(plan.command())
+    print(plan.command_block(oneline=oneline))
     if plan.notes:
         print()
         print("notes:")
@@ -231,9 +260,9 @@ def _print_plan(plan: plan_mod.Plan) -> None:
             print(f"  - {note}")
     if plan.warnings:
         print()
-        print("warnings:")
+        print(paint("warnings:", "bold", "yellow"))
         for warning in plan.warnings:
-            print(f"  - {warning}")
+            print(paint(f"  - {warning}", "yellow"))
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:
@@ -255,15 +284,15 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     if args.json:
         print_json(result)
     else:
-        print(f"verify: {'ok' if result['ok'] else 'failed'}")
+        print(f"verify: {paint_status('ok' if result['ok'] else 'failed', 'ok' if result['ok'] else 'fail')}")
         for check in result["checks"]:
-            print(f"[{check['status']}] {check['name']}: {check['detail']}")
+            print(f"[{paint_status(check['status'], check['status'])}] {check['name']}: {check['detail']}")
             if check.get("hint"):
                 print(f"       -> {check['hint']}")
         for warning in result["warnings"]:
-            print(f"[warn] {warning}")
+            print(f"[{paint_status('warn', 'warn')}] {warning}")
         for error in result["errors"]:
-            print(f"[fail] {error}")
+            print(f"[{paint_status('fail', 'fail')}] {error}")
     return 0 if result["ok"] else 1
 
 
@@ -288,7 +317,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     if args.json:
         print_json(plan.as_dict())
     else:
-        _print_plan(plan)
+        _print_plan(plan, oneline=bool(getattr(args, "oneline", False)))
     return 0
 
 
@@ -301,17 +330,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         if result["status"] == "fail" and not args.force:
             doctor.print_report(result)
             eprint()
-            eprint("Refusing to start. Fix the failed checks, or pass --force.")
+            eprint(paint("Refusing to start. Fix the failed checks, or pass --force.", "red", stream=sys.stderr))
             return 1
     elif plan.fallback:
         eprint("FLE preflight skipped: falling back to upstream llama.cpp.")
+    oneline = bool(getattr(args, "oneline", False))
     if args.dry_run:
         if args.json:
             print_json(plan.as_dict())
         else:
-            _print_plan(plan)
+            _print_plan(plan, oneline=oneline)
         return 0
-    _print_plan(plan)
+    _print_plan(plan, oneline=oneline)
     eprint()
     eprint(f"starting {plan.binary}")
     if getattr(args, "fallback", False) and not plan.fallback:
@@ -632,11 +662,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="with --baseline: exit 2 when the median drops by more than PCT percent (default 10)",
     )
     b.add_argument("--json", action="store_true")
+    _add_color(b)
     b.set_defaults(func=_cmd_bench)
 
     cfg = sub.add_parser("config", help="show or change the global settings")
     cfg.add_argument("--config", dest="config", metavar="FILE", help="use another config file")
     cfg.add_argument("--json", action="store_true")
+    _add_color(cfg)
     cfg_sub = cfg.add_subparsers(dest="action", required=True)
     cfg_sub.add_parser("path", help="print the config path")
     init = cfg_sub.add_parser("init", help="write a default config")
@@ -655,12 +687,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # JSON stays plain whatever --color says; otherwise --color decides (auto: only on a terminal).
+    set_color_mode("never" if getattr(args, "json", False) else getattr(args, "color", "auto"))
     try:
         return int(args.func(args))
     except FleError as exc:
-        eprint(f"fle: {exc}")
+        eprint(f"{paint('fle:', 'bold', 'red', stream=sys.stderr)} {exc}")
         if exc.hint:
-            eprint(f"hint: {exc.hint}")
+            eprint(f"{paint('hint:', 'cyan', stream=sys.stderr)} {exc.hint}")
         return 2
     except BrokenPipeError:
         return 0

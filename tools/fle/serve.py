@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Protocol
 
-from .util import FleError, eprint, prepare_run_env
+from .util import FleError, eprint, is_tty, prepare_run_env
 
 READY = "ready"  # /health answered OK
 FAILED = "failed"  # the process ended with a non-zero code before it was ready
@@ -61,6 +62,8 @@ class Supervisor:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         say: Callable[[str], None] = eprint,
+        progress: bool | None = None,
+        progress_interval: float = 10.0,
     ) -> None:
         self.spawn = spawn
         self.health = health or (lambda plan: http_health(plan.host, plan.port))
@@ -69,19 +72,34 @@ class Supervisor:
         self.sleep = sleep
         self.clock = clock
         self.say = say
+        # Progress lines only for a person watching: stderr is a terminal. Tests pass True or False.
+        self.progress = is_tty(sys.stderr) if progress is None else progress
+        self.progress_interval = progress_interval
+        self.waited = 0.0  # seconds the last wait_ready took
 
     def wait_ready(self, proc: Process, plan: Any) -> tuple[str, int | None]:
-        """Watch a starting server until it is ready, has ended, or the wait runs out."""
-        deadline = self.clock() + self.ready_timeout
-        while True:
-            code = proc.poll()
-            if code is not None:
-                return (EXITED if code == 0 else FAILED), code
-            if self.health(plan):
-                return READY, None
-            if self.clock() >= deadline:
-                return TIMEOUT, None
-            self.sleep(self.poll_interval)
+        """Watch a starting server until it is ready, has ended, or the wait runs out.
+
+        With progress on, a line "still loading ... N s" goes out about every `progress_interval` seconds."""
+        started = self.clock()
+        deadline = started + self.ready_timeout
+        next_report = started + self.progress_interval
+        try:
+            while True:
+                code = proc.poll()
+                if code is not None:
+                    return (EXITED if code == 0 else FAILED), code
+                if self.health(plan):
+                    return READY, None
+                now = self.clock()
+                if now >= deadline:
+                    return TIMEOUT, None
+                if self.progress and self.progress_interval > 0 and now >= next_report:
+                    self.say(f"fle: still loading ... {int(now - started)} s")
+                    next_report = now + self.progress_interval
+                self.sleep(self.poll_interval)
+        finally:
+            self.waited = self.clock() - started
 
     def _finish(self, proc: Process) -> int:
         try:
@@ -107,7 +125,7 @@ class Supervisor:
             proc.terminate()
             return 130
         if state == READY:
-            self.say("fle: the server is ready.")
+            self.say(f"fle: ready after {int(self.waited)} s" if self.progress else "fle: the server is ready.")
             return self._finish(proc)
         if state == EXITED:
             return int(code or 0)

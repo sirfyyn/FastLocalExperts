@@ -101,7 +101,9 @@ config unset KEY` removes an override.
   `--ready-timeout SEC` (default 3600) is how long the start is watched. An explicit `--spec ngram-*` or `mtp` is
   never dropped silently: with it there is no fallback, only the error. Set
   `FLE_UPSTREAM_ENGINE=/path/to/upstream/llama-server` if no upstream build is found automatically. Without
-  `--fallback`, `serve` replaces itself with the server (`exec`) as before.
+  `--fallback`, `serve` replaces itself with the server (`exec`) as before: nothing watches the start, so there is
+  no progress line either (the engine's own log shows the loading). With `--fallback`, and only when stderr is a
+  terminal, `serve` prints `fle: still loading ... N s` about every 10 seconds and `fle: ready after N s` at the end.
 - **`bench`** — measures prompt and decode tokens/s through the OpenAI-compatible `/v1` endpoint. It starts no server.
   `--prompt-file` reads a longer prompt, `--output` writes the JSON result, `--compare URL` runs the same prompt
   against a second running server/model, and the report shows `finish_reason`, draft acceptance and a warning when a
@@ -118,6 +120,18 @@ config unset KEY` removes an override.
 - **`config`** — read and write the user config (`path`, `init`, `show`, `set`, `unset`, `edit`).
 
 `--json` is available on the read-only commands for scripts. `--debug` prints a traceback for an unexpected failure.
+
+### Reading the output
+
+- The start command in `plan` and `serve` is laid out one environment variable per line, then `llama-server`, then one
+  flag (with its value) per line, each line but the last ending in ` \`. Paste it into a shell as it is; it is the same
+  command as before. `--oneline` prints the old form instead. `--json` is unchanged (`command` keeps the old text).
+- Colour is for warnings (`warnings:`), errors (`fle:` and `hint:`) and the ok/warn/fail marks of `doctor` and `verify`.
+  `--color auto` (the default) colours only a terminal, and not when `NO_COLOR` is set or `TERM=dumb`; `--color always`
+  and `--color never` force it. `--json` is never coloured.
+- A dense model (no experts) shows `experts: dense (no experts)` in `inspect`, is not warned about a missing `-cmoe`, and
+  gets notes that do not talk about an expert cache. `--profile nvme` is meant for models larger than RAM; on a dense
+  model it only maps the file and skips warm-up, and the plan says so.
 
 ## Notes for large models
 

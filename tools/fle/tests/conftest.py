@@ -13,7 +13,7 @@ TOOLS = Path(__file__).resolve().parents[2]
 if str(TOOLS) not in sys.path:
     sys.path.insert(0, str(TOOLS))
 
-from fle import config, gguf, hardware  # noqa: E402
+from fle import config, gguf, hardware, util  # noqa: E402
 from fle.util import GiB, MiB  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -51,6 +51,10 @@ def clean_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         if key.startswith("FLE_"):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    # Output tests compare plain text even when pytest runs with -s on a terminal; colour tests opt in explicitly.
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm")
+    util.set_color_mode("auto")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     monkeypatch.setenv("FLE_CONFIG", str(tmp_path / "xdg" / "fle" / "config.toml"))
 

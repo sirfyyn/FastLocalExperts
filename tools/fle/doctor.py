@@ -6,7 +6,7 @@ import shlex
 from typing import Any
 
 from . import config, gguf, hardware, plan as plan_mod
-from .util import FleError, GiB, MiB, human_bytes, human_int
+from .util import FleError, GiB, MiB, human_bytes, human_int, paint_status
 
 STATUS_ORDER = {"ok": 0, "warn": 1, "fail": 2}
 
@@ -23,8 +23,12 @@ def worst(checks: list[dict[str, str]]) -> str:
     return status
 
 
-def suggest(checks: list[dict[str, str]], profile: str, model_path: str) -> list[dict[str, str]]:
-    """Another profile that would resolve a warning or failure, as a ready command. At most one per profile."""
+def suggest(
+    checks: list[dict[str, str]], profile: str, model_path: str, dense: bool = False
+) -> list[dict[str, str]]:
+    """Another profile that would resolve a warning or failure, as a ready command. At most one per profile.
+
+    `dense` words the nvme reason for a model without experts (there is nothing to stream; the file is only mapped)."""
     if not model_path:
         return []
     found: dict[str, str] = {}
@@ -38,7 +42,10 @@ def suggest(checks: list[dict[str, str]], profile: str, model_path: str) -> list
         if name == "RAM" and status == "warn":
             add("nvme", "the experts are larger than the free RAM; nvme memory-maps them from disk")
         elif name == "plan warning" and "larger than RAM plus VRAM" in detail:
-            add("nvme", "the model is larger than RAM plus VRAM; nvme streams experts from disk")
+            if dense:
+                add("nvme", "the model is larger than RAM plus VRAM; nvme memory-maps it from disk (slow for a dense model)")
+            else:
+                add("nvme", "the model is larger than RAM plus VRAM; nvme streams experts from disk")
         elif name == "GPU memory" and status == "warn" and profile in ("auto", "max", "debug"):
             add("balanced", "little VRAM is free; balanced keeps a bigger margin and a smaller cache")
         elif name == "GPU" and status == "fail":
@@ -109,7 +116,7 @@ def run(model_path: str, settings: dict[str, Any]) -> dict[str, Any]:
         engine = hardware.detect_engine(engine_path)
         if engine.get("ok"):
             checks.append(_check("engine", "ok", f"{engine['path']} ({engine.get('flavor')}, {engine.get('backend')})"))
-            for problem in hardware.check_engine_flags(engine, profile):
+            for problem in hardware.check_engine_flags(engine, profile, bool(model.experts) if model else None):
                 status = "fail" if profile not in ("off",) else "warn"
                 checks.append(_check("engine flags", status, problem))
         else:
@@ -127,9 +134,13 @@ def run(model_path: str, settings: dict[str, Any]) -> dict[str, Any]:
                 kv = int(model.kv_bytes_per_token("q8_0", "q8_0") * plan_mod._context(profile, model, 0))
                 need = model.gpu_bytes + kv + plan_mod.ENGINE_OVERHEAD_MIB * MiB
                 if need > free:
-                    checks.append(_check("GPU memory", "warn",
-                                         f"non-expert weights and KV need about {human_bytes(need)}, {human_bytes(free)} free",
-                                         "Stop other GPU work, lower the context, or use --profile balanced/nvme."))
+                    if model.experts:
+                        detail = f"non-expert weights and KV need about {human_bytes(need)}, {human_bytes(free)} free"
+                        hint = "Stop other GPU work, lower the context, or use --profile balanced/nvme."
+                    else:
+                        detail = f"weights and KV need about {human_bytes(need)}, {human_bytes(free)} free"
+                        hint = "Stop other GPU work, lower the context, or use --profile balanced."
+                    checks.append(_check("GPU memory", "warn", detail, hint))
                 else:
                     checks.append(_check("GPU memory", "ok", f"{human_bytes(free - need)} left for the cache"))
     if model and model.expert_bytes:
@@ -165,15 +176,15 @@ def run(model_path: str, settings: dict[str, Any]) -> dict[str, Any]:
         "plan": parsed_plan.as_dict() if parsed_plan else None,
         "system": system,
         "checks": checks,
-        "suggestions": suggest(checks, profile, model_path),
+        "suggestions": suggest(checks, profile, model_path, dense=bool(model and not model.experts)),
     }
 
 
 def print_report(report: dict[str, Any]) -> None:
-    print(f"fle doctor: {report['status']}")
+    print(f"fle doctor: {paint_status(report['status'], report['status'])}")
     for item in report["checks"]:
         mark = {"ok": "ok  ", "warn": "warn", "fail": "fail"}[item["status"]]
-        print(f"[{mark}] {item['name']}: {item['detail']}")
+        print(f"[{paint_status(mark, item['status'])}] {item['name']}: {item['detail']}")
         if item.get("hint"):
             print(f"       -> {item['hint']}")
     system = report.get("system") or {}
@@ -187,7 +198,8 @@ def print_report(report: dict[str, Any]) -> None:
     print(f"disk:   {human_bytes(system.get('disk_free'))} free")
     if report.get("model"):
         model = report["model"]
-        print(f"model:  {model['name']} ({model['arch']}, {model['size_human']}, {model['tensor_count']} tensors)")
+        kind = "dense, " if not model.get("experts") else f"{human_int(model['experts'])} experts, "
+        print(f"model:  {model['name']} ({model['arch']}, {kind}{model['size_human']}, {model['tensor_count']} tensors)")
     print(f"config: {report['config']}")
     suggestions = report.get("suggestions") or []
     if suggestions:

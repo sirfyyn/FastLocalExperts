@@ -52,6 +52,31 @@ ENGINE_OVERHEAD_MIB = 6749
 DEFAULT_FIT_TARGET_MIB = 1115
 
 
+_NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
+
+
+def _is_flag(token: str) -> bool:
+    return token.startswith("-") and len(token) > 1 and not _NUMBER.match(token)
+
+
+def _flag_groups(args: list[str]) -> list[list[str]]:
+    """Split an argument list into display groups: a flag together with its value, or a flag alone. Order is kept, so
+    joining the groups gives the original list; only the line breaks are a guess (`-ngl 99` is one line, `--jinja` is
+    one line)."""
+    groups: list[list[str]] = []
+    i = 0
+    while i < len(args):
+        token = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+        if _is_flag(token) and nxt is not None and not _is_flag(nxt):
+            groups.append([token, nxt])
+            i += 2
+        else:
+            groups.append([token])
+            i += 1
+    return groups
+
+
 @dataclass
 class Plan:
     profile: str
@@ -85,6 +110,18 @@ class Plan:
         env = " ".join(f"{k}={shlex.quote(v)}" for k, v in self.env.items())
         cmd = " ".join(shlex.quote(x) for x in [self.binary, *self.args])
         return f"{env} \\\n  {cmd}" if env else cmd
+
+    def command_block(self, oneline: bool = False) -> str:
+        """The start command for people: one environment variable per line, then llama-server and one flag (with its
+        value) per line, every line but the last ending in ` \\`. It pastes into a shell and means exactly what
+        `command()` means; `oneline=True` returns `command()` itself. JSON keeps using `command()`."""
+        if oneline or os.name == "nt":
+            return self.command()
+        lines = [f"{k}={shlex.quote(v)}" for k, v in self.env.items()]
+        lines.append(shlex.quote(self.binary))
+        for group in _flag_groups(self.args):
+            lines.append("  " + " ".join(shlex.quote(x) for x in group))
+        return " \\\n".join(lines)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -235,7 +272,15 @@ def _cache_budget(
             f"{human_int(fit_target)} MiB margin."
         )
     if profile == "nvme":
-        notes.append("NVMe profile: the model is memory-mapped, so the filesystem can page experts in on demand.")
+        if model.experts:
+            notes.append("NVMe profile: the model is memory-mapped, so the filesystem can page experts in on demand.")
+        else:
+            notes.append(
+                "NVMe profile: nvme is meant for models larger than RAM. The model is memory-mapped and starts without "
+                "warm-up, so the filesystem pages weights in on demand. A dense model has no experts to stream: the "
+                "layers that stay off the GPU are read in full for every token, so one larger than RAM plus VRAM will "
+                "be slow, and one that fits is better off with auto."
+            )
     return max(0, cache), {
         "vram_free": free,
         "gpu_weights": gpu_weights,
@@ -300,7 +345,10 @@ def build(
     fit_target = as_int(settings.get("fit_target_mib"), 0) or DEFAULT_FIT_TARGET_MIB
     if profile == "balanced" and fit_target == DEFAULT_FIT_TARGET_MIB:
         fit_target = 1536
-        notes.append("Balanced keeps a 1536 MiB fit margin (1115 MiB in auto) and 30 percent of the cache free.")
+        if model.experts:
+            notes.append("Balanced keeps a 1536 MiB fit margin (1115 MiB in auto) and 30 percent of the cache free.")
+        else:
+            notes.append("Balanced keeps a 1536 MiB fit margin (1115 MiB in auto); a dense model has no expert cache.")
     elif profile == "max" and fit_target == DEFAULT_FIT_TARGET_MIB:
         fit_target = 512
         notes.append("Max uses a 512 MiB fit margin instead of 1115 MiB; stop other GPU work first.")
@@ -334,9 +382,16 @@ def build(
             "the size and cache estimate are incomplete."
         )
     if model.size > mem.get("total", 0) + sum(g.get("memory_total", 0) for g in chosen_gpus):
-        warnings.append(
-            "The model is larger than RAM plus VRAM. Use --profile nvme to stream experts from disk, or add memory."
-        )
+        if model.experts:
+            warnings.append(
+                "The model is larger than RAM plus VRAM. Use --profile nvme to stream experts from disk, or add memory."
+            )
+        else:
+            warnings.append(
+                "The model is larger than RAM plus VRAM. A dense model has no experts to stream; --profile nvme "
+                "memory-maps it from disk, but the layers that stay off the GPU are read in full for every token, so expect it to be slow. "
+                "A smaller quantisation or more memory is the real fix."
+            )
     if model.expert_bytes and mem.get("available", 0) and model.expert_bytes > mem.get("available", 0):
         warnings.append(
             f"Experts need {human_bytes(model.expert_bytes)} in RAM, but only {human_bytes(mem.get('available', 0))} is free."
@@ -493,7 +548,10 @@ def build(
     if not model.experts and profile in ("auto", "balanced", "max", "debug"):
         notes.append("Dense model: no expert cache and no MoE flags; full GPU offload, fit, KV cache and speculation still apply.")
     if profile == "max" and not model.experts:
-        notes.append("Max does not add an expert cache for a dense model; auto/off plus --spec ngram-mod is usually the speed lever.")
+        notes.append(
+            "Max does not add an expert cache for a dense model; it only raises the default context to "
+            f"{human_int(PROFILE_CONTEXT['max'])} tokens and lowers the fit margin. For speed, try --spec ngram-mod."
+        )
 
     if cache_mib > 0 and profile not in ("off", "nvme"):
         if profile == "balanced":

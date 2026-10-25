@@ -49,6 +49,7 @@ class Clock:
 
 def make_supervisor(procs, health, said, clock=None, **kw):
     clock = clock or Clock()
+    kw.setdefault("progress", False)  # progress lines are tested on their own
     spawned = []
 
     def spawn(plan):
@@ -140,6 +141,53 @@ def test_wait_ready_states():
     assert sup.wait_ready(FakeProc("a", 0), None) == (serve.EXITED, 0)
     sup2, _ = make_supervisor([], lambda plan: True, [])
     assert sup2.wait_ready(FakeProc("a", 0, alive_polls=5), None) == (serve.READY, None)
+
+
+# ---- loading progress ---------------------------------------------------------------------------------------
+
+
+def test_progress_lines_every_ten_seconds_then_ready_after():
+    said, clock = [], Clock()
+    sup, _ = make_supervisor(
+        [FakeProc("fle", code=0, alive_polls=10**9)], lambda plan: clock.now >= 25, said, clock=clock, progress=True
+    )
+    assert sup.run(P("x"), lambda reason: pytest.fail("no fallback")) == 0
+    assert said == ["fle: still loading ... 10 s", "fle: still loading ... 20 s", "fle: ready after 25 s"]
+
+
+def test_no_progress_lines_without_a_terminal():
+    said, clock = [], Clock()
+    sup, _ = make_supervisor(
+        [FakeProc("fle", code=0, alive_polls=10**9)], lambda plan: clock.now >= 25, said, clock=clock, progress=False
+    )
+    assert sup.run(P("x"), lambda reason: pytest.fail("no fallback")) == 0
+    assert said == ["fle: the server is ready."]
+
+
+def test_progress_defaults_to_whether_stderr_is_a_terminal(monkeypatch):
+    class Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(serve.sys, "stderr", Tty())
+    assert serve.Supervisor().progress is True
+    monkeypatch.setattr(serve.sys, "stderr", object())
+    assert serve.Supervisor().progress is False
+
+
+def test_progress_interval_is_adjustable_and_failures_stay_quiet():
+    said, clock = [], Clock()
+    sup, _ = make_supervisor(
+        [FakeProc("a", code=1, alive_polls=7), FakeProc("b", code=0)],
+        lambda plan: False,
+        said,
+        clock=clock,
+        progress=True,
+        progress_interval=3.0,
+    )
+    assert sup.run(P("x"), lambda reason: P("up", True)) == 0
+    assert said[:2] == ["fle: still loading ... 3 s", "fle: still loading ... 6 s"]
+    assert any("restarting once" in line for line in said)
 
 
 # ---- cli glue ---------------------------------------------------------------------------------------------
