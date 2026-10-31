@@ -29,6 +29,8 @@ impl Server {
             cmd.env("DYLD_LIBRARY_PATH", dir);
             #[cfg(target_os = "linux")]
             cmd.env("LD_LIBRARY_PATH", dir);
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            let _ = dir; // Windows loads the engine's DLLs from the folder of the program itself
         }
         let child = cmd
             .spawn()
