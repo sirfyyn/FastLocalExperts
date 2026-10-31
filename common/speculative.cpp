@@ -2340,7 +2340,30 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         // consecutive accept rounds with low acceptance fraction (< 0.5)
         int n_low = 0;
+
+        // FLE v2: draft rounds still to skip after a low-acceptance streak (replaces the global table reset)
+        int n_skip = 0;
     };
+
+    // FLE v2: optional file the table is loaded from at start and saved to (FLE_NGRAM_MOD_FILE); empty = in memory only
+    std::string file;
+    int64_t     t_last_save = 0;
+
+    static int64_t now_s() {
+        return (int64_t) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
+    void maybe_save(bool force) {
+        if (file.empty()) { return; }
+        const int64_t t = now_s();
+        if (!force && t - t_last_save < 120) { return; }
+        t_last_save = t;
+        if (!mod.save(file)) {
+            SPC_WRN("ngram_mod: could not save the table to '%s'\n", file.c_str());
+        }
+    }
+
+    ~common_speculative_impl_ngram_mod() override { maybe_save(true); }
 
     std::vector<seq_info> sinfos;
 
@@ -2365,10 +2388,21 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
         }
 
         sinfos.resize(n_seq);
+
+        if (const char * f = std::getenv("FLE_NGRAM_MOD_FILE")) {
+            file = f;
+            if (!file.empty()) {
+                if (mod.load(file)) {
+                    SPC_WRN("ngram_mod: warm start from '%s' (%zu of %zu slots in use)\n", file.c_str(), mod.get_used(), mod.size());
+                }
+                t_last_save = now_s();
+            }
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         auto & sinfo = sinfos[seq_id];
+        maybe_save(false);
 
         sinfo.i_last = 0;
         sinfo.n_draft_last = 0;
@@ -2384,15 +2418,9 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         sinfo.i_last = prompt.size() - n;
 
-        const double f = (double)mod.get_used() / (double)mod.size();
-        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), f);
-
-        constexpr double f_thold = 0.25;
-        if (f > f_thold) {
-            SPC_WRN("ngram_mod occupancy %.2f exceeds threshold (%.2f) - resetting\n", f, f_thold);
-
-            mod.reset();
-        }
+        // FLE v2: the table replaces its oldest entries by itself; the old reset above 25 % occupancy wiped the knowledge of
+        // all earlier prompts every few long prompts.
+        SPC_TRC("ngram_mod occupancy = %zu/%zu (%.2f)\n", mod.get_used(), mod.size(), (double)mod.get_used() / (double)mod.size());
     }
 
     void draft_one(
@@ -2407,6 +2435,16 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
 
         const size_t cur_len = prompt.size();
         if (cur_len < mod.get_n()) {
+            return;
+        }
+
+        if (sinfo.n_skip > 0) { // FLE v2: backing off after a low-acceptance streak; the table keeps learning below
+            sinfo.n_skip--;
+            if (sinfo.i_last + 32 < cur_len) {
+                for (size_t i = sinfo.i_last; i < cur_len - mod.get_n(); ++i) { mod.add(prompt.data() + i); }
+                sinfo.i_last = cur_len - mod.get_n();
+            }
+            result.clear();
             return;
         }
 
@@ -2483,12 +2521,12 @@ struct common_speculative_impl_ngram_mod : public common_speculative_impl {
                 sinfo.n_low++;
                 if (sinfo.n_low >= 5) {
                     if (verbose) {
-                        SPC_TRC("low acceptance streak (%d) - resetting ngram_mod\n", sinfo.n_low);
+                        SPC_TRC("low acceptance streak (%d) - skipping 16 draft rounds of this sequence (table kept)\n", sinfo.n_low);
                     }
 
-                    mod.reset();
+                    // FLE v2: the table is shared by all sequences; one bad streak must not wipe what the others learned
                     sinfo.n_low = 0;
-                    sinfo.i_last = 0;
+                    sinfo.n_skip = 16;
                 }
             } else {
                 sinfo.n_low = 0;
