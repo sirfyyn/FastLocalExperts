@@ -409,6 +409,17 @@ fn round_mib(n_bytes: f64, step: i64) -> i64 {
     (whole.div_euclid(step) * step).max(0)
 }
 
+/// `(context, per slot)` like `qol.effective_context`.
+pub fn effective_context(context: i64, parallel: i64, kv_unified: bool) -> (i64, i64) {
+    let parallel = parallel.max(1);
+    let context = context.max(1);
+    if kv_unified || parallel == 1 {
+        (context, context)
+    } else {
+        (context, (context / parallel).max(1))
+    }
+}
+
 /// One-line note about the effective context (`qol.effective_context(...)["note"]`).
 pub fn effective_context_note(context: i64, parallel: i64, kv_unified: bool) -> String {
     let parallel = parallel.max(1);
@@ -470,6 +481,8 @@ pub struct Plan {
     pub notes: Vec<String>,
     /// path of the draft/MTP model, for the load progress
     pub draft: Option<String>,
+    /// set when this plan replaces one that failed to load or could not be built: why (it is not tried a second time)
+    pub fallback: String,
 }
 
 impl Plan {
@@ -517,7 +530,7 @@ impl Plan {
             .map(|(k, v)| (k.clone(), json!(v)))
             .collect();
         json!({"engine": self.engine, "binary": self.binary, "args": self.args, "env": env, "port": self.port, "model": self.model, "profile": self.profile,
-            "notes": self.notes, "draft": self.draft, "command": self.command_line()})
+            "notes": self.notes, "draft": self.draft, "fallback": self.fallback, "command": self.command_line()})
     }
 }
 
@@ -862,9 +875,23 @@ pub fn auto_plan(i: &AutoInput) -> R<Plan> {
         let vocab = mtp["vocab"].as_str().unwrap_or("").to_string();
         let (mut use_mtp, mut ngram) = (false, String::new());
         let mtp_on = launch.get("mtp").map(py_truthy).unwrap_or(true);
+        // Only an engine whose help does not list --spec-type is known to lack it; entries without the key are recent.
+        let spec_type_ok = engine.get("spec_type").map(py_truthy).unwrap_or(true);
+        if matches!(spec.as_str(), "mtp" | "ngram-mod" | "ngram-simple") && !spec_type_ok {
+            return Err(plan_err2(
+                &format!("Speculation mode {} needs an engine that knows --spec-type, and this one does not.", py_repr(&json!(spec))),
+                "Update the engine, or set speculation to none.",
+            ));
+        }
         match spec.as_str() {
             "none" => notes.push("Speculation is off.".into()),
             "mtp" => {
+                if !mtp_on {
+                    return Err(plan_err2(
+                        "Speculation is set to mtp, but MTP is switched off (launch.mtp); the two settings contradict each other.",
+                        "Switch MTP on, or set speculation to auto or none.",
+                    ));
+                }
                 if head.is_empty() || vocab.is_empty() {
                     return Err(plan_err2("MTP was requested, but this model has no MTP head and vocabulary file.", "Download the MTP sidecars on the Models page, or set speculation to auto or ngram-mod."));
                 }
@@ -875,9 +902,17 @@ pub fn auto_plan(i: &AutoInput) -> R<Plan> {
                 notes.push(format!("Self-speculation: {spec}. It drafts from the prompt/context; acceptance is prompt-dependent."));
             }
             _ => {
-                if mtp_on && !head.is_empty() && !vocab.is_empty() {
+                if mtp_on && !head.is_empty() && !vocab.is_empty() && !spec_type_ok {
+                    notes.push(
+                        "MTP is off: this engine does not know --spec-type. Update the engine."
+                            .into(),
+                    );
+                } else if mtp_on && !head.is_empty() && !vocab.is_empty() {
                     use_mtp = true;
-                } else if mtp_on && mtp["supported"].as_bool() == Some(true) && head.is_empty() {
+                } else if mtp_on
+                    && mtp["supported"].as_bool() == Some(true)
+                    && (head.is_empty() || vocab.is_empty())
+                {
                     notes.push("MTP is off: the MTP head or its vocabulary file is not downloaded (Models page).".into());
                 }
             }
@@ -968,6 +1003,7 @@ pub fn auto_plan(i: &AutoInput) -> R<Plan> {
             profile: "auto".into(),
             notes,
             draft,
+            fallback: String::new(),
         },
         engine
             .get("log_verbosity")
@@ -1456,6 +1492,7 @@ pub fn profile_plan(i: &ProfileInput) -> R<Plan> {
         profile: profile.id.clone(),
         notes,
         draft,
+        fallback: String::new(),
     };
     // For a custom profile `engine` is the check of its own binary (None if that could not run): no -lv unless known.
     let lv = i

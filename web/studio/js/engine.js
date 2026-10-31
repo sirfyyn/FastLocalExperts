@@ -51,7 +51,7 @@ export function mount(main) {
     status: h("div", { class: "card pad-lg" }),
     best: h("div", { class: "card" }),
     launch: h("div", { class: "card" }),
-    preview: h("div", { class: "card" }),
+    preview: h("div", { class: "card sticky-side" }),
     profiles: h("div", { class: "card" }),
     engines: h("div", { class: "card" }),
     attach: h("div", { class: "card" }),
@@ -63,9 +63,9 @@ export function mount(main) {
         + "a profile keeps a command of your own, placeholders and all.")), modeSwitch),
     boxes.status,
     boxes.best,
-    h("div", { class: "grid two start" }, boxes.launch, boxes.preview),
+    h("div", { class: "grid two" }, boxes.launch, boxes.preview),
     boxes.profiles,
-    h("div", { class: "grid two start" }, boxes.engines, boxes.attach),
+    h("div", { class: "grid two" }, boxes.engines, boxes.attach),
     boxes.log)));
 
   const settings = () => store.state?.settings || {};
@@ -73,7 +73,11 @@ export function mount(main) {
   let editing = null; // the profile in the editor: {id, name, engine, command, notes, builtin}
   let preview = null;
   let previewError = "";
+  let previewFixes = [];
+  let previewChips = []; // [{label, value, tone}] from the plan answer: the facts in one row above the command
+  let previewSpec = null; // {applies, reason} from the plan answer; null = not known yet, the menu stays usable
   let checkResult = null;
+  let moreOpen = false; // "More: expert cache ..." stays open when the form is rebuilt (for example by a plan answer)
   let pending = {};
 
   // ------------------------------------------------------------------------------------------- data flow
@@ -113,22 +117,53 @@ export function mount(main) {
     flush();
   }
 
+  // The plan behind the command box: read-only, so it follows every setting without starting anything. A plan that
+  // cannot be built comes back as text (and maybe a fix), not as an error; only the newest answer is shown.
+  let previewSeq = 0;
   const refreshPreview = debounce(async () => {
+    const seq = ++previewSeq;
     if (!sel.model && sel.profile === "auto") {
       preview = null;
+      previewFixes = [];
       previewError = usableModels().length ? "Choose a model." : "Download or add a model first (Models page).";
       renderPreview();
       return;
     }
+    let answer;
     try {
-      preview = await post("/api/engine/preview", { model: sel.model, profile: sel.profile });
-      previewError = "";
+      answer = await post("/api/engine/plan", { model: sel.model, profile: sel.profile });
     } catch (e) {
-      preview = null;
-      previewError = e.message;
+      answer = { ok: false, error: e.message, fixes: [] };
     }
+    if (seq !== previewSeq) return;
+    preview = answer.ok ? answer.plan : null;
+    previewError = answer.ok ? "" : answer.error;
+    previewFixes = answer.fixes || [];
+    previewChips = answer.ok ? answer.summary || [] : [];
+    const wasOff = previewSpec?.applies === false;
+    previewSpec = answer.speculation || null;
     renderPreview();
+    if ((previewSpec?.applies === false) !== wasOff) renderLaunch(); // the Speculation menu follows the engine
   }, 200);
+
+  async function applyFix(fix, button) {
+    if (fix.kind !== "download_mtp") return;
+    button.disabled = true;
+    try {
+      await post(`/api/catalog/${fix.model}/download`, { mtp: true });
+      toast("Downloading the MTP files. The command updates when they are there.", "good", 6000);
+    } catch (e) {
+      button.disabled = false;
+      toast(e.message, "bad", 9000);
+    }
+  }
+
+  function fixButtons() {
+    if (!previewFixes.length) return null;
+    return h("div", { class: "row wrap", style: { marginTop: "12px" } }, previewFixes.map((f) => h("button", {
+      class: "btn sm primary", onclick: (e) => applyFix(f, e.currentTarget) },
+    icon("download", "sm"), f.label + (f.size ? ` (${fmt.bytes(f.size)})` : ""))));
+  }
 
   // ------------------------------------------------------------------------------------------- status
 
@@ -202,6 +237,8 @@ export function mount(main) {
       h("div", { class: "status-hero" },
         h("div", { style: { minWidth: 0 } }, h("div", { class: "big" }, stateBadge(e.state), h("span", null, name || "No model loaded"))),
         h("div", { class: "row wrap" }, actions)),
+      e.plan?.fallback && ["starting", "ready"].includes(e.state)
+        ? h("div", { class: "callout warn", style: { marginTop: "14px" } }, icon("alert", "sm"), h("div", null, e.plan.fallback)) : null,
       detail ? h("div", { style: { marginTop: "14px" } }, detail) : null,
       unitInfo ? h("div", { style: { marginTop: "14px" } }, unitInfo) : null,
       endpoint ? h("div", { style: { marginTop: "14px" } }, endpoint) : null);
@@ -316,6 +353,7 @@ export function mount(main) {
     if (!gpuOptions.some(([v]) => v === L.gpus)) gpuOptions.push([L.gpus, `GPUs ${L.gpus}`]);
     const coresHint = h("span", { class: "hint" }, maskHint(L.cpu_mask));
     const eng = store.engine;
+    const specOff = previewSpec?.applies === false; // the plan says speculation would change nothing here
     const boundTo = eng?.attached ? eng.service?.unit || "a running server" : "";
 
     clear(boxes.launch,
@@ -338,7 +376,7 @@ export function mount(main) {
             gpuOptions.map(([v, label]) => h("option", { value: v, selected: v === L.gpus }, label))),
           auto ? "Other GPUs stay free for other work." : "Applies when the profile sets no CUDA_VISIBLE_DEVICES."),
           field("CPU cores", coresInput(L.cpu_mask, coresHint), coresHint)) : field("CPU cores", coresInput(L.cpu_mask, coresHint), coresHint),
-        auto ? h("details", { class: "stack" },
+        auto ? h("details", { class: "stack", open: moreOpen, ontoggle: (e) => { moreOpen = e.currentTarget.open; } },
           h("summary", { class: "small muted", style: { cursor: "pointer" } }, "More: expert cache, threads, memory, port"),
           h("div", { class: "stack", style: { marginTop: "10px" } },
             h("div", { class: "grid two" },
@@ -354,14 +392,19 @@ export function mount(main) {
               (v) => save({ launch: { pinned_load: v } })), "FLE engine: faster expert loading on Linux and Windows, costs RAM that cannot be swapped."),
             h("label", { class: "row" }, toggle(L.mtp, (v) => save({ launch: { mtp: v } })),
               h("span", null, "MTP drafting when the MTP head is there ", h("span", { class: "muted small" }, "(FLE engine)"))),
-            field("Speculation", h("select", { class: "select", onchange: (e) => save({ launch: { spec: e.target.value } }) },
+            field("Speculation", h("select", { class: "select", disabled: specOff, title: specOff ? previewSpec.reason : "",
+              onchange: (e) => save({ launch: { spec: e.target.value } }) },
               [["auto", "Auto (MTP when the sidecars exist)"], ["none", "Off"], ["mtp", "MTP only"], ["ngram-mod", "Ngram (modified)"], ["ngram-simple", "Ngram (simple)"]].map(([v, label]) => h("option", { value: v, selected: v === (L.spec || "auto") }, label))),
-              "How the engine drafts ahead. auto only turns on MTP when its head and vocabulary file are present; ngram-mod/ngram-simple need an engine that supports --spec-type and are prompt-dependent."),
+              specOff ? previewSpec.reason
+                : "How the engine drafts ahead. auto only turns on MTP when its head and vocabulary file are present; ngram-mod/ngram-simple need an engine that supports --spec-type and are prompt-dependent."),
             field("Extra arguments", h("input", { class: "input mono", value: L.extra_args || "", placeholder: "--flash-attn on",
-              onchange: (e) => save({ launch: { extra_args: e.target.value } }) })),
+              oninput: (e) => save({ launch: { extra_args: e.target.value } }) })),
             field("Extra environment", h("textarea", { class: "textarea mono", rows: 2, placeholder: "KEY=value, one per line",
-              value: L.extra_env || "", onchange: (e) => save({ launch: { extra_env: e.target.value } }) })))) : null,
+              value: L.extra_env || "", oninput: (e) => save({ launch: { extra_env: e.target.value } }) })))) : null,
         h("div", { class: "divider" }),
+        auto ? h("label", { class: "row" }, toggle(L.fallback_on_failure !== false, (v) => save({ launch: { fallback_on_failure: v } })),
+          h("span", null, "Start upstream if loading fails ", h("span", { class: "muted small" },
+            "(once, without FLE features and speculation; needs an upstream engine)"))) : null,
         h("label", { class: "row" }, toggle(L.restart_on_crash, (v) => save({ launch: { restart_on_crash: v } })),
           h("span", null, "Start again if it crashes ", h("span", { class: "muted small" }, "(for a server that should stay up)"))),
         h("label", { class: "row" }, toggle(L.autostart, (v) => save({ launch: { autostart: v } })),
@@ -445,14 +488,21 @@ export function mount(main) {
       h("p", null, "What Start runs. Paste it into a terminal to run the engine without FLE Studio.")),
     preview ? copyButton(() => preview.command, "Copy the command") : null);
     if (!preview) {
-      clear(boxes.preview, head, previewError ? h("div", { class: "callout warn" }, icon("alert", "sm"), h("div", null, previewError)) : null);
+      previewChips = [];
+      clear(boxes.preview, head, previewError ? h("div", { class: "callout warn" }, icon("alert", "sm"), h("div", null, previewError)) : null,
+        fixButtons());
       return;
     }
+    const notes = (preview.notes || []).filter((n) => n !== preview.fallback); // the fallback has a callout of its own
     clear(boxes.preview, head,
+      preview.fallback ? h("div", { class: "callout warn", style: { marginBottom: "10px" } }, icon("alert", "sm"), h("div", null, preview.fallback)) : null,
+      previewChips.length ? h("div", { class: "sum-chips", "aria-label": "Summary of this start" }, previewChips.map((c) => h("span",
+        { class: `sum-chip ${["ok", "warn", "info"].includes(c.tone) ? c.tone : "info"}` }, h("small", null, c.label), h("b", null, c.value)))) : null,
       h("div", { class: "cmd" }, highlightCommand(preview.command)),
+      fixButtons(),
       explainBlock(preview, { open: mode === "simple" }),
-      preview.notes?.length ? h("ul", { class: "small muted", style: { margin: "12px 0 0", paddingLeft: "1.2em", display: "grid", gap: "4px" } },
-        preview.notes.map((n) => h("li", null, n))) : null,
+      notes.length ? h("ul", { class: "small muted", style: { margin: "12px 0 0", paddingLeft: "1.2em", display: "grid", gap: "4px" } },
+        notes.map((n) => h("li", null, n))) : null,
       h("div", { class: "row small faint wrap", style: { marginTop: "10px" } },
         h("span", null, `Engine: ${preview.engine}`), h("span", null, `Port ${preview.port}`),
         preview.draft ? h("span", null, "MTP drafting on") : null));
@@ -793,9 +843,9 @@ export function mount(main) {
   let lastState = store.engine?.state;
   unsub.push(on("state", renderAll));
   let lastUnit = store.engine?.service?.unit;
+  unsub.push(on("enginelog", () => { if (store.engine?.log_seq !== logSeq) fetchLog(); }));
   unsub.push(on("engine", () => {
     renderStatus();
-    if (store.engine?.log_seq !== logSeq) fetchLog();
     if (store.engine?.state !== lastState || store.engine?.service?.unit !== lastUnit) {
       lastState = store.engine?.state;
       lastUnit = store.engine?.service?.unit;

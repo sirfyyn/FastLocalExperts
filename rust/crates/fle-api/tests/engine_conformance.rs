@@ -85,6 +85,35 @@ fn seed(home: &Path, fake: &Path) {
     std::fs::write(fake, FAKE).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // an engine that always dies while loading, and an upstream engine that is installed and good
+    let crashy = home.join("crashy-llama-server");
+    std::fs::write(
+        &crashy,
+        FAKE.replace(
+            "mode = os.environ.get(\"FAKE_MODE\", \"ok\")",
+            "mode = \"crash\"",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&crashy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let good = home.join("good-llama-server");
+    std::fs::write(
+        &good,
+        FAKE.replace(
+            "mode = os.environ.get(\"FAKE_MODE\", \"ok\")",
+            "mode = \"ok\"",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(home.join("engines")).unwrap();
+    std::fs::write(
+        home.join("engines/engines.json"),
+        json!([{"id": "upstream-cpu-b1", "variant": "upstream-cpu", "kind": "upstream", "flavor": "upstream", "backend": "cpu", "tag": "b1", "path": good.to_string_lossy(),
+                "version": "1", "installed": 1.0, "ok": true, "problem": ""}])
+        .to_string(),
+    )
+    .unwrap();
 }
 
 fn status(addr: SocketAddr) -> Value {
@@ -242,6 +271,8 @@ fn the_engine_matches_the_python_studio() {
             200
         );
     }
+    // the early scenarios want a crash to stay a crash: the fallback is switched on where it is the subject
+    config(json!({"launch": {"fallback_on_failure": false}}));
     let model_id = |addr: SocketAddr| -> String {
         let v: Value =
             serde_json::from_slice(&http(addr, "GET", "/api/models", &[], None).body).unwrap();
@@ -404,6 +435,40 @@ fn the_engine_matches_the_python_studio() {
         &post(py.addr, &tp, "/api/engine/stop", &json!({})),
     );
     settle("slow stopped", &["stopped"], "engine exited");
+    // 3b. an engine that dies while loading: Studio starts the installed upstream engine once instead and says so
+    let set_engine = |which: &str| {
+        for (addr, tok, h) in [(rs, &tr, &hr), (py.addr, &tp, &hp)] {
+            let path = h.join(which);
+            assert_eq!(post(addr, tok, "/api/settings", &json!({"engine": {"choice": "custom", "custom_path": path.to_string_lossy()}, "launch": {"extra_env": ""}})).status, 200);
+        }
+    };
+    set_engine("crashy-llama-server");
+    config(json!({"launch": {"fallback_on_failure": true}}));
+    let (a0, b0) = start("fallback", "");
+    same("fallback just started", &a0, &b0);
+    let (a, b) = settle("fallback ready", &["ready"], "draft acceptance");
+    same("fallback ready", &a, &b);
+    assert!(
+        a["plan"]["fallback"]
+            .as_str()
+            .is_some_and(|f| f.starts_with("The engine ended while loading (exit code 3")),
+        "{}",
+        a["plan"]["fallback"]
+    );
+    same_log("fallback", &a, &b);
+    cmp_resp(
+        "stop after the fallback",
+        &post(rs, &tr, "/api/engine/stop", &json!({})),
+        &post(py.addr, &tp, "/api/engine/stop", &json!({})),
+    );
+    settle("fallback stopped", &["stopped"], "engine exited");
+    // with the switch off, the crash stays a crash
+    config(json!({"launch": {"fallback_on_failure": false}}));
+    start("no fallback", "");
+    let (a, b) = settle("no fallback crashed", &["crashed"], "engine exited");
+    same("no fallback crashed", &a, &b);
+    // a profile of its own is not rescued
+    set_engine("fake-llama-server");
     // 4. refused starts
     config(json!({"launch": {"extra_env": "FAKE_MODE=ok"}}));
     cmp_resp(

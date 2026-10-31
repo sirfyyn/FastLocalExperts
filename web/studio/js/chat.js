@@ -2,11 +2,11 @@
 // and the live panel with the engine's numbers.
 
 import { get, hostUrl, post, put, streamChat, upload } from "./api.js";
-import { emit, engineModelName, engineUp, navigate, on, refreshChats, store, topbar } from "./app.js";
+import { emit, engineModelName, engineUp, modelMenuProviders, navigate, on, refreshChats, store, topbar } from "./app.js";
 import { attachmentsEl, createAttach } from "./attach.js";
-import { buildRequest, estimateRequest, usedImages } from "./chat-request.js";
+import { attachmentBlock, buildRequest, estimateRequest, estimateTokens, usedImages } from "./chat-request.js";
 import { addChild, ensureTree, indexOf, newId, pathOf, removeBranch, siblingsOf, switchTo } from "./chat-tree.js";
-import { renderMarkdown } from "./md.js";
+import { createStreamRenderer, renderMarkdown } from "./md.js";
 import { host as appHost, replaceMessages, swapNode } from "./app-bridge.js";
 import { showAppNow, toolCardEl, waitForApproval } from "./tools-ui.js";
 import { clear, confirmDialog, copyText, debounce, fmt, h, icon, mark, meter, openMenu, ring, sparkline, stateBadge, toast } from "./ui.js";
@@ -19,6 +19,8 @@ const SUGGESTIONS = [
 ];
 
 const imageCache = new Map(); // picture file name → data URL, for requests
+const PAINT_MS = 80; // an answer that streams is drawn at most about 12 times a second
+const CURSOR = '<span class="cursor"></span>';
 
 async function loadImages(nodes) {
   for (const blob of usedImages(nodes)) {
@@ -46,6 +48,8 @@ export function mount(main, chatId) {
   let caps = { vision: false, tools: null, n_ctx: null, max_upload_mb: 25, pdf: true };
   let toolInfo = { enabled: false, tools: [], servers: [], max_rounds: 8, connecting: false };
   let toolPolls = 0;
+  let ctxHistory = { key: "", used: 0, exact: false }; // the context count, see contextUse (declared here: the first render runs early)
+  let ctxAtt = { key: "", tokens: 0 };
   let alive = true;
   const unsub = [];
 
@@ -234,7 +238,12 @@ export function mount(main, chatId) {
   function modelMenu(anchor) {
     const svc = store.engine?.service;
     if (svc) { // the service loads its own model with its own command
-      openMenu(anchor, [{ head: svc.unit }, { label: "Start, stop and log: Engine page", icon: "engine", onclick: () => navigate("/engine") }]);
+      const tail = [{ label: "Start, stop and log: Engine page", icon: "engine", onclick: () => navigate("/engine") }];
+      // Plugins add entries, for example a model switcher next to the service (plugin switch).
+      Promise.all(modelMenuProviders.map((p) => p(svc).catch(() => null))).then((lists) => {
+        const extra = lists.filter(Boolean).flat();
+        openMenu(anchor, extra.length ? [...extra, "sep", ...tail] : [{ head: svc.unit }, ...tail]);
+      });
       return;
     }
     const models = (store.state?.models || []).filter((m) => m.kind === "model" && m.complete);
@@ -397,6 +406,7 @@ export function mount(main, chatId) {
             h("button", { class: "btn ghost icon sm", title: "Delete this message and what follows", "aria-label": "Delete", disabled: !!turn, onclick: () => removeMsg(m) }, icon("trash", "sm")))));
     }
     const isLive = streaming && streaming.msg === m;
+    if (isLive) { streaming.els = {}; streaming.shape = shapeOf(streaming); }
     const cont = v.idx.byId.get(m.parent)?.role === "assistant"; // the answer goes on after a tool call
     const body = h("div", { class: "body", style: { display: "grid", gap: "8px", minWidth: 0 } });
     if (!cont) body.append(h("div", { class: "who" }, m.model || "Assistant", m.t ? h("span", { class: "faint", style: { fontWeight: 400 } }, fmt.ago(m.t)) : null));
@@ -404,8 +414,11 @@ export function mount(main, chatId) {
     const hasCalls = (m.tool_calls || []).length > 0;
     if (m.content || isLive || !hasCalls) { // a step that only calls tools shows just its tool cards
       const md = h("div", { class: `md${isLive ? " streaming" : ""}` });
-      md.innerHTML = renderMarkdown(m.content) + (isLive && !streaming.thinking && !hasCalls ? '<span class="cursor"></span>' : "");
-      if (!m.content && !isLive && !m.error) md.innerHTML = '<p class="faint">(no text)</p>';
+      if (isLive) {
+        streamInto(md, streaming.rc, m.content, !streaming.thinking && !hasCalls);
+        streaming.els.md = md;
+      } else if (!m.content && !m.error) md.innerHTML = '<p class="faint">(no text)</p>';
+      else md.innerHTML = renderMarkdown(m.content);
       body.append(md);
     }
     for (const call of m.tool_calls || []) body.append(toolCardEl(call, infoFor(call.name)));
@@ -427,9 +440,12 @@ export function mount(main, chatId) {
   function thinkEl(m, isLive) {
     const secs = m.think_s ?? (isLive && streaming.thinkStart ? (performance.now() - streaming.thinkStart) / 1000 : null);
     const label = isLive && streaming.thinking ? "Thinking" : secs ? `Thought for ${fmt.dur(secs)}` : "Thoughts";
+    const bodyEl = h("div", { class: "think-body md" });
+    if (isLive) { streamInto(bodyEl, streaming.rr, m.reasoning || "", false); streaming.els.think = bodyEl; }
+    else bodyEl.innerHTML = renderMarkdown(m.reasoning || "");
     const d = h("details", { class: `think${isLive && streaming.thinking ? " live" : ""}` },
       h("summary", null, icon("chevron", "sm chev"), icon("brain", "sm"), h("span", { class: "lbl" }, label)),
-      h("div", { class: "think-body md", html: renderMarkdown(m.reasoning || "") }));
+      bodyEl);
     if (isLive && streaming.thinking) d.open = true;
     else if (streaming?.openThink?.has(m)) d.open = true;
     d.addEventListener("toggle", () => {
@@ -482,25 +498,49 @@ export function mount(main, chatId) {
   }
 
   // How full the context window is: the engine's own count up to the last answer, an estimate for the rest.
+  // The count is made once per change of the history (a turn), not per keystroke: the history part is kept under a key
+  // made of cheap numbers (lengths), and the draft in the box is added to it. The estimate is additive over messages.
+  function historyKey(nodes, c) {
+    let n = 0;
+    for (const m of nodes) {
+      n += (m.content || "").length + (m.reasoning || "").length + (m.stats?.predicted_n || 0) + (m.attachments || []).length;
+      for (const call of m.tool_calls || []) n += (call.arguments || "").length + (typeof call.result === "string" ? call.result.length : 0);
+    }
+    const tools = toolsActive() ? toolInfo.tools.map((t) => t.name).join(",") : "";
+    return [chat.id, chat.leaf, nodes.length, n, (chat.system || c.system_prompt || "").length, tools].join("|");
+  }
+
+  function draftTokens(draft) {
+    const key = attach.items.map((a) => `${a.kind}:${a.blob || a.name}:${a.text?.length || 0}`).join(",");
+    if (ctxAtt.key !== key) {
+      ctxAtt = { key, tokens: attach.items.reduce((sum, a) => sum + (a.kind === "text" ? estimateTokens(attachmentBlock(a)) : 600), 0) };
+    }
+    return draft || attach.items.length ? estimateTokens(draft) + ctxAtt.tokens + 4 : 0;
+  }
+
   function contextUse() {
     const c = store.state?.settings?.chat || {};
     const nctx = caps.n_ctx || store.engine?.n_ctx;
     const nodes = pathOf(chat);
-    const draft = ta.value.trim();
-    if (draft || attach.items.length) nodes.push({ role: "user", content: draft, attachments: attach.items });
-    const images = new Map(usedImages(nodes).map((b) => [b, "x"]));
-    const opts = { system: chat.system || c.system_prompt, settings: c, tools: toolsActive() ? toolInfo.tools.map((t) => t.schema) : [], images };
-    let used = estimateRequest(buildRequest({ nodes, ...opts }));
-    let exact = false;
-    for (let k = nodes.length - 1; k >= 0; k -= 1) {
-      const s = nodes[k].stats;
-      if (s?.predicted_n) {
-        used = used - estimateRequest(buildRequest({ nodes: nodes.slice(0, k + 1), ...opts })) + (s.cache_n || 0) + (s.prompt_n || 0) + (s.predicted_n || 0);
-        exact = k === nodes.length - 1;
-        break;
+    const key = historyKey(nodes, c);
+    if (ctxHistory.key !== key) {
+      const images = new Map(usedImages(nodes).map((b) => [b, "x"]));
+      const opts = { system: chat.system || c.system_prompt, settings: c, tools: toolsActive() ? toolInfo.tools.map((t) => t.schema) : [], images };
+      let used = estimateRequest(buildRequest({ nodes, ...opts }));
+      let exact = false;
+      for (let k = nodes.length - 1; k >= 0; k -= 1) {
+        const s = nodes[k].stats;
+        if (s?.predicted_n) {
+          used = used - estimateRequest(buildRequest({ nodes: nodes.slice(0, k + 1), ...opts })) + (s.cache_n || 0) + (s.prompt_n || 0) + (s.predicted_n || 0);
+          exact = k === nodes.length - 1;
+          break;
+        }
       }
+      ctxHistory = { key, used, exact };
     }
-    return { used: Math.max(0, Math.round(used)), nctx, exact };
+    const draft = ta.value.trim();
+    const extra = draftTokens(draft);
+    return { used: Math.max(0, Math.round(ctxHistory.used + extra)), nctx, exact: ctxHistory.exact && !extra };
   }
 
   function renderComposer() {
@@ -681,12 +721,13 @@ export function mount(main, chatId) {
     if (chat.id) await save();
   }
 
-  function requestFor(node, useTools, images) {
+  // lastRound: no more tool calls. The tools stay in the request (same prompt, cache kept); tool_choice "none" stops the call.
+  function requestFor(node, useTools, images, lastRound = false) {
     const c = store.state?.settings?.chat || {};
     const idx = indexOf(chat);
     const nodes = [];
     for (let cur = node.parent ? idx.byId.get(node.parent) : null; cur; cur = cur.parent ? idx.byId.get(cur.parent) : null) nodes.unshift(cur);
-    return buildRequest({ nodes, system: chat.system || c.system_prompt, settings: c,
+    return buildRequest({ nodes, system: chat.system || c.system_prompt, settings: c, noMoreTools: lastRound,
       tools: useTools ? toolInfo.tools.map((t) => t.schema) : [], images: caps.vision ? images : new Map() });
   }
 
@@ -698,8 +739,9 @@ export function mount(main, chatId) {
     let node = first;
     try {
       for (let round = 0; ; round += 1) {
-        const useTools = toolsActive() && round < (toolInfo.max_rounds || 8);
-        await generateInto(node, useTools, ctrl);
+        const lastRound = round >= (toolInfo.max_rounds || 8);
+        await generateInto(node, toolsActive(), ctrl, lastRound);
+        if (lastRound) { delete node.tool_calls; break; } // the limit is reached; a call that came anyway does not run
         if (ctrl.signal.aborted || node.error || !(node.tool_calls || []).length) break;
         await save();
         await executeCalls(node, ctrl);
@@ -719,15 +761,15 @@ export function mount(main, chatId) {
     }
   }
 
-  async function generateInto(asst, useTools, ctrl) {
+  async function generateInto(asst, useTools, ctrl, lastRound = false) {
     const images = await loadImages(pathOf(chat).filter((m) => m !== asst));
     streaming = { msg: asst, ctrl, t0: performance.now(), tFirst: 0, thinking: false, thinkStart: 0, raw: "", split: false,
-      openThink: new Set(), frame: 0 };
+      openThink: new Set(), frame: 0, lastPaint: 0, shape: "", els: {}, rc: createStreamRenderer(), rr: createStreamRenderer() };
     renderMessages();
     scrollBottom();
     renderComposer();
     try {
-      await streamChat(requestFor(asst, useTools, images), { signal: ctrl.signal, onChunk });
+      await streamChat(requestFor(asst, useTools, images, lastRound), { signal: ctrl.signal, onChunk });
     } catch (e) {
       if (e.name === "AbortError") asst.stopped = true;
       else {
@@ -748,7 +790,7 @@ export function mount(main, chatId) {
     for (const c of calls) { if (!c.id) c.id = `call_${newId()}`; c.status = "pending"; }
     if (calls.length) asst.tool_calls = calls; else delete asst.tool_calls;
     streaming = null;
-    cancelAnimationFrame(s.frame);
+    clearTimeout(s.frame);
     renderMessages();
     renderComposer();
     scrollBottom();
@@ -859,21 +901,57 @@ export function mount(main, chatId) {
         cache_n: t.cache_n, accept: t.draft_n ? (t.draft_n_accepted || 0) / t.draft_n : null, draft_n: t.draft_n || 0,
       };
     }
-    if (!s.frame) {
-      s.frame = requestAnimationFrame(() => {
-        if (!streaming) return;
-        streaming.frame = 0;
+    if (!s.frame) { // at most one drawing per PAINT_MS, however fast the chunks come
+      const wait = Math.max(0, PAINT_MS - (performance.now() - s.lastPaint));
+      s.frame = setTimeout(() => {
+        if (streaming !== s) return;
+        s.frame = 0;
+        s.lastPaint = performance.now();
         paintStreaming();
-      });
+      }, wait);
     }
+  }
+
+  // What the structure of the streaming message depends on. While it stays the same, only the text is added to the
+  // two markdown bodies; when it changes (a thinking block appears, a tool call comes) the message is built again.
+  function shapeOf(s) {
+    const m = s.msg;
+    if ((m.tool_calls || []).length) return ""; // a card with growing arguments: always built again
+    return [!!m.reasoning, s.thinking, !!m.content, m.think_s ?? "", m.stats?.predicted_n ?? ""].join();
+  }
+
+  // Write `text` into a markdown body made of two parts: `.md-stable` (finished blocks, only ever added to) and
+  // `.md-tail` (the open rest, written again). See createStreamRenderer in md.js.
+  function streamInto(box, renderer, text, cursor) {
+    const { tail } = renderer.update(text);
+    box.replaceChildren(h("div", { class: "md-stable", html: renderer.html }), h("div", { class: "md-tail", html: tail + (cursor ? CURSOR : "") }));
+  }
+
+  function patchStream(box, renderer, text, cursor) {
+    const { reset, fresh, tail } = renderer.update(text);
+    const [stable, rest] = box.children;
+    if (reset) stable.innerHTML = fresh;
+    else if (fresh) stable.insertAdjacentHTML("beforeend", fresh);
+    rest.innerHTML = tail + (cursor ? CURSOR : "");
   }
 
   function paintStreaming() {
     const s = streaming;
+    const m = s.msg;
+    const shape = shapeOf(s);
+    if (shape && shape === s.shape && s.els.md?.isConnected && (!m.reasoning || s.els.think?.isConnected)) {
+      patchStream(s.els.md, s.rc, m.content, !s.thinking);
+      if (s.els.think) {
+        patchStream(s.els.think, s.rr, m.reasoning, false);
+        if (s.thinking) s.els.think.scrollTop = s.els.think.scrollHeight;
+      }
+      scrollBottom();
+      return;
+    }
     const v = view();
-    const i = v.path.indexOf(s.msg);
-    const old = inner.querySelector(`.msg[data-id="${s.msg.id}"]`);
-    const fresh = msgEl(s.msg, i, v);
+    const i = v.path.indexOf(m);
+    const old = inner.querySelector(`.msg[data-id="${m.id}"]`);
+    const fresh = msgEl(m, i, v);
     if (old) {
       const thinkBody = old.querySelector(".think-body");
       const keepScroll = thinkBody ? thinkBody.scrollTop : 0;

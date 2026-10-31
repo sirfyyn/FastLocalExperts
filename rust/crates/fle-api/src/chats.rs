@@ -202,7 +202,7 @@ impl Chats {
             out.push((
                 updated.as_f64().unwrap_or(0.0),
                 json!({"id": d.get("id").cloned().unwrap_or(json!(stem)), "title": title, "updated": updated,
-                       "model": d.get("model").cloned().unwrap_or(json!("")), "messages": active_path(&nodes, &leaf).len()}),
+                       "model": d.get("model").cloned().unwrap_or(json!("")), "favorite": d.get("favorite").is_some_and(py_truthy), "messages": active_path(&nodes, &leaf).len()}),
             ));
         }
         // newest first; equal times keep their order (Python's sort with reverse=True is stable)
@@ -269,7 +269,7 @@ impl Chats {
             .unwrap_or(json!(now));
         let chat = json!({
             "id": ident, "version": VERSION, "title": title.chars().take(120).collect::<String>(), "created": created, "updated": now,
-            "model": s("model"), "system": s("system"), "leaf": leaf, "messages": nodes,
+            "model": s("model"), "system": s("system"), "favorite": data.get("favorite").is_some_and(py_truthy), "leaf": leaf, "messages": nodes,
         });
         let text = serde_json::to_string(&chat).unwrap();
         if text.len() > MAX_BYTES {

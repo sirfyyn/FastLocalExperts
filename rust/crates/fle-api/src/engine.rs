@@ -111,6 +111,8 @@ pub fn port_taken(port: i64) -> bool {
 }
 
 type Listener = Box<dyn Fn(&str) + Send + Sync>;
+/// Asked when the engine ends before it was ready (not stopped by the user): the plan to start instead, if any.
+pub type LoadFailure = Box<dyn Fn(&Plan, i32, &str) -> Option<Plan> + Send + Sync>;
 
 struct State {
     state: String, // stopped | starting | ready | stopping | crashed | attached
@@ -152,6 +154,7 @@ pub struct Engine {
     ops: Sender<Op>,
     log_dir: PathBuf,
     listeners: Arc<Mutex<Vec<Listener>>>,
+    on_load_failure: Arc<Mutex<Option<LoadFailure>>>,
 }
 
 fn is_running(c: &Arc<Mutex<Child>>) -> bool {
@@ -195,6 +198,7 @@ impl Engine {
             ops: tx,
             log_dir,
             listeners: Arc::new(Mutex::new(vec![])),
+            on_load_failure: Arc::new(Mutex::new(None)),
         };
         let sup = e.clone();
         std::thread::Builder::new()
@@ -206,6 +210,10 @@ impl Engine {
 
     pub fn add_listener(&self, l: Listener) {
         self.listeners.lock().unwrap().push(l);
+    }
+
+    pub fn set_on_load_failure(&self, f: LoadFailure) {
+        *self.on_load_failure.lock().unwrap() = Some(f);
     }
 
     pub fn set_restart_on_crash(&self, on: bool) {
@@ -461,6 +469,10 @@ impl Engine {
             cmd.env("PATH", format!("{};{path}", dir.display()));
         }
         self.open_log();
+        if !plan.fallback.is_empty() {
+            // first line of the new run's log file (the failed run's file is closed by now)
+            self.append(&format!("FLE Studio: {}", plan.fallback));
+        }
         let start_line = format!("$ {}", plan.command_line().replace('\n', " "));
         self.append(&start_line);
         for l in self.listeners.lock().unwrap().iter() {
@@ -605,6 +617,8 @@ impl Engine {
 
     fn on_exit(&self, gen: u64, rc: i32) {
         let mut again: Option<Plan> = None;
+        let mut failed_load: Option<Plan> = None;
+        let error;
         {
             let mut s = self.st.lock().unwrap();
             if s.proc.as_ref().map(|p| p.0) != Some(gen) {
@@ -634,6 +648,11 @@ impl Engine {
                             format!(": {last}")
                         };
                 }
+                if s.ready_at == 0.0 {
+                    if let Some((_, p)) = s.plan.as_ref().filter(|(_, p)| p.fallback.is_empty()) {
+                        failed_load = Some(p.clone());
+                    }
+                }
                 let t = now();
                 s.crashes.push_back(t);
                 if s.crashes.len() > 10 {
@@ -644,9 +663,16 @@ impl Engine {
                     again = s.plan.as_ref().map(|p| p.1.clone());
                 }
             }
+            error = s.error.clone();
         }
         self.append(&format!("FLE Studio: engine exited with code {rc}"));
         self.close_log();
+        if let Some(failed) = failed_load {
+            if self.on_load_failure.lock().unwrap().is_some() {
+                self.start_fallback(&failed, rc, &error);
+                return;
+            }
+        }
         if let Some(plan) = again {
             self.append("FLE Studio: restart on crash is on; starting the engine again in 5 s");
             let me = self.clone();
@@ -656,6 +682,21 @@ impl Engine {
                     me.append(&format!("FLE Studio: not restarted. {m}"));
                 }
             });
+        }
+    }
+
+    /// The engine ended while loading: start the plan the owner offers instead, once, and say so in the log.
+    fn start_fallback(&self, failed: &Plan, rc: i32, error: &str) {
+        let replacement = self
+            .on_load_failure
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|f| f(failed, rc, error));
+        let Some(plan) = replacement else { return };
+        // `start` writes the reason as the first line of the new log
+        if let Err(EngineErr::Busy(m) | EngineErr::Invalid(m)) = self.start(plan) {
+            self.append(&format!("FLE Studio: the fallback start did not work: {m}"));
         }
     }
 

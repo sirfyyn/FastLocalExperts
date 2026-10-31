@@ -11,42 +11,24 @@ class ApiError extends Error {
   }
 }
 
-// ----------------------------------------------------------------------------------------------- hosts
-// The page always talks to its own Studio. When another host is chosen (hosts.js), every /api/ and /v1/ request goes
-// to /h/<host id>/…, which this Studio passes on to the host with this client's token. Doing it on fetch itself means
-// pages and helpers that call fetch directly need no special case. Choosing a host reloads the page.
+// ----------------------------------------------------------------------------------------------- transport
+// Where a call goes is a plugin's business: with the Remote access plugin and another host chosen, every /api/ and /v1/
+// request goes to /h/<host id>/…, which this Studio passes on to the host. The plugin fills in this object before the
+// page asks for anything (a boot script with `early`). Doing it on fetch itself means pages and helpers that call fetch
+// directly need no special case. Without a plugin every path stays as it is.
 
-const HOST = (() => {
-  try { return localStorage.getItem("fle-host") || ""; } catch { return ""; }
-})();
-
-export const activeHostId = () => HOST;
+export const transport = {
+  url: (path) => path, // the address to use for a path
+  confirm: null, // async (method, path) => bool: a host asks the person at this page to confirm an install
+  problem: null, // (details) => void: a call failed because of the host (not reachable, certificate changed)
+  gone: null, // (status, data) => bool: true when the answer means the chosen host does not exist any more (handled)
+};
 
 // The address to use for a path that the page puts into a link or an <img>/<a download> itself.
-export function hostUrl(path) {
-  return HOST && /^\/(api|v1|app-frame)\//.test(path) && !path.startsWith("/api/hosts") ? `/h/${HOST}${path}` : path;
-}
+export const hostUrl = (path) => transport.url(path);
 
 const nativeFetch = window.fetch.bind(window);
 window.fetch = (input, init) => nativeFetch(typeof input === "string" ? hostUrl(input) : input, init);
-
-function hostProblem(details) {
-  if (details?.code === "unreachable" || details?.code === "fingerprint_changed" || details?.code === "unpaired") {
-    window.dispatchEvent(new CustomEvent("fle-host-problem", { detail: details }));
-  }
-}
-
-async function confirmOnHost(method, path) {
-  const { confirmDialog } = await import("./ui.js");
-  let name = "this host";
-  try { name = localStorage.getItem("fle-host-name") || name; } catch { /* storage blocked */ }
-  return confirmDialog({
-    title: "Confirm on the host",
-    body: `This changes ${name}: ${method} ${path}. Go ahead?`,
-    ok: "Confirm",
-    danger: true,
-  });
-}
 
 // FLE Studio was restarted and this page still holds the old run's token: reload once to get the new one.
 // At most every 15 s, so a server that keeps refusing cannot put the page into a reload loop.
@@ -84,8 +66,8 @@ async function api(method, path, body) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = null; }
   // A host asks for a confirmation of installs and updates; the person at this page gives it, the call is repeated.
-  if (res.status === 428 && data?.error?.confirm && !opts.headers["X-FLE-Confirm"]) {
-    if (!(await confirmOnHost(method, path))) throw new ApiError(0, "Cancelled");
+  if (res.status === 428 && data?.error?.confirm && transport.confirm && !opts.headers["X-FLE-Confirm"]) {
+    if (!(await transport.confirm(method, path))) throw new ApiError(0, "Cancelled");
     opts.headers["X-FLE-Confirm"] = "1";
     const again = await fetch(path, opts);
     const raw = await again.text();
@@ -93,13 +75,11 @@ async function api(method, path, body) {
     if (!again.ok) throw new ApiError(again.status, data?.error?.message || `${again.status} ${again.statusText}`, data?.error);
     return data;
   }
-  if (res.status === 404 && HOST && /^This host is not in the list/.test(data?.error?.message || "")) {
-    try { localStorage.removeItem("fle-host"); localStorage.removeItem("fle-host-name"); } catch { /* storage blocked */ }
-    location.href = "/";  // the host was removed (maybe in another tab): back to this machine
+  if (res.status === 404 && transport.gone?.(res.status, data)) {
     throw new ApiError(404, "That host is gone; going back to this machine");
   }
   if (!res.ok) {
-    hostProblem(data?.error);
+    transport.problem?.(data?.error);
     throw new ApiError(res.status, data?.error?.message || `${res.status} ${res.statusText}`, data?.error);
   }
   return data;
@@ -124,7 +104,7 @@ export async function streamChat(body, { signal, onChunk }) {
     let msg = `${res.status} ${res.statusText}`;
     let details = null;
     try { details = (await res.json())?.error || null; msg = details?.message || msg; } catch { /* keep status text */ }
-    hostProblem(details);
+    transport.problem?.(details);
     throw new ApiError(res.status, msg, details);
   }
   const reader = res.body.getReader();

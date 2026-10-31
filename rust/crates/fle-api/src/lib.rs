@@ -11,6 +11,7 @@ pub mod hf;
 pub mod launch;
 pub mod library;
 pub mod live;
+pub mod planview;
 pub mod report_time;
 pub mod run;
 pub mod server;

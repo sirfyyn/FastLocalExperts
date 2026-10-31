@@ -51,7 +51,7 @@ fn src() -> Option<PathBuf> {
         .map(PathBuf::from)
         .ok()
         .into_iter()
-        .chain([h.join("fle-studio-020/src"), h.join("fle-studio/src")])
+        .chain([h.join("fle-studio-main/src"), h.join("fle-studio/src")])
         .find(|p| p.join("fle_studio/gguf.py").exists())
 }
 
