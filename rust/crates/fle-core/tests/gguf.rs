@@ -250,7 +250,7 @@ fn matches_the_python_helper() {
     let rs = read_model(&p).unwrap().summary();
     assert_eq!(
         py_json(&rs) + "\n",
-        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n"), // Python writes CRLF on Windows
         "the text differs from the Python helper"
     );
     for (k, v) in rs.as_object().unwrap() {
