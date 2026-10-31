@@ -319,7 +319,9 @@ namespace GGUFMeta {
 
         bool type_ok = false;
         switch (arr_info.gt) {
-            case GGUF_TYPE_UINT32:
+            case GGUF_TYPE_UINT32:  type_ok = (std::is_same<T,     int32_t>::value) ||
+                                              (std::is_same<T,    uint32_t>::value) ||
+                                              (std::is_same<T,    uint64_t>::value); break;
             case GGUF_TYPE_INT32:   type_ok = (std::is_same<T,     int32_t>::value) ||
                                               (std::is_same<T,    uint32_t>::value); break;
             case GGUF_TYPE_UINT64:  type_ok = (std::is_same<T,    uint64_t>::value); break;
@@ -339,6 +341,16 @@ namespace GGUFMeta {
             for (size_t i = 0; i < n_items; i++) {
                 const T value = gguf_get_arr_str(ctx, kid, i);
                 result.emplace_back(value);
+            }
+        } else if constexpr (std::is_same<T, uint64_t>::value) {
+            result.resize(arr_info.length);
+            if (arr_info.gt == GGUF_TYPE_UINT32) {
+                const uint32_t * src = (const uint32_t *) arr_info.data;
+                for (size_t i = 0; i < arr_info.length; i++) {
+                    result[i] = src[i];
+                }
+            } else {
+                result.assign((const T*)arr_info.data, (const T *)arr_info.data + arr_info.length);
             }
         } else {
             result.resize(arr_info.length);
@@ -414,8 +426,12 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint32_t, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<uint32_t, LLAMA_MAX_LAYERS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<uint64_t>>(enum llm_kv kid, std::vector<uint64_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
     template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
+    // Project Maya's engram keys are read by their literal arch-prefixed names.
+    template bool llama_model_loader::get_arr<uint32_t>(const std::string & key, std::vector<uint32_t> & result, bool required);
+    template bool llama_model_loader::get_arr<uint64_t>(const std::string & key, std::vector<uint64_t> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -441,6 +457,7 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<int32_t>    (enum llm_kv kid, int32_t & result,     bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
 
     template<>
@@ -1258,6 +1275,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        // the deepseek41 Engram table (~200 GB) is a CPU get_rows gather table: never put it in device memory
+        if (get_arch() == LLM_ARCH_DEEPSEEK41 && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD && !ggml_backend_buft_is_host(buft)) {
+            LLAMA_LOG_WARN("llama_model_loader: %s (%zu MiB %s) must stay in host memory; ignoring placement on %s, using %s\n",
+                    tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
+                    ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
+            buft = ggml_backend_cpu_buffer_type();
         }
 
         // avoid using a host buffer when using mmap

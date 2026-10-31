@@ -439,10 +439,11 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_IQ2_KT  = 43, // ik_llama trellis (QTIP), 2.125 bpw
-        GGML_TYPE_IQ3_KT  = 44, // ik_llama trellis (QTIP), 3.125 bpw
-        GGML_TYPE_IQ4_KT  = 45, // ik_llama trellis (QTIP), 4.0 bpw
-        GGML_TYPE_COUNT   = 46,
+        GGML_TYPE_MXFP8   = 43, // MXFP8 (E4M3, E8M0 scale), gather-only
+        GGML_TYPE_IQ2_KT  = 44, // ik_llama trellis (QTIP), 2.125 bpw
+        GGML_TYPE_IQ3_KT  = 45, // ik_llama trellis (QTIP), 3.125 bpw
+        GGML_TYPE_IQ4_KT  = 46, // ik_llama trellis (QTIP), 4.0 bpw
+        GGML_TYPE_COUNT   = 47,
     };
 
     // precision
@@ -1459,6 +1460,17 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // set the minimum required accumulator type (MUL_MAT / MUL_MAT_ID / FLASH_ATTN_EXT)
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // set the smallest rank the implementation may use for src[idx] (MUL_MAT / MUL_MAT_ID)
+    GGML_API bool ggml_prec_set_src(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec,
+            int                  idx);
 
     // change the hint of a matrix multiplication
     GGML_API void ggml_mul_mat_set_hint(

@@ -68,6 +68,9 @@ struct llama_ubatch {
     std::shared_ptr<data_t> data;
 };
 
+// crash if a mixed ubatch reaches code that expects only tokens or only embd
+#define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT((ubatch).token || (ubatch).embd)
+
 // a helper for sanitizing, fulfilling and splitting a batch
 class llama_batch_allocr {
 public:
