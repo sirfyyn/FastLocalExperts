@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod chat;
 pub mod download;
 pub mod engines;
+pub mod gguf;
 pub mod plan;
 pub mod policy;
 pub mod server;

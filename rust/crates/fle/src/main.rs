@@ -27,6 +27,13 @@ enum Cmd {
     Models,
     /// Load a model and keep serving it (OpenAI-compatible API) until Ctrl+C
     Run { model: String },
+    /// Read a model's header: architecture, parts, expert bytes, KV cache (no weights are loaded)
+    Inspect {
+        /// model file, first shard, or the folder that contains the shards
+        model: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask one question and print the answer (loads the model for the duration)
     Ask {
         model: String,
@@ -107,6 +114,45 @@ fn main() -> Result<()> {
                     "",
                     m.note
                 );
+            }
+            Ok(())
+        }
+        Some(Cmd::Inspect { model, json }) => {
+            let m = fle_core::gguf::read_model(&model)?;
+            let sm = m.summary();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sm)?);
+                return Ok(());
+            }
+            let n = |k: &str| sm[k].as_u64().map(|v| v.to_string()).unwrap_or("-".into());
+            println!("{}  ({})", m.name, m.arch);
+            println!(
+                "  size        {} in {} part(s){}",
+                system::gib(m.size),
+                m.parts.len(),
+                if m.complete() { "" } else { "  INCOMPLETE" }
+            );
+            println!(
+                "  layers      {}   context {}   experts {} (used {})",
+                n("layers"),
+                n("context_length"),
+                n("experts"),
+                n("experts_used")
+            );
+            println!(
+                "  expert data {}   always-needed {}   input tables {}",
+                system::gib(m.expert_bytes),
+                system::gib(m.gpu_bytes),
+                system::gib(m.input_bytes)
+            );
+            println!(
+                "  KV cache    {} bytes/token (q8_0)   {} (f16)",
+                n("kv_bytes_per_token_q8"),
+                n("kv_bytes_per_token_f16")
+            );
+            println!("  quant types:");
+            for (t, (c, b)) in &m.type_histogram {
+                println!("    {t:<8} {c:>5} tensors  {}", system::gib(*b));
             }
             Ok(())
         }
