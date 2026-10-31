@@ -18,7 +18,7 @@ pub fn defaults() -> Map<String, Value> {
         "engine": {"choice": "auto", "custom_path": "", "upstream_tag": "b11540", "fle_tag": "latest"},
         "launch": {
             "profile": "auto", "context": 32768, "parallel": 1, "mtp": true, "spec": "auto", "gpu_cache_mib": 0, "gpus": "auto",
-            "threads": 0, "cpu_mask": "", "pinned_load": "auto", "prompt_cache_mib": -1, "port": 0, "extra_args": "", "extra_env": "",
+            "threads": 0, "cpu_mask": "", "pinned_load": "auto", "prompt_cache_mib": -1, "port": 0, "extra_args": "", "extra_env": "", "fallback_on_failure": true,
             "restart_on_crash": false, "autostart": false
         },
         "chat": {
@@ -29,9 +29,11 @@ pub fn defaults() -> Map<String, Value> {
             "enabled": true, "max_rounds": 8, "call_timeout": 60, "calculator": true, "datetime": true, "files": false, "files_dir": "",
             "web_search": false, "web_search_confirm": true, "web_search_url": "", "mcp_enabled": true, "mcp_json": "", "mcp_trusted": []
         },
+        "capture": {"enabled": false, "max_mb": 2048},
         "forge": {"tools_dir": ""},
         "attach_url": "",
         "attach_service": "",
+        "switch_url": "",
         "attach_key": "",
         "attach_auto": false,
         "last_model": "",

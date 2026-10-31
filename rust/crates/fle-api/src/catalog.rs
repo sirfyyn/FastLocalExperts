@@ -104,3 +104,12 @@ pub fn catalog(sys: &Value) -> Vec<Map<String, Value>> {
         })
         .collect()
 }
+
+/// The MTP state of a catalog model for a badge: `ready` (both sidecars there), `missing` or `none`.
+pub fn mtp_status(supported: bool, head: bool, vocab: bool) -> Value {
+    if !supported {
+        return json!({"state": "none", "label": "no MTP", "head": false, "vocab": false});
+    }
+    let ready = head && vocab;
+    json!({"state": if ready { "ready" } else { "missing" }, "label": if ready { "MTP ready" } else { "MTP files missing" }, "head": head, "vocab": vocab})
+}

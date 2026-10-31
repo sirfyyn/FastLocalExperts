@@ -52,27 +52,44 @@ export function userContent(node, images = new Map()) {
   return [{ type: "text", text: text || " " }, ...pics.map((a) => ({ type: "image_url", image_url: { url: images.get(a.blob) } }))];
 }
 
-function toolMessages(node) {
+function toolMessages(node, withReasoning) {
   const calls = (node.tool_calls || []).filter((c) => c.name);
   if (!calls.length) return [];
   const asked = { role: "assistant", content: node.content || "", tool_calls: calls.map((c) => ({
     id: c.id, type: "function", function: { name: c.name, arguments: c.arguments || "{}" } })) };
+  if (withReasoning && node.reasoning) asked.reasoning_content = node.reasoning;
   const answers = calls.map((c) => ({ role: "tool", tool_call_id: c.id,
     content: typeof c.result === "string" && c.result ? c.result : "The call was interrupted before it finished." }));
   return [asked, ...answers];
 }
 
+// The thoughts of an answer travel back only for the messages after the last user message, which is where the chat
+// templates (Qwen and others) keep them. Then the prompt of the next step starts with exactly the text the engine
+// has already read, and its prompt cache holds. Older thoughts are left out, as the templates do themselves.
 export function apiMessages(nodes, images = new Map()) {
   const out = [];
-  for (const m of nodes) {
+  let lastUser = -1;
+  nodes.forEach((m, i) => { if (m.role === "user") lastUser = i; });
+  nodes.forEach((m, i) => {
     if (m.role === "user") out.push({ role: "user", content: userContent(m, images) });
     else if (m.role === "assistant") {
-      const withTools = toolMessages(m);
+      const withReasoning = i > lastUser;
+      const withTools = toolMessages(m, withReasoning);
       if (withTools.length) out.push(...withTools);
-      else if (m.content) out.push({ role: "assistant", content: m.content });
+      else if (m.content) {
+        const msg = { role: "assistant", content: m.content };
+        if (withReasoning && m.reasoning) msg.reasoning_content = m.reasoning;
+        out.push(msg);
+      }
     }
-  }
+  });
   return out;
+}
+
+// By name, so that the same set of tools is always the same text in the prompt.
+export function sortedTools(tools) {
+  const name = (t) => String(t?.function?.name ?? "");
+  return [...tools].sort((a, b) => (name(a) < name(b) ? -1 : name(a) > name(b) ? 1 : 0));
 }
 
 export function usedImages(nodes) {
@@ -80,7 +97,9 @@ export function usedImages(nodes) {
 }
 
 // nodes: the conversation up to (not including) the message that will be generated.
-export function buildRequest({ nodes, system = "", settings = {}, tools = [], images = new Map(), extra = {} }) {
+// noMoreTools: the last round of a turn. The tools stay in the request, only `tool_choice: "none"` stops the call:
+// taking the tools out would change the front of the prompt and make the engine read all of it again.
+export function buildRequest({ nodes, system = "", settings = {}, tools = [], images = new Map(), extra = {}, noMoreTools = false }) {
   const msgs = apiMessages(nodes, images);
   if (system) msgs.unshift({ role: "system", content: system });
   const body = { messages: msgs, stream_options: { include_usage: true },
@@ -90,7 +109,10 @@ export function buildRequest({ nodes, system = "", settings = {}, tools = [], im
       min_p: settings.min_p, presence_penalty: settings.presence_penalty });
   }
   if (settings.max_tokens > 0) body.max_tokens = settings.max_tokens;
-  if (tools.length) body.tools = tools;
+  if (tools.length) {
+    body.tools = sortedTools(tools);
+    if (noMoreTools) body.tool_choice = "none";
+  }
   Object.assign(body, extra);
   return finalizeRequest(body);
 }
@@ -101,6 +123,7 @@ export function estimateRequest(body) {
   for (const m of body.messages) {
     if (typeof m.content === "string") total += estimateTokens(m.content) + 4;
     else for (const p of m.content || []) total += p.type === "text" ? estimateTokens(p.text) : 600;
+    if (m.reasoning_content) total += estimateTokens(m.reasoning_content);
     for (const c of m.tool_calls || []) total += estimateTokens(c.function.name + c.function.arguments) + 8;
   }
   if (body.tools) total += estimateTokens(JSON.stringify(body.tools));

@@ -307,6 +307,11 @@ fn the_proxy_and_the_live_numbers_match_the_python_studio() {
         );
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     }
+    // the sampler runs only while somebody looks: a first look now, so the counters are read from the attach on
+    for addr in [rs, py.addr] {
+        assert_eq!(http(addr, "GET", "/api/live", &[], None).status, 200);
+    }
+    std::thread::sleep(Duration::from_millis(1500));
     both("models", "GET", "/v1/models", &[], None);
     both(
         "echo get with query",

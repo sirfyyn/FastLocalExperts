@@ -32,6 +32,13 @@ fn seed(home: &Path) {
         false,
     );
     std::fs::write(m.join(FLE).join("mtp/fle-mtp-vocab-32k.txt"), b"vocab").unwrap();
+    // a catalog model with both parts (tiny files): complete, supports MTP, but its head and vocabulary are not there
+    mk(
+        &format!("{FLE}/IQ3_M/Qwen3.8-Flash-Next-FLE-IQ3_M-00002-of-00002.gguf"),
+        "qwen3moe",
+        "Whatever",
+        true,
+    );
     // a catalog model whose second part is being downloaded
     mk(
         &format!("{FLE}/IQ2_M/Qwen3.8-Flash-Next-FLE-IQ2_M-00001-of-00002.gguf"),
@@ -192,6 +199,64 @@ fn models_catalog_and_downloads_match_the_python_studio() {
         both(&format!("add {i}"), "POST", "/api/models/add", Some(body));
         both(&format!("models after add {i}"), "GET", "/api/models", None);
     }
+    // the plan preview (no engine is installed here: an answer with the fix, not a failure)
+    let plan_body = |m: &str, extra: &str| format!("{{\"model\": \"{m}\"{extra}}}");
+    let iq3 = "{model:Qwen3.8-Flash-Next-FLE-IQ3_M-00001-of-00002.gguf}";
+    both(
+        "plan, a catalog model needing MTP files",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body(iq3, "")),
+    );
+    both(
+        "plan, a model with no catalog entry",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body("{model:UP.GGUF}", "")),
+    );
+    both(
+        "plan, nothing chosen",
+        "POST",
+        "/api/engine/plan",
+        Some("{}"),
+    );
+    both(
+        "plan, unknown model",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body("ffffffffffff", "")),
+    );
+    both(
+        "plan, incomplete model",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body(
+            "{model:Qwen3.8-Flash-Next-FLE-IQ2_M-00001-of-00002.gguf}",
+            "",
+        )),
+    );
+    both(
+        "plan, a profile",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body(
+            "{model:UP.GGUF}",
+            ", \"profile\": \"fle-reference\"",
+        )),
+    );
+    both(
+        "plan, unknown profile",
+        "POST",
+        "/api/engine/plan",
+        Some(&plan_body("{model:UP.GGUF}", ", \"profile\": \"nope\"")),
+    );
+    both("plan bad body", "POST", "/api/engine/plan", Some("nope"));
+    both(
+        "preview, a catalog model without an engine",
+        "POST",
+        "/api/engine/preview",
+        Some(&plan_body(iq3, "")),
+    );
     both(
         "remove import",
         "POST",

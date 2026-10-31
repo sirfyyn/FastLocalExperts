@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// The version the page is told (the Python Studio this server replaces).
-pub const STUDIO_VERSION: &str = "0.2.0";
+pub const STUDIO_VERSION: &str = "0.4.1";
 
 #[derive(Default, Clone)]
 pub struct RunOptions {

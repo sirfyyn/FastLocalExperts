@@ -2,9 +2,7 @@
 
 import { del, get } from "./api.js";
 import { initChatSearch, searchActive } from "./chat-search.js";
-import { initHosts } from "./hosts.js";
 import { clear, confirmDialog, fmt, h, icon, stateBadge, toast } from "./ui.js";
-import { initUpdates } from "./update.js";
 
 // ----------------------------------------------------------------------------------------------- store
 
@@ -16,6 +14,7 @@ export const store = {
   chats: [],
   downloads: [],
   online: true,
+  plugins: [], // /api/plugins: the plugins of this machine, see plugin-page.js
 };
 
 const subs = new Map();
@@ -47,6 +46,44 @@ export async function refreshChats() {
   renderChatList();
 }
 
+export async function refreshPlugins() {
+  const r = await get("/api/plugins");
+  store.plugins = r.plugins;
+  navKey = "";
+  renderNav();
+  return r;
+}
+
+// What plugins add to the Settings page: {order, build(ui)} where ui is what settings.js passes to its own sections
+// (section, field, toggle, save, render). The core sections have the orders 10, 20, 30 … (see settings.js).
+export const settingsSections = [];
+
+// Entries that plugins add to the chat's model menu of an attached service: async (service) => items | null
+// (items as openMenu in ui.js takes them). The model switcher plugin is one.
+export const modelMenuProviders = [];
+
+// Entries that plugins put at the top of the chat list: (pathname) => element | null. After a change the plugin
+// calls renderChatList(). The recorder plugin has the Live entry here.
+export const chatListHeads = [];
+
+// A plugin's boot script (plugins.py ctx.boot) runs once per page load and may add Settings sections, sidebar
+// notices and the like. A script that fails is reported and does not stop the page.
+const booted = new Set();
+async function bootPlugins(early) {
+  const { makeKit } = await import("./plugin-kit.js");
+  for (const p of store.plugins) {
+    if (!p.loaded || !p.boot || booted.has(p.id) || !!p.boot_early !== early) continue;
+    booted.add(p.id);
+    try {
+      const mod = await import(`/plugins/${p.id}/${p.boot}`);
+      await mod.init?.(makeKit(p));
+    } catch (e) {
+      console.error(`plugin ${p.id}:`, e);
+      toast(`The plugin “${p.id}” did not start: ${e.message}`, "bad", 8000);
+    }
+  }
+}
+
 export const engineUp = () => ["ready", "attached"].includes(store.engine?.state);
 export const engineModelName = () => store.engine?.model?.name || store.engine?.plan?.model?.name || "";
 
@@ -59,11 +96,15 @@ const ACTIVE_DL = new Set(["queued", "downloading", "verifying", "installing"]);
 async function tick() {
   try {
     const eng = await get("/api/engine");
-    const key = JSON.stringify([eng.state, eng.phase, eng.error, eng.load, eng.model?.id, eng.n_ctx, eng.log_seq,
+    // The log has its own topic: a new log line must not make every page ask for the model, its capabilities and the
+    // launch preview again (a busy engine prints several lines a second).
+    const key = JSON.stringify([eng.state, eng.phase, eng.error, eng.load, eng.model?.id, eng.n_ctx,
       eng.cache, eng.accept_logged, eng.reachable]);
     const stateChanged = eng.state !== store.engine?.state;
+    const logMoved = eng.log_seq !== store.engine?.log_seq;
     store.engine = eng;
     if (key !== lastEngineKey) { lastEngineKey = key; emit("engine"); }
+    if (logMoved) emit("enginelog");
     if (stateChanged) renderEngineCard();
 
     const live = await get(`/api/live?since=${lastLive}`);
@@ -110,12 +151,13 @@ const pages = {
   engine: () => import("./engine.js"),
   lab: () => import("./lab.js"),
   cache: () => import("./cache.js"),
-  forge: () => import("./forge.js"),
   settings: () => import("./settings.js"),
+  plugin: () => import("./plugin-page.js"),
 };
 const routes = [
   [/^\/$/, "chat"], [/^\/c\/([0-9a-f]{16})$/, "chat"], [/^\/models\/?$/, "models"], [/^\/engine\/?$/, "engine"],
-  [/^\/lab\/?$/, "lab"], [/^\/cache\/?$/, "cache"], [/^\/forge\/?$/, "forge"], [/^\/settings\/?$/, "settings"],
+  [/^\/lab\/?$/, "lab"], [/^\/cache\/?$/, "cache"], [/^\/settings\/?$/, "settings"],
+  [/^\/p\/([a-z][a-z0-9-]{0,31})(?:\/.*)?$/, "plugin"],
 ];
 let current = null;
 let currentName = "";
@@ -134,6 +176,8 @@ async function route() {
     const m = path.match(re);
     if (m) { name = n; arg = m[1] || null; break; }
   }
+  const own = store.plugins.find((p) => p.loaded && p.page?.path && (path === p.page.path || path.startsWith(`${p.page.path}/`)));
+  if (own) { name = "plugin"; arg = own.id; } // a plugin of the package itself with a path of its own, like /forge
   document.getElementById("app").classList.remove("nav-open");
   if (current?.unmount) current.unmount();
   current = null;
@@ -157,7 +201,7 @@ export function topbar(title, ...right) {
 
 const NAV = [
   ["/", "chat", "Chat"], ["/models", "models", "Models"], ["/engine", "engine", "Engine"],
-  ["/lab", "lab", "Experiments"], ["/cache", "grid", "Expert cache"], ["/forge", "forge", "Forge"],
+  ["/lab", "lab", "Experiments"], ["/cache", "grid", "Expert cache"],
   ["/settings", "settings", "Settings"],
 ];
 
@@ -168,10 +212,12 @@ function renderNav() {
   const activeDl = store.downloads.filter((d) => ACTIVE_DL.has(d.state)).length;
   // The live poll calls this every few seconds on /models and /engine; rebuilding the links there
   // replaced the link under a pressed mouse button and the click got lost.
-  const key = `${path} ${activeDl}`;
+  const pages = store.plugins.filter((p) => p.loaded && p.page && p.page.nav !== false).map((p) => [p.page.path || `/p/${p.id}`, p.page.icon, p.page.title]);
+  const key = `${path} ${activeDl} ${pages.map((p) => p[0]).join(",")}`;
   if (key === navKey && nav.childElementCount) return;
   navKey = key;
-  clear(nav, NAV.map(([href, ic, label]) => {
+  const items = [...NAV.slice(0, -1), ...pages, NAV[NAV.length - 1]]; // plugin pages go above Settings
+  clear(nav, items.map(([href, ic, label]) => {
     const active = href === "/" ? path === "/" || path.startsWith("/c/") : path.startsWith(href);
     return h("a", { href, "data-link": true, class: active ? "active" : "" }, icon(ic), label,
       ic === "models" && activeDl ? h("span", { class: "badge", title: "Downloads running" }, activeDl) : null);
@@ -189,15 +235,16 @@ function chatGroup(ts) {
   return "Older";
 }
 
-function renderChatList() {
+export function renderChatList() {
   if (searchActive()) return; // the search box shows its hits in this list
   const list = document.getElementById("chat-list");
   const active = (location.pathname.match(/^\/c\/([0-9a-f]{16})$/) || [])[1];
+  const heads = chatListHeads.map((make) => make(location.pathname)).filter(Boolean); // entries of plugins, like Live
   if (!store.chats.length) {
-    clear(list, h("div", { class: "chat-empty" }, "Your conversations stay on this computer."));
+    clear(list, ...heads, h("div", { class: "chat-empty" }, "Your conversations stay on this computer."));
     return;
   }
-  const out = [];
+  const out = [...heads];
   let group = "";
   for (const c of store.chats) {
     const g = chatGroup(c.updated);
@@ -213,7 +260,7 @@ function renderChatList() {
         refreshChats();
       } }, icon("trash", "sm"));
     out.push(h("a", { class: `chat-item${c.id === active ? " active" : ""}`, href: `/c/${c.id}`, "data-link": true, title: c.title },
-      h("span", { class: "t" }, c.title), x));
+      c.favorite ? icon("star", "sm") : null, h("span", { class: "t" }, c.title), x));
   }
   clear(list, out);
 }
@@ -255,6 +302,10 @@ async function start() {
   });
   window.addEventListener("popstate", route);
   initChatSearch({ onClear: () => refreshChats().catch(() => {}) });
+  // The plugins of this machine come first, and those that change where the page's calls go (the hosts of Remote
+  // access) start before the page asks for anything else.
+  await refreshPlugins().catch(() => {});
+  await bootPlugins(true);
   try {
     await refreshState();
   } catch (e) {
@@ -264,9 +315,8 @@ async function start() {
   document.getElementById("brand-ver").textContent = `v${store.state.version}`;
   store.engine = store.state.engine;
   renderEngineCard();
-  initUpdates();
-  initHosts();
   refreshChats().catch(() => {});
+  await bootPlugins(false);
   route();
   tick();
 }

@@ -78,6 +78,8 @@ pub fn rates(
 }
 
 struct Inner {
+    /// time of the last look at the live data (a page asked), `None` before the first
+    seen: Option<Instant>,
     history: VecDeque<Value>,
     responses: VecDeque<Value>,
     metrics_available: Option<bool>,
@@ -91,6 +93,8 @@ struct Inner {
 pub struct Live {
     engine: Engine,
     inner: Arc<Mutex<Inner>>,
+    wake: Arc<std::sync::Condvar>,
+    watch_seconds: f64,
 }
 
 impl Live {
@@ -98,6 +102,7 @@ impl Live {
         let l = Live {
             engine,
             inner: Arc::new(Mutex::new(Inner {
+                seen: None,
                 history: VecDeque::new(),
                 responses: VecDeque::new(),
                 metrics_available: None,
@@ -106,6 +111,8 @@ impl Live {
                 gpus: vec![],
                 totals: json!({}),
             })),
+            wake: Arc::new(std::sync::Condvar::new()),
+            watch_seconds: 20.0,
         };
         let me = l.clone();
         std::thread::Builder::new()
@@ -114,15 +121,46 @@ impl Live {
                 let has_nvidia = !crate::system::nvidia().is_empty();
                 let mut tick = 0u64;
                 loop {
+                    // The sampler runs only while somebody watches: a page that asks for the live data keeps it going for
+                    // `watch_seconds` after its last look. With no page open nothing is sampled, so an idle Studio next to a
+                    // busy engine sends the engine no /metrics and /slots requests.
+                    if !me.watched() {
+                        let guard = me.inner.lock().unwrap();
+                        let _unused = me
+                            .wake
+                            .wait_while(guard, |i| {
+                                !i.seen
+                                    .is_some_and(|t| t.elapsed().as_secs_f64() < me.watch_seconds)
+                            })
+                            .unwrap();
+                        tick = 0; // the counters kept running meanwhile; the first rate covers the time not watched
+                        continue;
+                    }
                     let t0 = Instant::now();
                     me.sample(tick, has_nvidia);
                     tick += 1;
                     let spent = t0.elapsed().as_secs_f64();
-                    std::thread::sleep(Duration::from_secs_f64((interval - spent).max(0.2)));
+                    std::thread::sleep(Duration::from_secs_f64(
+                        (interval - spent).max(0.2).min(interval.max(0.2)),
+                    ));
                 }
             })
             .expect("live thread");
         l
+    }
+
+    /// Somebody looks (a page asked for the live data, or an answer went through the proxy).
+    pub fn touch(&self) {
+        self.inner.lock().unwrap().seen = Some(Instant::now());
+        self.wake.notify_all();
+    }
+
+    pub fn watched(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .seen
+            .is_some_and(|t| t.elapsed().as_secs_f64() < self.watch_seconds)
     }
 
     /// Called by the chat proxy with the `timings` of every finished answer.
@@ -300,6 +338,7 @@ impl Live {
     }
 
     pub fn snapshot(&self, since: f64) -> Value {
+        self.touch();
         let i = self.inner.lock().unwrap();
         let hist: Vec<Value> = if since != 0.0 {
             i.history

@@ -15,13 +15,6 @@ fn seed(home: &Path) {
         json!({"updates": {"check": false}}).to_string(),
     )
     .unwrap();
-    std::fs::write(
-        home.join("hosts.json"),
-        json!([{"id": "h1", "name": "titan", "color": "#abc", "kind": "direct", "scheme": "https", "address": "titan:8642", "fingerprint": "aabbccddeeff00112233", "mirror": false, "ssh": null, "paired": true, "token": "secret"},
-               {"id": "h2", "name": "Other", "kind": "ssh", "ssh": {"target": "me@x", "port": 22, "remote_port": 8642}}])
-        .to_string(),
-    )
-    .unwrap();
 }
 
 #[test]
@@ -117,22 +110,43 @@ fn tool_routes_hosts_capabilities_and_update_match_the_python_studio() {
     };
     both("tools default", "GET", "/api/tools", None, &[]);
     both(
+        "plugins (none in the core)",
+        "GET",
+        "/api/plugins",
+        None,
+        &[],
+    );
+    both(
+        "plugin toggle unknown",
+        "POST",
+        "/api/plugins/forge/enable",
+        Some(&json!({})),
+        &[],
+    );
+    both(
+        "plugin toggle bad id",
+        "POST",
+        "/api/plugins/Forge/enable",
+        Some(&json!({})),
+        &[],
+    );
+    both("plugin route", "GET", "/api/p/forge/jobs", None, &[]);
+    both(
+        "plugin route bad id",
+        "POST",
+        "/api/p/Bad_Id/x",
+        Some(&json!({})),
+        &[],
+    );
+    both("plugin files", "GET", "/plugins/forge/boot.js", None, &[]);
+    both("plugin files bad", "GET", "/plugins/forge", None, &[]);
+    both(
         "capabilities, nothing loaded",
         "GET",
         "/api/chat/capabilities",
         None,
         &[],
     );
-    both("hosts", "GET", "/api/hosts", None, &[]);
-    both("update", "GET", "/api/update", None, &["install"]);
-    both(
-        "update dismiss",
-        "POST",
-        "/api/update/dismiss",
-        Some(&json!({"version": "9.9.9"})),
-        &["install"],
-    );
-    both("settings after dismiss", "GET", "/api/settings", None, &[]);
     let share = |h: &Path| h.join("share").to_string_lossy().to_string();
     for (addr, tok, h) in [(rs, &tr, &hr), (py.addr, &tp, &hp)] {
         let r = http(addr, "POST", "/api/settings", &[("X-FLE-Token", tok)], Some(json!({"tools": {"files": true, "files_dir": share(h), "web_search": true, "mcp_trusted": ["a"], "max_rounds": 3,

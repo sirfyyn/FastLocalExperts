@@ -691,7 +691,7 @@ impl Engines {
                 .take(300)
                 .collect()
         };
-        let result = json!({"ok": ok, "version": ver.unwrap_or_default(), "backend": backend, "flavor": flavor, "log_verbosity": help.contains("--log-verbosity"), "problem": problem});
+        let result = json!({"ok": ok, "version": ver.unwrap_or_default(), "backend": backend, "flavor": flavor, "log_verbosity": help.contains("--log-verbosity"), "spec_type": help.contains("--spec-type"), "problem": problem});
         self.inner
             .detect_cache
             .lock()
@@ -723,7 +723,7 @@ impl Engines {
             };
             return Ok(
                 json!({"kind": "custom", "flavor": info["flavor"], "backend": info["backend"], "path": shown.to_string_lossy(), "version": info.get("version").cloned().unwrap_or(json!("")),
-                "log_verbosity": info.get("log_verbosity").cloned().unwrap_or(json!(false))}),
+                "log_verbosity": info.get("log_verbosity").cloned().unwrap_or(json!(false)), "spec_type": info.get("spec_type").cloned().unwrap_or(json!(false))}),
             );
         }
         let want = if want == "auto" {

@@ -15,6 +15,79 @@ export function renderMarkdown(src) {
   return blocks(text.split("\n")).join("");
 }
 
+// ----------------------------------------------------------------------------------------------- streaming
+
+// For a text that only grows (an answer while it streams). The text is cut at blank lines that surely end a block;
+// the part above the last cut is rendered once and kept, only the open rest is rendered again on every update.
+// update(text) returns {reset, fresh, tail}: `fresh` is the HTML of blocks that became final since the last call
+// (append it after what is shown), `tail` the HTML of the open rest (replace the old tail with it). `reset` means the
+// text changed in a way that is not growth: show `fresh` instead of what was shown. fresh + tail is always the same
+// as renderMarkdown of the whole text.
+export function createStreamRenderer() {
+  let done = ""; // the text up to the last cut, as it was rendered
+  let doneHtml = "";
+  return {
+    get html() { return doneHtml; },
+    update(src) {
+      const text = String(src || "").replace(/\r\n?/g, "\n").replace(/\u0000|\u0001/g, "");
+      let reset = false;
+      if (!text.startsWith(done)) { done = ""; doneHtml = ""; reset = true; }
+      const cut = findCut(text, done.length);
+      let fresh = "";
+      if (cut > done.length) {
+        fresh = blocks(text.slice(done.length, cut).split("\n")).join("");
+        done = text.slice(0, cut);
+        doneHtml += fresh;
+      }
+      const rest = text.slice(done.length);
+      return { reset, fresh: reset ? doneHtml : fresh, tail: blocks(rest.split("\n")).join("") };
+    },
+  };
+}
+
+// The end (just after the "\n" of the last line of a block) of the last block that is final, searching from `from`
+// (a line start); `from` when there is none. A block is final when a blank line follows it, and after the blank line
+// comes a whole line that cannot continue it. Fences and $$ / \[ formulas may contain blank lines.
+function findCut(text, from) {
+  let cut = from;
+  let pos = from;
+  let fence = null; // the closing pattern of an open code fence
+  let math = null;
+  let lastText = ""; // the last line with text before the blank lines
+  let blankAt = -1; // where the blank lines after it begin
+  while (pos < text.length) {
+    const nl = text.indexOf("\n", pos);
+    if (nl < 0) break; // the last line is not complete: it is never a reason to cut
+    const line = text.slice(pos, nl);
+    const next = nl + 1;
+    if (fence) {
+      if (fence.test(line)) fence = null;
+    } else if (math) {
+      if (math.test(line)) math = null;
+    } else if (blank(line)) {
+      if (blankAt < 0 && lastText) blankAt = pos;
+    } else {
+      if (blankAt >= 0 && !/^\s/.test(line) && !(LIST_RE.test(line) && LIST_RE.exec(line)[4] !== undefined && continuesList(lastText))) {
+        cut = blankAt;
+      }
+      blankAt = -1;
+      lastText = line;
+      const f = line.match(FENCE_RE);
+      if (f) fence = new RegExp(`^\\s{0,3}${f[2][0] === "`" ? "`" : "~"}{${f[2].length},}\\s*$`);
+      else if (/^\s*(\$\$|\\\[)/.test(line)) {
+        const closeRe = line.trim().startsWith("$$") ? /\$\$\s*$/ : /\\\]\s*$/;
+        const first = line.trim().slice(2);
+        if (!(first && closeRe.test(first))) math = closeRe;
+      }
+    }
+    pos = next;
+  }
+  return cut;
+}
+
+// A line of a list (or of an item's content): a list item after it belongs to the same list.
+const continuesList = (line) => /^\s/.test(line) || (LIST_RE.test(line) && LIST_RE.exec(line)[4] !== undefined);
+
 const blank = (l) => /^\s*$/.test(l);
 const indentOf = (l) => l.match(/^\s*/)[0].replace(/\t/g, "    ").length;
 

@@ -19,6 +19,17 @@ jobs:
     defaults: { run: { working-directory: rust } }
     steps:
       - uses: actions/checkout@v6
+      # The Python FLE Studio (core only) at the pinned commit is the specification: the comparison tests start it next to the Rust server.
+      - id: pin
+        shell: bash
+        run: echo "sha=$(cat STUDIO_PIN)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          repository: sirfyyn/fle-studio
+          ref: ${{ steps.pin.outputs.sha }}
+          path: fle-studio-pinned
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.13" }
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "clippy, rustfmt" }
       - uses: Swatinem/rust-cache@v2
@@ -26,3 +37,6 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+        env:
+          FLE_STUDIO_SRC: ${{ github.workspace }}/fle-studio-pinned/src
+          FLE_STUDIO_PYTHON: python

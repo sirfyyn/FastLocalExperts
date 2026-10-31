@@ -14,7 +14,7 @@ pub fn studio_src() -> Option<PathBuf> {
         .ok()
         .into_iter()
         .chain([
-            dirs_home().join("fle-studio-020/src"),
+            dirs_home().join("fle-studio-main/src"),
             dirs_home().join("fle-studio/src"),
         ]);
     c.into_iter()
@@ -166,6 +166,8 @@ pub fn start_python_with(src: &Path, home: &Path, prelude: &str) -> Py {
             .arg(home)
             .args(["--port", &port.to_string(), "--no-browser"])
             .env("PYTHONPATH", src)
+            // the core only: the plugins of the package (forge, updates, remote access, ...) are not what this server replaces
+            .env("FLE_STUDIO_NO_BUNDLED", "1")
             .env("FLE_STUDIO_HOME", home)
             .stdout(Stdio::null())
             .stderr(Stdio::null())

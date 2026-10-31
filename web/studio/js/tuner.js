@@ -50,7 +50,8 @@ const BUDGETS = [[10, "10 minutes"], [20, "20 minutes"], [45, "45 minutes"], [90
 export function mountBest(box, opts) {
   loadStyle();
   let data = { current: null, results: [], best: null, params: [], defaults: { params: [], runs: 3, budget_min: 20 } };
-  const form = { budget: 20, runs: 3, params: null, screen: true };
+  // `open` keeps "What to try" unfolded across re-renders (each poll rebuilds the card).
+  const form = { budget: 20, runs: 3, params: null, screen: true, open: false };
   let timer = 0;
   let gone = false;
 
@@ -116,7 +117,7 @@ export function mountBest(box, opts) {
 
     const engineOn = opts.engineRunning();
     const canTune = !!opts.model() && !engineOn;
-    const form1 = h("details", { class: "stack" },
+    const form1 = h("details", { class: "stack", open: form.open, ontoggle: (e) => { form.open = e.target.open; } },
       h("summary", { class: "small muted", style: { cursor: "pointer" } }, "What to try and for how long"),
       h("div", { class: "stack", style: { marginTop: "10px" } },
         h("div", { class: "grid two" },

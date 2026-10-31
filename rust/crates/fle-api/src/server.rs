@@ -85,7 +85,7 @@ pub fn new_studio(opts: Options) -> Ctx {
             .unwrap_or(false),
     );
     let chats = Chats::new(&home);
-    Arc::new(Studio {
+    let studio = Arc::new(Studio {
         opts,
         token: make_token(),
         config,
@@ -98,7 +98,15 @@ pub fn new_studio(opts: Options) -> Ctx {
         engine,
         profiles: Mutex::new(Profiles::new(&home)),
         downloads,
-    })
+    });
+    let weak = Arc::downgrade(&studio);
+    studio
+        .engine
+        .set_on_load_failure(Box::new(move |plan, rc, error| {
+            weak.upgrade()
+                .and_then(|s| s.load_failure_fallback(plan, rc, error))
+        }));
+    studio
 }
 
 fn ct_eq(a: &str, b: &str) -> bool {
@@ -452,14 +460,10 @@ impl Studio {
             Err(Fail::Api(e)) => Err(e),
             Err(Fail::Plan(exc)) => {
                 // Plan-time upstream fallback: if the FLE plan cannot be built (no NVIDIA GPU for the FLE engine, say),
-                // retry once with an installed upstream llama-server and speculation off.
-                if given.is_some()
-                    || settings["launch"]
-                        .get("profile")
-                        .and_then(Value::as_str)
-                        .unwrap_or("auto")
-                        != "auto"
-                {
+                // retry once with an installed upstream llama-server and speculation off. This does not rescue a model
+                // that fails after it has started loading (the engine's own load fallback does that).
+                if prof_id != "auto" {
+                    // (the page sends "auto" itself, so that is not a reason to refuse)
                     return Err(ApiError(400, exc.0));
                 }
                 let Some(up) = self.engines.resolve("upstream", &info).ok() else {
@@ -471,22 +475,229 @@ impl Studio {
                         ),
                     ));
                 };
-                let mut fb = settings.clone();
-                fb["launch"]["mtp"] = json!(false);
-                fb["launch"]["spec"] = json!("none");
-                let m = model.clone().unwrap_or(Value::Null);
-                let mut plan = auto_plan(&AutoInput {
-                    model: &m,
-                    engine: &up,
-                    settings: &fb,
-                    sysinfo: &info,
-                    port,
-                    data_dir: &data_dir,
-                })
-                .map_err(|e| ApiError(400, e.0))?;
-                plan.notes.insert(0, format!("FLE plan failed: {}", exc.0));
-                plan.notes.insert(1, "Falling back to upstream llama.cpp; FLE features and speculation are disabled.".into());
+                let mut plan = match self.upstream_plan(model.as_ref(), &settings, &up, &info, port)
+                {
+                    Ok(p) => p,
+                    Err(fb) => {
+                        return Err(ApiError(
+                            400,
+                            format!("{} The upstream fallback failed too: {}", exc.0, fb.0),
+                        ))
+                    }
+                };
+                let why = exc.0.trim().to_string();
+                plan.fallback = format!(
+                    "The FLE plan could not be built: {why}{} Studio fell back to upstream llama.cpp; FLE features and speculation are off.",
+                    if why.ends_with('.') { "" } else { "." }
+                );
+                plan.notes.insert(0, plan.fallback.clone());
                 Ok(plan)
+            }
+        }
+    }
+
+    /// The automatic plan for an upstream llama-server with speculation off (the fallback of the FLE plan).
+    fn upstream_plan(
+        &self,
+        model: Option<&Value>,
+        settings: &Value,
+        upstream: &Value,
+        info: &Value,
+        port: i64,
+    ) -> Result<crate::launch::Plan, crate::launch::PlanError> {
+        let mut fb = settings.clone();
+        fb["launch"]["mtp"] = json!(false);
+        fb["launch"]["spec"] = json!("none");
+        let m = model.cloned().unwrap_or(json!({}));
+        crate::launch::auto_plan(&crate::launch::AutoInput {
+            model: &m,
+            engine: upstream,
+            settings: &fb,
+            sysinfo: info,
+            port,
+            data_dir: &self.opts.home,
+        })
+    }
+
+    /// The engine ended while loading. With the automatic profile, start upstream llama.cpp once instead. Only for a plan that
+    /// Studio built itself (profile auto), not for one that already is the upstream engine, and not when
+    /// `launch.fallback_on_failure` is off or no upstream llama-server is installed.
+    pub fn load_failure_fallback(
+        &self,
+        failed: &crate::launch::Plan,
+        rc: i32,
+        error: &str,
+    ) -> Option<crate::launch::Plan> {
+        let settings = Value::Object(self.config.lock().unwrap().data.clone());
+        if !settings["launch"]
+            .get("fallback_on_failure")
+            .map(crate::settings::py_truthy)
+            .unwrap_or(true)
+            || failed.profile != "auto"
+        {
+            return None;
+        }
+        let info = self.sysinfo();
+        let upstream = self.engines.resolve("upstream", &info).ok()?;
+        if upstream["path"].as_str() == Some(failed.binary.as_str()) {
+            return None;
+        }
+        let want_port = settings["launch"]
+            .get("port")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, 65535) as u16;
+        let port = i64::from(crate::launch::free_port(want_port));
+        let mut plan = self
+            .upstream_plan(Some(&failed.model), &settings, &upstream, &info, port)
+            .ok()?;
+        let what = format!("exit code {rc}")
+            + &if error.is_empty() {
+                String::new()
+            } else {
+                format!(": {error}")
+            };
+        plan.fallback = format!("The engine ended while loading ({what}). Starting upstream llama.cpp instead, once; FLE features and speculation are off. Switch this off under Engine > Advanced > Start upstream if loading fails.");
+        plan.notes.insert(0, plan.fallback.clone());
+        Some(plan)
+    }
+
+    /// What the user can do in one click so that the plan can use MTP, as buttons (`plan_fixes`).
+    pub fn plan_fixes(&self, model_ident: &str, profile_ident: Option<&Value>) -> Vec<Value> {
+        let launch_cfg = self
+            .config
+            .lock()
+            .unwrap()
+            .get("launch")
+            .cloned()
+            .unwrap_or(json!({}));
+        let prof_id = match profile_ident.filter(|v| crate::settings::py_truthy(v)) {
+            Some(v) => crate::settings::py_str(v),
+            None => match launch_cfg.get("profile") {
+                Some(v) if crate::settings::py_truthy(v) => crate::settings::py_str(v),
+                _ => "auto".into(),
+            },
+        };
+        let model = if model_ident.is_empty() {
+            None
+        } else {
+            self.library
+                .lock()
+                .unwrap()
+                .get(&self.models_dir(), model_ident)
+        };
+        let Some(model) = model.filter(|m| prof_id == "auto" && m["catalog_id"].is_string()) else {
+            return vec![];
+        };
+        let mtp = if model["mtp"].is_object() {
+            model["mtp"].clone()
+        } else {
+            json!({})
+        };
+        if mtp["supported"] != json!(true) || (mtp["head"].is_string() && mtp["vocab"].is_string())
+        {
+            return vec![];
+        }
+        let spec = match launch_cfg.get("spec") {
+            Some(v) if crate::settings::py_truthy(v) => crate::settings::py_str(v).to_lowercase(),
+            _ => "auto".into(),
+        };
+        if (spec != "auto" && spec != "mtp")
+            || !launch_cfg
+                .get("mtp")
+                .map(crate::settings::py_truthy)
+                .unwrap_or(true)
+        {
+            return vec![]; // MTP is off on purpose (or contradicted): a download would not change the plan
+        }
+        let Some(entry) = crate::catalog::by_id(model["catalog_id"].as_str().unwrap_or(""))
+            .filter(|e| e["mtp"] == json!(true))
+        else {
+            return vec![];
+        };
+        let size = crate::catalog::mtp_head()["size"].as_i64().unwrap_or(0)
+            + crate::catalog::mtp_vocab()["size"].as_i64().unwrap_or(0);
+        vec![
+            json!({"kind": "download_mtp", "model": entry["id"], "label": "Download MTP files", "size": size}),
+        ]
+    }
+
+    /// Whether the Speculation setting changes the command: `{"applies", "reason"}` (`speculation_view`).
+    pub fn speculation_view(
+        &self,
+        profile_ident: Option<&Value>,
+        plan: Option<&crate::launch::Plan>,
+    ) -> Value {
+        let cfg_profile = self.config.lock().unwrap().get("launch.profile").cloned();
+        let prof_id = match profile_ident.filter(|v| crate::settings::py_truthy(v)) {
+            Some(v) => crate::settings::py_str(v),
+            None => match cfg_profile {
+                Some(v) if crate::settings::py_truthy(&v) => crate::settings::py_str(&v),
+                _ => "auto".into(),
+            },
+        };
+        if prof_id != "auto" {
+            return json!({"applies": false, "reason": "A start profile's own command decides; speculation applies to the automatic start only."});
+        }
+        if let Some(p) = plan.filter(|p| !p.fallback.is_empty()) {
+            return json!({"applies": false, "reason": p.fallback});
+        }
+        let flavor: Option<String> = match plan {
+            Some(p) if p.profile == "auto" && (p.engine == "fle" || p.engine == "upstream") => {
+                Some(p.engine.clone())
+            }
+            _ => self
+                .engine_for("auto", &self.sysinfo())
+                .ok()
+                .map(|e| match e.get("flavor") {
+                    Some(v) if crate::settings::py_truthy(v) => crate::settings::py_str(v),
+                    _ => crate::settings::py_str(&e["kind"]),
+                }),
+        };
+        if flavor.as_deref() == Some("upstream") {
+            return json!({"applies": false, "reason": "Speculation needs the FLE engine; the selected engine is upstream llama.cpp. Pick an FLE engine to use it."});
+        }
+        json!({"applies": true, "reason": ""})
+    }
+
+    /// `make_plan` for the live preview: a plan that cannot be built is an answer, not a failure (`plan_view`).
+    pub fn plan_view(&self, model_ident: &str, profile_ident: Option<&Value>) -> Value {
+        let fixes = self.plan_fixes(model_ident, profile_ident);
+        match self.make_plan(model_ident, profile_ident) {
+            Err(e) => {
+                json!({"ok": false, "error": e.1, "fixes": fixes, "speculation": self.speculation_view(profile_ident, None)})
+            }
+            Ok(plan) => {
+                let public = plan.public();
+                let launch_cfg = self
+                    .config
+                    .lock()
+                    .unwrap()
+                    .get("launch")
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let model = if model_ident.is_empty() {
+                    None
+                } else {
+                    self.library
+                        .lock()
+                        .unwrap()
+                        .get(&self.models_dir(), model_ident)
+                };
+                let spec = match launch_cfg.get("spec") {
+                    Some(v) if crate::settings::py_truthy(v) => crate::settings::py_str(v),
+                    _ => "auto".into(),
+                };
+                let chips = crate::planview::summary(
+                    &public,
+                    model.as_ref(),
+                    &spec,
+                    launch_cfg
+                        .get("mtp")
+                        .map(crate::settings::py_truthy)
+                        .unwrap_or(true),
+                );
+                json!({"ok": true, "plan": public, "fixes": fixes, "speculation": self.speculation_view(profile_ident, Some(&plan)), "summary": chips})
             }
         }
     }
@@ -585,87 +796,6 @@ impl Studio {
         Ok(json!({"content": content, "is_error": is_error, "ms": t0.elapsed().as_millis() as i64}))
     }
 
-    /// The hosts this Studio can switch to, as the page lists them (`api_hosts`; adding a host comes with the remote stage).
-    pub fn hosts_view(&self) -> Value {
-        let file = self.opts.home.join("hosts.json");
-        let hosts: Vec<Value> = match std::fs::read_to_string(&file)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        {
-            Some(Value::Array(a)) => a,
-            _ => vec![],
-        };
-        let public: Vec<Value> = hosts
-            .iter()
-            .map(|h| {
-                let mut o: Map<String, Value> = [
-                    "id",
-                    "name",
-                    "color",
-                    "kind",
-                    "scheme",
-                    "address",
-                    "fingerprint",
-                    "mirror",
-                    "ssh",
-                    "paired",
-                ]
-                .iter()
-                .map(|k| (k.to_string(), h.get(*k).cloned().unwrap_or(Value::Null)))
-                .collect();
-                let fp = h
-                    .get("fingerprint")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .replace(':', "");
-                let pretty = fp
-                    .as_bytes()
-                    .chunks(2)
-                    .map(|c| String::from_utf8_lossy(c).to_uppercase())
-                    .collect::<Vec<_>>()
-                    .join(":");
-                o.insert("fingerprint_pretty".into(), json!(pretty));
-                o.insert("tunnel".into(), Value::Null);
-                Value::Object(o)
-            })
-            .collect();
-        let ssh = std::env::var("FLE_STUDIO_SSH")
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-            || fle_core::launch::which("ssh").is_some();
-        let name = {
-            let n = self
-                .config
-                .lock()
-                .unwrap()
-                .get("remote.name")
-                .map(crate::settings::py_str)
-                .unwrap_or_default();
-            if !n.trim().is_empty() {
-                n.trim().to_string()
-            } else {
-                fle_core::launch::run_text("hostname", &[])
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string()
-            }
-        };
-        json!({"hosts": public, "ssh": ssh, "client_name": name})
-    }
-
-    /// What the update panel shows. This program updates itself with its first release; until then nothing is offered.
-    pub fn update_view(&self) -> Value {
-        let c = self.config.lock().unwrap();
-        let g = |k: &str| c.get(k).is_some_and(crate::settings::py_truthy);
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        json!({"enabled": g("updates.check"), "prereleases": g("updates.prereleases"), "current": self.opts.version, "checked": Value::Null, "checking": false, "error": "", "app": Value::Null,
-            "engines": [], "install": {"kind": "binary", "source": exe, "service": false}, "run": {"state": "idle", "tag": "", "message": "", "tail": []}, "result": Value::Null})
-    }
-
     pub fn sysinfo(&self) -> Value {
         crate::system::info(&self.models_dir())
     }
@@ -722,9 +852,18 @@ impl Studio {
         let info = crate::system::info(&self.models_dir());
         let models = self.library.lock().unwrap().scan(&self.models_dir());
         let jobs = self.downloads.list();
+        let extras = self.extras_view();
         let mut out = vec![];
         for mut entry in crate::catalog::catalog(&info) {
             let id = entry["id"].clone();
+            entry.insert(
+                "mtp_status".into(),
+                crate::catalog::mtp_status(
+                    entry.get("mtp").is_some_and(crate::settings::py_truthy),
+                    extras["mtp_head"]["present"] == json!(true),
+                    extras["mtp_vocab"]["present"] == json!(true),
+                ),
+            );
             let local = models
                 .iter()
                 .rev()
@@ -802,6 +941,36 @@ fn engine_service_action(p: &str) -> Option<&str> {
         .filter(|a| matches!(*a, "start" | "stop" | "restart"))
 }
 
+/// A call under `/api/p/<id>/`: no plugin is installed in this program, so none is on.
+fn plugin_off(p: &str) -> ApiError {
+    let rest = &p["/api/p/".len()..];
+    let id = rest.split('/').next().unwrap_or("");
+    let ok = !id.is_empty()
+        && id.len() <= 32
+        && id.as_bytes()[0].is_ascii_lowercase()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok {
+        ApiError(404, format!("The plugin {id} is not on"))
+    } else {
+        ApiError(404, "Not found".into())
+    }
+}
+
+/// `/api/plugins/<id>/<enable|disable>` -> the plugin id
+fn plugin_toggle(p: &str) -> Option<&str> {
+    let rest = p.strip_prefix("/api/plugins/")?;
+    let (id, act) = rest.split_once('/')?;
+    let ok = !id.is_empty()
+        && id.len() <= 32
+        && id.as_bytes()[0].is_ascii_lowercase()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    (ok && matches!(act, "enable" | "disable")).then_some(id)
+}
+
 /// `/api/models/<12 hex>/remove` -> the id
 fn model_remove_id(p: &str) -> Option<&str> {
     let id = p.strip_prefix("/api/models/")?.strip_suffix("/remove")?;
@@ -835,30 +1004,6 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 .unwrap_or(json!({})),
         )),
         ("POST", "/api/tools/call") => r.json(MAX_JSON).and_then(|body| st.tools_call(&body)),
-        ("GET", "/api/hosts") => Ok(st.hosts_view()),
-        ("GET", "/api/update") => Ok(st.update_view()),
-        ("POST", "/api/update/check") => Ok(st.update_view()),
-        ("POST", "/api/update/ack") => Ok(st.update_view()),
-        ("POST", "/api/update/dismiss") => r.json(MAX_JSON).and_then(|body| {
-            let version = body
-                .get("version")
-                .filter(|v| crate::settings::py_truthy(v))
-                .map(crate::settings::py_str)
-                .unwrap_or_default();
-            if !version.is_empty() {
-                let patch = json!({"updates": {"dismissed": version}});
-                st.config
-                    .lock()
-                    .unwrap()
-                    .update(patch.as_object().unwrap())
-                    .map_err(|e| ApiError(400, e))?;
-            }
-            Ok(st.update_view())
-        }),
-        ("POST", "/api/update/apply") => Err(ApiError(
-            409,
-            "Updating from inside this program comes with its first release.".into(),
-        )),
         ("GET", "/api/state") => Ok(st.state()),
         ("GET", "/api/settings") => Ok(st.config.lock().unwrap().public()),
         ("POST", "/api/settings") => r.json(MAX_JSON).and_then(|body| {
@@ -995,6 +1140,20 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0),
             2000,
+        )),
+        ("POST", "/api/engine/plan") => r.json(MAX_JSON).map(|body| {
+            let model = body
+                .get("model")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            st.plan_view(&model, body.get("profile"))
+        }),
+        (_, _) if p.starts_with("/api/p/") => Err(plugin_off(p)),
+        ("GET", "/api/plugins") => Ok(json!({"api_version": 1, "plugins": [], "error": ""})),
+        ("POST", _) if plugin_toggle(p).is_some() => Err(ApiError(
+            404,
+            format!("No plugin named {} is installed", plugin_toggle(p).unwrap()),
         )),
         ("POST", "/api/engine/preview") => r.json(MAX_JSON).and_then(|body| {
             let model = body
@@ -1165,6 +1324,26 @@ fn static_file(st: &Studio, path: &str, head: bool) -> Response<Body> {
     if !ok {
         return not_found();
     }
+    if let Some(rest) = name.strip_prefix("plugins/") {
+        // a plugin's own files: none is installed in this program
+        let id = rest.split('/').next().unwrap_or("");
+        let valid = !id.is_empty()
+            && id.len() <= 32
+            && id.as_bytes()[0].is_ascii_lowercase()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && rest.contains('/');
+        return error_json(
+            404,
+            &if valid {
+                format!("The plugin {id} is not on")
+            } else {
+                "Not found".to_string()
+            },
+            head,
+        );
+    }
     let mut data: Option<Vec<u8>> = read_web(st, &name);
     if data.is_none() {
         if !name.rsplit('/').next().unwrap_or("").contains('.') {
@@ -1267,7 +1446,7 @@ async fn handler(
 }
 
 /// Features of the Python Studio that this server does not have yet: a clear 501 instead of a 404 that looks like a bug.
-fn not_yet(path: &str, method: &Method) -> Option<&'static str> {
+fn not_yet(path: &str, _method: &Method) -> Option<&'static str> {
     let is = |p: &str| path == p || path.starts_with(&format!("{p}/"));
     Some(if is("/api/hf") {
         "Searching and downloading from Hugging Face"
@@ -1285,8 +1464,10 @@ fn not_yet(path: &str, method: &Method) -> Option<&'static str> {
         "The engine flag help"
     } else if is("/api/mcp") || is("/oauth") || is("/api/apps") || is("/app-frame") {
         "MCP servers"
-    } else if is("/api/remote") || is("/h") || (is("/api/hosts") && *method != Method::GET) {
+    } else if is("/api/remote") || is("/h") || is("/api/hosts") {
         "Remote access"
+    } else if is("/api/update") {
+        "Updating from inside the program"
     } else {
         return None;
     })
@@ -1420,6 +1601,7 @@ async fn proxy(
         .unwrap_or("*/*")
         .to_string();
     let live = st.live.clone();
+    live.touch();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
     let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Upstream>();
     std::thread::spawn(move || {

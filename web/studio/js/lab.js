@@ -84,12 +84,61 @@ export function mount(main) {
         cur.tests.length ? testsTable(cur.tests) : null) : null,
       !running && cur && cur.state !== "done" ? h("div", { class: `callout ${cur.state === "failed" ? "bad" : "warn"}`, style: { marginTop: "14px" } },
         icon("alert", "sm"), h("div", null, cur.state === "failed" ? `The last test failed: ${cur.error || "unknown error"}` : "The last test was cancelled.")) : null,
+      !running && cur?.state === "done" && cur.compare ? compareNote(cur.compare, { marginTop: "14px" }) : null,
       h("p", { class: "small faint", style: { margin: "12px 0 0" } },
         "With sampling on, decode speed and MTP acceptance vary from run to run; the summary uses medians, so repeat at least three times before comparing."));
   }
 
   function profileName(id) {
     return (store.state?.profiles || []).find((p) => p.id === id)?.name || id;
+  }
+
+  // The change against the last result of the same model and settings (bench.py compare_decode).
+  function compareNote(c, style = {}) {
+    const when = c.previous_started ? fmt.date(c.previous_started) : "the last run";
+    if (!c.comparable) {
+      return h("div", { class: "callout", style }, icon("info", "sm"),
+        h("div", { class: "small" }, `No comparison with ${when}: ${c.reason}.`));
+    }
+    const sign = c.change_pct > 0 ? "+" : "";
+    return h("div", { class: `callout ${c.warn ? "warn" : "info"}`, style }, icon(c.warn ? "alert" : "info", "sm"),
+      sparkline(c.series), // before the text: on a narrow screen the table scrolls sideways and the end is out of view
+      h("div", { class: "small grow" }, h("b", null, `${sign}${c.change_pct.toFixed(1)} % decode speed`),
+        ` against ${when} (${fmt.rate(c.old)} to ${fmt.rate(c.new)} tok/s, median of ${c.tests.join(" and ")})`,
+        c.warn ? ". That is a drop of more than 10 %: check what changed (settings, other load, thermal limits)." : "."));
+  }
+
+  // The decode speed of the last runs of this setting as a small line (bench.py decode_series): oldest left, this run
+  // right and marked. A run without a usable speed (cut off at the token limit) is a grey tick on the baseline.
+  function sparkline(series) {
+    if (!Array.isArray(series) || series.length < 2) return null;
+    const W = 120;
+    const H = 30;
+    const pad = 4;
+    const vals = series.map((p) => p.decode).filter((v) => typeof v === "number");
+    if (!vals.length) return null;
+    const lo = Math.min(...vals);
+    const hi = Math.max(...vals);
+    const x = (i) => pad + (i * (W - 2 * pad)) / (series.length - 1);
+    const y = (v) => (hi === lo ? H / 2 : H - pad - ((v - lo) / (hi - lo)) * (H - 2 * pad - 2));
+    const ns = "http://www.w3.org/2000/svg";
+    const el = (tag, attrs) => {
+      const e = document.createElementNS(ns, tag);
+      for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+      return e;
+    };
+    const svg = el("svg", { class: "spark", viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img",
+      "aria-label": `Decode speed of the last ${series.length} runs: ${series.map((p) => (p.decode === null ? "no value" : fmt.rate(p.decode))).join(", ")} tok/s` });
+    const pts = series.map((p, i) => (typeof p.decode === "number" ? [x(i), y(p.decode), i] : null)).filter(Boolean);
+    if (pts.length > 1) svg.append(el("polyline", { class: "line", fill: "none", points: pts.map(([px, py]) => `${px.toFixed(1)},${py.toFixed(1)}`).join(" ") }));
+    series.forEach((p, i) => {
+      if (typeof p.decode !== "number") svg.append(el("line", { class: "gap", x1: x(i), x2: x(i), y1: H - pad - 3, y2: H - pad }));
+    });
+    const last = series.length - 1;
+    for (const [px, py, i] of pts) svg.append(el("circle", { class: i === last ? "now" : "dot", cx: px.toFixed(1), cy: py.toFixed(1), r: i === last ? 3 : 1.8 }));
+    const box = h("span", { class: "spark-box", title: "Decode speed of the last runs of this setting, oldest left; grey ticks: runs cut off at the token limit" });
+    box.append(svg);
+    return box;
   }
 
   async function start() {
@@ -188,6 +237,7 @@ export function mount(main) {
         c.profile ? [h("dt", null, "Start"), h("dd", null, c.profile === "auto" ? "Automatic settings" : profileName(c.profile))] : null,
         c.n_ctx ? [h("dt", null, "Context"), h("dd", null, `${fmt.int(c.n_ctx)} tokens`)] : null,
         [h("dt", null, "Runs"), h("dd", null, `${r.runs}, ${r.tests.length} requests`)]),
+      r.compare ? compareNote(r.compare) : null,
       testsTable(r.tests),
       c.command ? h("div", { class: "cmd" }, c.command, copyButton(c.command, "Copy the command")) : null);
   }

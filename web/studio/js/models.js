@@ -14,7 +14,6 @@ export function mount(main) {
   const unsub = [];
   const hw = h("div", { class: "hw" });
   const catGrid = h("div", { class: "cat-grid" });
-  const catNote = h("div");
   const dlBox = h("div");
   const libBox = h("div");
   const hfBox = h("div", { class: "card" });
@@ -22,11 +21,10 @@ export function mount(main) {
     h("div", { class: "page-head" }, h("div", null, h("h2", null, "Models"),
       h("p", null, "Pick a model that fits this computer. Downloads resume after an interruption and every file is checked against its SHA-256 before use."))),
     hw,
-    section("Recommended models", "FLE quants of Qwen3.8-Flash-Next (made for the FLE engine: experts in RAM, the busy ones cached on the GPU, MTP drafting for faster answers) and two OpenAI gpt-oss models.", h("div", { class: "stack" }, catNote, catGrid)),
+    section("FLE quants of Qwen3.8-Flash-Next", "Made for the FLE engine: experts in RAM, the busy ones cached on the GPU, MTP drafting for faster answers.", catGrid),
     dlBox,
     libBox,
-    hfBox,
-    forgeCard());
+    hfBox);
   main.replaceChildren(topbar("Models"), h("div", { class: "page" }, page));
 
   const mtpChoice = new Map(); // catalog id -> download the MTP head too
@@ -74,10 +72,6 @@ export function mount(main) {
     if (!cat) return;
     const jobs = new Map(store.downloads.map((d) => [d.dedupe, d]));
     clear(catGrid, cat.map((m) => modelCard(m, jobs.get(`catalog:${m.id}`))));
-    // On a small machine every card says "Too big"; say what to do instead of leaving a wall of red.
-    const none = cat.length > 0 && cat.every((m) => m.fit?.verdict === "too_big");
-    clear(catNote, none ? h("div", { class: "fit-line" }, icon("info", "sm"),
-      h("span", null, "None of these fits this computer's memory. Smaller GGUF files from Hugging Face work with the upstream engine: search below, or add a file from disk.")) : null);
   }
 
   function modelCard(m, job) {
@@ -90,7 +84,7 @@ export function mount(main) {
     if (active) {
       action = jobBlock(job);
     } else if (local?.complete) {
-      const mtpMissing = m.mtp && !(extras.mtp_head?.present && extras.mtp_vocab?.present);
+      const mtpMissing = m.mtp_status?.state === "missing";
       action = h("div", { class: "row wrap" },
         h("span", { class: "pill good" }, icon("check", "sm"), "In your library"),
         mtpMissing ? h("button", { class: "btn sm", title: "Faster answers through MTP drafting", onclick: () => download(m, true) },
@@ -115,6 +109,11 @@ export function mount(main) {
         fact("KL divergence", kld !== null ? fmt.two(kld) : "–", m.kld ? `Mean KL divergence against BF16 on three test texts: ${m.kld.map((x) => x.toFixed(3)).join(" / ")} (lower is better)` : ""),
         fact("Load time", m.measured?.load_s ? fmt.dur(m.measured.load_s) : "–", "Measured on the reference machine")),
       h("div", { class: "small faint" }, m.speed),
+      m.mtp_status ? h("div", { class: "row small" },
+        h("span", { class: `pill ${{ ready: "good", missing: "warn", none: "" }[m.mtp_status.state] || ""}`,
+          title: m.mtp_status.state === "none" ? "This model has no MTP head; the engine drafts without it"
+            : `MTP head ${m.mtp_status.head ? "there" : "missing"}, vocabulary file ${m.mtp_status.vocab ? "there" : "missing"}` },
+        m.mtp_status.label)) : null,
       m.fit?.advice ? h("div", { class: "fit-line" }, icon("info", "sm"), h("span", null, m.fit.advice)) : null,
       action,
       h("div", { class: "row small faint" }, h("span", null, m.license), h("span", { class: "grow" }),
@@ -324,19 +323,4 @@ function section(title, sub, body) {
   return h("section", { class: "stack" },
     h("div", null, h("h3", { style: { margin: 0, fontSize: "16px" } }, title), sub ? h("p", { class: "muted small", style: { margin: "2px 0 0" } }, sub) : null),
     body);
-}
-
-function forgeCard() {
-  const report = store.state?.reference?.report || "https://sirfyyn.github.io/FastLocalExperts/";
-  return h("div", { class: "card pad-lg forge" },
-    h("div", { class: "card-head" }, icon("spark"), h("div", { class: "grow" }, h("h3", null, "Studio Forge: build your own FLE quant"),
-      h("p", null, "The recipe behind the FLE files, as a guided job for any mixture-of-experts model.")),
-      h("a", { class: "btn", href: "/forge", "data-link": true }, "Open Forge")),
-    h("ol", null,
-      h("li", null, h("b", null, "Pick a base model"), " in BF16 from Hugging Face."),
-      h("li", null, h("b", null, "Measure"), ": an importance matrix from public prompts and a profile of which experts each layer actually uses."),
-      h("li", null, h("b", null, "Prune with REAP"), ": drop the least salient experts per layer (FLE-IQ3_M-REAP448 keeps 448 of 512)."),
-      h("li", null, h("b", null, "Quantize"), " with the FLE tensor recipe: busy experts and shared weights at higher precision, rarely used experts lower."),
-      h("li", null, h("b", null, "Check"), ": KL divergence against BF16 on three text sets, then a speed test on the Experiments page.")),
-    h("div", { class: "row small" }, h("a", { href: report, target: "_blank", rel: "noopener" }, "How the FLE quants were made ", icon("external", "sm"))));
 }
