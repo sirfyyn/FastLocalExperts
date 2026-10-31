@@ -34,6 +34,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Check parts, tensor count, offsets and tensor types of a model file
+    Verify {
+        model: std::path::PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask one question and print the answer (loads the model for the duration)
     Ask {
         model: String,
@@ -121,7 +127,7 @@ fn main() -> Result<()> {
             let m = fle_core::gguf::read_model(&model)?;
             let sm = m.summary();
             if json {
-                println!("{}", serde_json::to_string_pretty(&sm)?);
+                println!("{}", fle_core::gguf::py_json(&sm));
                 return Ok(());
             }
             let n = |k: &str| sm[k].as_u64().map(|v| v.to_string()).unwrap_or("-".into());
@@ -155,6 +161,34 @@ fn main() -> Result<()> {
                 println!("    {t:<8} {c:>5} tensors  {}", system::gib(*b));
             }
             Ok(())
+        }
+        Some(Cmd::Verify { model, json }) => {
+            let m = fle_core::gguf::read_model(&model)?;
+            let r = fle_core::gguf::verify_model(&m);
+            let ok = r["ok"].as_bool().unwrap_or(false);
+            if json {
+                println!("{}", fle_core::gguf::py_json(&r));
+            } else {
+                println!("verify: {}", if ok { "ok" } else { "failed" });
+                for c in r["checks"].as_array().unwrap() {
+                    println!(
+                        "[{}] {}: {}",
+                        c["status"].as_str().unwrap(),
+                        c["name"].as_str().unwrap(),
+                        c["detail"].as_str().unwrap()
+                    );
+                    if let Some(h) = c["hint"].as_str().filter(|h| !h.is_empty()) {
+                        println!("       -> {h}");
+                    }
+                }
+                for w in r["warnings"].as_array().unwrap() {
+                    println!("[warn] {}", w.as_str().unwrap());
+                }
+                for e in r["errors"].as_array().unwrap() {
+                    println!("[fail] {}", e.as_str().unwrap());
+                }
+            }
+            std::process::exit(if ok { 0 } else { 1 });
         }
         Some(Cmd::Run { model }) => {
             let srv = flow::ensure_and_start(&home, &model, &mut |e| print_event(&e))?;
