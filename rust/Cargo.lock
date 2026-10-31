@@ -517,6 +517,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "dirs",
+ "flate2",
  "fle-core",
  "form_urlencoded",
  "getrandom 0.2.17",
@@ -524,8 +525,10 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tar",
  "tokio",
  "ureq",
+ "zip",
 ]
 
 [[package]]

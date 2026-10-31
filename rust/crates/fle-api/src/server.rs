@@ -2,6 +2,7 @@
 //! Port of the plumbing in `fle_studio/server.py`; routes live next to the code they call.
 use crate::chats::{ChatError, Chats, MAX_BYTES as MAX_CHAT};
 use crate::downloads::Downloads;
+use crate::engines::{EngineError, Engines};
 use crate::library::{LibError, Library};
 use crate::settings::Config;
 use axum::body::{to_bytes, Body};
@@ -22,6 +23,8 @@ pub struct Options {
     /// The built web page (index.html, js/, css). Later it is embedded in the binary.
     pub web_dir: Option<PathBuf>,
     pub version: String,
+    /// Where GitHub's releases are asked (tests point it at a server of their own).
+    pub github_api: String,
 }
 
 pub struct Studio {
@@ -32,6 +35,7 @@ pub struct Studio {
     pub chat_lock: Mutex<()>,
     pub library: Mutex<Library>,
     pub downloads: Downloads,
+    pub engines: Engines,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -60,6 +64,7 @@ pub fn new_studio(opts: Options) -> Ctx {
                 .unwrap_or_default()
         }),
     );
+    let engines = Engines::new(&home, downloads.clone(), config.clone(), &opts.github_api);
     let chats = Chats::new(&home);
     Arc::new(Studio {
         opts,
@@ -68,6 +73,7 @@ pub fn new_studio(opts: Options) -> Ctx {
         chats,
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
+        engines,
         downloads,
     })
 }
@@ -289,6 +295,10 @@ impl Studio {
         self.config.lock().unwrap().models_dir()
     }
 
+    pub fn sysinfo(&self) -> Value {
+        crate::system::info(&self.models_dir())
+    }
+
     /// Which of the two MTP files are in the models folder (`extras_view`).
     pub fn extras_view(&self) -> Value {
         let root = self.models_dir();
@@ -388,6 +398,16 @@ fn catalog_download_id(p: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// `/api/engines/<id>/remove` -> the engine id (`[\w.-]+`)
+fn engine_remove_id(p: &str) -> Option<&str> {
+    let id = p.strip_prefix("/api/engines/")?.strip_suffix("/remove")?;
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    .then_some(id)
+}
+
 /// `/api/models/<12 hex>/remove` -> the id
 fn model_remove_id(p: &str) -> Option<&str> {
     let id = p.strip_prefix("/api/models/")?.strip_suffix("/remove")?;
@@ -446,6 +466,50 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 .unwrap_or(true);
             st.download_catalog(catalog_download_id(p).unwrap(), mtp)
         }),
+        ("GET", "/api/engines") => {
+            let info = st.sysinfo();
+            let (os, arch) = crate::engines::os_arch();
+            Ok(
+                json!({"installed": st.engines.installed(), "variants": crate::engines::variants(&info, os, &arch)}),
+            )
+        }
+        ("POST", "/api/engines/install") => r.json(MAX_JSON).and_then(|body| {
+            let variant = body
+                .get("variant")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            let info = st.sysinfo();
+            let (os, arch) = crate::engines::os_arch();
+            if !crate::engines::variants(&info, os, &arch)
+                .iter()
+                .any(|v| v["id"] == variant.as_str())
+            {
+                return Err(ApiError(
+                    400,
+                    "That engine does not fit this machine".into(),
+                ));
+            }
+            st.engines.install(&variant, &info).map_err(|e| match e {
+                EngineError::Runtime(m) => ApiError(409, m),
+                EngineError::Network(m) => ApiError(502, format!("Could not reach GitHub: {m}")),
+                EngineError::NotFound => ApiError(404, "Not found".into()),
+            })
+        }),
+        ("POST", "/api/engines/check") => r.json(MAX_JSON).map(|body| {
+            let path = body
+                .get("path")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            st.engines.detect(&path)
+        }),
+        ("POST", _) if engine_remove_id(p).is_some() => {
+            match st.engines.remove(engine_remove_id(p).unwrap()) {
+                Ok(()) => Ok(json!({"ok": true})),
+                Err(_) => Err(ApiError(404, "Not found".into())),
+            }
+        }
         ("GET", "/api/catalog") => {
             Ok(json!({"catalog": st.catalog_view(), "extras": st.extras_view()}))
         }
