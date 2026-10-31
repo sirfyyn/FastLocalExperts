@@ -67,7 +67,7 @@ pub struct Host {
     pub port_free: PortCheck,
 }
 
-fn run_capture(
+pub fn run_capture(
     exe: &Path,
     args: &[&str],
     timeout: u64,

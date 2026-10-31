@@ -37,7 +37,10 @@ impl Drop for Tmp {
     }
 }
 pub fn tmp(n: &str) -> Tmp {
-    let d = std::env::temp_dir().join(format!("fle-api-{}-{n}", std::process::id()));
+    // without symlinks in the path (macOS keeps /var behind /private/var): the Python Studio compares resolved with
+    // unresolved folders in places, and the two only agree when there is nothing to resolve
+    let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    let d = base.join(format!("fle-api-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     Tmp(d)
@@ -146,12 +149,20 @@ pub fn free_port() -> u16 {
         .unwrap()
         .port()
 }
-#[allow(clippy::zombie_processes)] // `Py` kills and waits for the child when it is dropped
 pub fn start_python(src: &Path, home: &Path) -> Py {
+    start_python_with(src, home, "")
+}
+
+/// Like `start_python`, with a line of Python run first (it can change a module constant, for example).
+#[allow(clippy::zombie_processes)] // `Py` kills and waits for the child when it is dropped
+pub fn start_python_with(src: &Path, home: &Path, prelude: &str) -> Py {
     let port = free_port();
+    let code = format!(
+        "import sys\n{prelude}\nfrom fle_studio.__main__ import main\nsys.exit(main(sys.argv[1:]))"
+    );
     let child =
         Command::new(std::env::var("FLE_STUDIO_PYTHON").unwrap_or_else(|_| "python3".into()))
-            .args(["-m", "fle_studio", "--home"])
+            .args(["-c", &code, "--home"])
             .arg(home)
             .args(["--port", &port.to_string(), "--no-browser"])
             .env("PYTHONPATH", src)
@@ -171,10 +182,15 @@ pub fn start_python(src: &Path, home: &Path) -> Py {
     panic!("the Python Studio did not start");
 }
 pub fn start_rust(src: &Path, home: &Path) -> SocketAddr {
+    start_rust_with(src, home, fle_api::engines::GITHUB_API)
+}
+
+pub fn start_rust_with(src: &Path, home: &Path, github_api: &str) -> SocketAddr {
     let st = new_studio(Options {
         home: home.to_path_buf(),
         web_dir: Some(src.join("fle_studio/web")),
         version: python_version(src),
+        github_api: github_api.to_string(),
     });
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
