@@ -12,6 +12,7 @@ pub mod launch;
 pub mod library;
 pub mod live;
 pub mod report_time;
+pub mod run;
 pub mod server;
 pub mod settings;
 pub mod system;

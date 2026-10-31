@@ -1,0 +1,43 @@
+/* Tuner, quality, A/B/A, expert cache view, flag explanations. Loaded by js/tuner.js on demand. */
+
+.explain { margin-top: 12px; }
+.explain summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.explain-list { display: grid; gap: 6px; margin-top: 10px; }
+.explain-row { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; font-size: 13px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+.explain-row .txt { grid-column: 1 / -1; color: var(--muted); }
+.explain-row code { overflow-wrap: anywhere; }
+.explain-row .env { color: var(--cyan); }
+.explain-row .val { color: var(--muted); }
+.explain-row.unknown .txt { color: var(--faint); }
+.explain-row .val { overflow-wrap: anywhere; }
+
+.mode-switch { display: inline-flex; border: 1px solid var(--line-2); border-radius: 9px; overflow: hidden; }
+.mode-switch button { background: transparent; color: var(--muted); border: 0; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+.mode-switch button.on { background: var(--accent-soft); color: var(--text); font-weight: 600; }
+
+.verdict { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+.verdict.better { background: var(--good-soft); color: var(--good); }
+.verdict.worse { background: var(--bad-soft); color: var(--bad); }
+.verdict.noise, .verdict.few { background: var(--soft-2); color: var(--muted); }
+
+.tune-best { display: grid; gap: 4px; padding: 12px 14px; border-radius: 10px; background: var(--good-soft); }
+.tune-best b { font-size: 18px; }
+.checks { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.checks label { display: inline-flex; gap: 6px; align-items: center; font-size: 13.5px; }
+.ci { color: var(--faint); font-size: 12px; white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; }
+
+/* expert cache view */
+.cache-top { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.layer-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 4px; }
+.layer-cell { aspect-ratio: 1; border-radius: 6px; display: grid; place-items: center; font-size: 11px; color: #0b0e14;
+  border: 2px solid transparent; cursor: pointer; background: var(--soft-2); }
+.layer-cell.sel { border-color: var(--text); }
+.hot-grid { display: flex; flex-wrap: wrap; gap: 3px; }
+.hot-cell { width: 26px; height: 26px; border-radius: 5px; display: grid; place-items: center; font-size: 10px; color: #0b0e14; background: var(--soft-2); }
+.chart-svg { width: 100%; height: 150px; display: block; }
+.chart-svg .grid { stroke: var(--line); stroke-width: 1; }
+.chart-svg .ln { fill: none; stroke: var(--accent); stroke-width: 2; }
+.chart-svg .ln.b { stroke: var(--cyan); }
+.chart-svg text { fill: var(--faint); font-size: 10px; }
+.legend-note { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }

@@ -1,0 +1,40 @@
+/* Hosts: the switcher, the colour that says which machine you are on, the notice, the dialogs. Loaded by js/hosts.js. */
+
+.host-switch {
+  display: flex; align-items: center; gap: 9px; width: 100%; padding: 7px 10px; margin: 0 0 8px; cursor: pointer;
+  background: var(--card); color: var(--text); border: 1px solid var(--line); border-radius: 10px; font: inherit; text-align: left;
+}
+.host-switch:hover { border-color: var(--line-2); }
+.host-switch .host-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.host-dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--good); }
+
+/* On a host the whole window says so: a bar across the top and a stripe on the sidebar, in the host's colour. */
+body.host-remote::before {
+  content: ""; position: fixed; left: 0; right: 0; top: 0; height: 3px; background: var(--host, var(--accent)); z-index: 70;
+}
+body.host-remote .sidebar { box-shadow: inset 3px 0 0 var(--host, var(--accent)); }
+body.host-remote .host-switch { border-color: var(--host, var(--accent)); }
+
+.host-banner {
+  position: fixed; top: 12px; left: 50%; transform: translateX(-50%); z-index: 65; display: flex; align-items: center; gap: 12px;
+  width: min(760px, calc(100vw - 24px)); padding: 10px 14px; border-radius: 12px; border: 1px solid var(--bad);
+  background: var(--card); box-shadow: var(--shadow);
+}
+.host-banner > .i { flex: none; color: var(--bad); }
+.host-banner.warn { border-color: var(--warn); }
+.host-banner.warn > .i { color: var(--warn); }
+.host-banner .small { color: var(--muted); overflow-wrap: anywhere; }
+
+.host-modal { width: min(520px, 100%); max-height: calc(100vh - 32px); overflow: auto; }
+.host-modal summary { cursor: pointer; color: var(--muted); }
+.host-modal form > .row > .field { flex: 1; }
+.host-error { color: var(--bad); min-height: 1em; }
+
+.host-row { display: flex; align-items: flex-start; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+.host-row > .host-dot { margin-top: 12px; }
+.host-row .input { height: 30px; max-width: 220px; }
+.host-row .good-text { color: var(--good); }
+.host-row .bad-text { color: var(--bad); }
+.pair-code { font-size: 30px; letter-spacing: 0.18em; font-weight: 600; user-select: all; }
+.fp { overflow-wrap: anywhere; user-select: all; }
+@media (max-width: 720px) { .host-row { flex-wrap: wrap; } }

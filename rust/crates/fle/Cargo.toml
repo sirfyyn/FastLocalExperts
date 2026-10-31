@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 fle-core = { path = "../fle-core" }
+fle-api = { path = "../fle-api" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
