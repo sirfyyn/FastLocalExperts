@@ -14,7 +14,7 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 [Quick start](#quick-start) ·
 [Films](#making-rhea-fast-eight-short-films) ·
 [Website](https://sirfyyn.de/en/fle/) ·
-[FLE Studio](https://github.com/sirfyyn/fle-studio) ·
+[FLE Link](https://flelink.run) ·
 [YouTube](https://www.youtube.com/@sirfyyn)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23272400.svg)](https://doi.org/10.5281/zenodo.23272400)
@@ -178,19 +178,21 @@ The FLE model files are standard GGUF and also load in upstream llama.cpp, for e
 `llama-server -m <file> -cmoe -ngl 99 -c 32768 --jinja`, without the MTP head. With the same file, FLE decoded 2.49
 times as fast as upstream in bracket B1e.
 
-### FLE Studio: the same engine in a browser window
+### FLE Link: run it without a command line
 
-[FLE Studio](https://github.com/sirfyyn/fle-studio) is a local app for macOS, Linux and Windows that runs FLE or plain
-llama.cpp for you: a chat with the live numbers beside it (decode and prefill speed, MTP drafts accepted, expert-cache
-hits, GPU use), a model loader for the files below that checks each download against its SHA-256, launch profiles that
-show the full command before it runs, and a short repeatable speed test. It can download the portable FLE builds from
-this repository's releases, or attach to a llama-server that already runs, also as a systemd service.
+[FLE Link](https://github.com/sirfyyn/flelink) is the layer between an inference engine and the tools that use it. It is one
+file (`flelink`) for macOS, Linux and Windows that looks at the machine, installs the engine that fits (FLE or plain
+llama.cpp), downloads a model that fits and checks it against its SHA-256, chooses the start settings, and serves an
+OpenAI-compatible API with a browser interface beside it: a chat with the live numbers (decode and prefill speed, MTP drafts
+accepted, expert-cache hits, GPU use), launch profiles that show the full command before it runs, and a short repeatable
+speed test. It can also attach to a llama-server that already runs, also as a systemd service. This repository is the
+engine only; FLE Link and the engine can be replaced independently.
 
-<a href="https://github.com/sirfyyn/fle-studio/blob/main/docs/media/fle-studio.mp4"><img alt="FLE Studio running Rhea (FLE-IQ3_M with its MTP head): a question, the answer streaming, the live data. Click for the full video." src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/fle-studio.gif"></a>
+<a href="https://github.com/sirfyyn/fle-studio/blob/main/docs/media/fle-studio.mp4"><img alt="FLE Link (then called FLE Studio) running Rhea (FLE-IQ3_M with its MTP head): a question, the answer streaming, the live data. Click for the full video." src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/fle-studio.gif"></a>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-dark.png">
-  <img alt="The engine view of FLE Studio attached to a systemd service running FLE" src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-light.png">
+  <img alt="The engine view of FLE Link attached to a systemd service running FLE" src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-light.png">
 </picture>
 
 Recorded on the reference machine against the running service. The speeds in the recording are single answers right
