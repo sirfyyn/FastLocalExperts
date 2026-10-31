@@ -1,0 +1,272 @@
+{
+ "reference_machine": "RTX PRO 4500 Blackwell 32 GB, 120 GB DDR5, Ryzen 9 9950X3D, Linux",
+ "report_url": "https://sirfyyn.github.io/FastLocalExperts/",
+ "models": [
+  {
+   "id": "fle-iq2_m",
+   "name": "FLE-IQ2_M",
+   "family": "Qwen3.8-Flash-Next",
+   "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+   "files": [
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ2_M/Qwen3.8-Flash-Next-FLE-IQ2_M-00001-of-00002.gguf",
+     "size": 42817327392,
+     "sha256": "36fa6072301df9bbc54000164625cc4a7292030f84e834d8a2fe1be65d97cc9c",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ2_M-00001-of-00002.gguf"
+    },
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ2_M/Qwen3.8-Flash-Next-FLE-IQ2_M-00002-of-00002.gguf",
+     "size": 28800138432,
+     "sha256": "2fab43ec437fb7f0007686ac5ada3935ce7119fcfd8a3101931ab16485431155",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ2_M-00002-of-00002.gguf"
+    }
+   ],
+   "summary": "Smallest and fastest FLE file. KL divergence clearly below the larger Unsloth UD-IQ1_M.",
+   "kld": [
+    0.16,
+    0.163,
+    0.339
+   ],
+   "speed": "+11.6 % decode against FLE-IQ3_M [95 %: +9.8 .. +13.4]",
+   "measured": {
+    "ram_gib": 38.7,
+    "pinned_gib": 36.7,
+    "gpu_mib": 31501,
+    "load_s": 127
+   },
+   "mtp": true,
+   "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5
+   },
+   "license": "Qwen Community License 1.0",
+   "notes": [],
+   "size": 71617465824,
+   "url": "https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF"
+  },
+  {
+   "id": "fle-iq3_xxs",
+   "name": "FLE-IQ3_XXS",
+   "family": "Qwen3.8-Flash-Next",
+   "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+   "files": [
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ3_XXS/Qwen3.8-Flash-Next-FLE-IQ3_XXS-00001-of-00002.gguf",
+     "size": 44931055808,
+     "sha256": "363de45326e29a1d210077cc30340a25df2281514cf04969672b8d5d2abc505f",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_XXS-00001-of-00002.gguf"
+    },
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ3_XXS/Qwen3.8-Flash-Next-FLE-IQ3_XXS-00002-of-00002.gguf",
+     "size": 34552744320,
+     "sha256": "271b45f015bc1aa97fa44adf5c957330feb81ea85158b6428445fb441f8763b0",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_XXS-00002-of-00002.gguf"
+    }
+   ],
+   "summary": "Same KL divergence as Unsloth UD-IQ3_XXS at 2.5 GB less; as fast as FLE-IQ3_M at 9.4 GB less.",
+   "kld": [
+    0.09,
+    0.093,
+    0.227
+   ],
+   "speed": "−0.7 % decode against FLE-IQ3_M [−2.1 .. +0.6], i.e. the same",
+   "measured": {
+    "ram_gib": 46.1,
+    "pinned_gib": 43.9,
+    "gpu_mib": 31279,
+    "load_s": 241
+   },
+   "mtp": true,
+   "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5
+   },
+   "license": "Qwen Community License 1.0",
+   "notes": [],
+   "size": 79483800128,
+   "url": "https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF"
+  },
+  {
+   "id": "fle-iq3_m-reap448",
+   "name": "FLE-IQ3_M-REAP448",
+   "family": "Qwen3.8-Flash-Next",
+   "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF",
+   "files": [
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF",
+     "path": "Qwen3.8-Flash-Next-FLE-IQ3_M-REAP448-00001-of-00002.gguf",
+     "size": 44914807136,
+     "sha256": "b0d002c1c68896618ce3b481a811f3245d152a276cec947204c7f0590bed9516",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_M-REAP448-00001-of-00002.gguf"
+    },
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF",
+     "path": "Qwen3.8-Flash-Next-FLE-IQ3_M-REAP448-00002-of-00002.gguf",
+     "size": 37087295680,
+     "sha256": "27f52c8db7725da78c0b03bbc4e90ac5b4bb3cd1419f97e2d74e6e5203f5cbec",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_M-REAP448-00002-of-00002.gguf"
+    }
+   ],
+   "summary": "FLE-IQ3_M with 64 of 512 experts per layer pruned by REAP saliency. Lower KLD than UD-IQ3_XXS at the same size; answers slightly fewer knowledge questions than FLE-IQ3_M.",
+   "kld": [
+    0.08,
+    0.086,
+    0.185
+   ],
+   "speed": "+0.7 % decode against FLE-IQ3_M [−0.3 .. +1.8], i.e. the same",
+   "measured": {
+    "ram_gib": 48.0,
+    "pinned_gib": 46.1,
+    "gpu_mib": 31367,
+    "load_s": 127
+   },
+   "mtp": true,
+   "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5
+   },
+   "license": "Qwen Community License 1.0",
+   "notes": [
+    "MKQA knowledge probe: −1.8 (German) / −3.2 (English) points against FLE-IQ3_M."
+   ],
+   "size": 82002102816,
+   "url": "https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-REAP448-GGUF"
+  },
+  {
+   "id": "fle-iq3_m",
+   "name": "FLE-IQ3_M",
+   "family": "Qwen3.8-Flash-Next",
+   "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+   "files": [
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ3_M/Qwen3.8-Flash-Next-FLE-IQ3_M-00001-of-00002.gguf",
+     "size": 44677859104,
+     "sha256": "624718434053eb01798d20c0f35f4673db58ee629cd01f9aee236e80c9f474dc",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_M-00001-of-00002.gguf"
+    },
+    {
+     "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+     "path": "IQ3_M/Qwen3.8-Flash-Next-FLE-IQ3_M-00002-of-00002.gguf",
+     "size": 44194382624,
+     "sha256": "7b3b094d2e5f0724720c217633677c450637cdd0212b02aad7a576510ecffa6a",
+     "name": "Qwen3.8-Flash-Next-FLE-IQ3_M-00002-of-00002.gguf"
+    }
+   ],
+   "summary": "Best quality of the FLE files: KL divergence within noise of Unsloth UD-IQ4_XS at 4.8 GB less.",
+   "kld": [
+    0.051,
+    0.05,
+    0.129
+   ],
+   "speed": "measured with the FLE engine and the MTP head on the reference machine: 91 tokens/s decode over six tasks, about 100 tokens/s on 24 greedy prompts",
+   "measured": {
+    "ram_gib": 54.3,
+    "pinned_gib": 52.2,
+    "gpu_mib": 31315,
+    "load_s": 167
+   },
+   "mtp": true,
+   "sampling": {
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 1.5
+   },
+   "license": "Qwen Community License 1.0",
+   "notes": [],
+   "size": 88872241728,
+   "url": "https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF"
+  },
+  {
+   "id": "gpt-oss-20b",
+   "name": "gpt-oss-20b (MXFP4)",
+   "family": "gpt-oss",
+   "repo": "ggml-org/gpt-oss-20b-GGUF",
+   "files": [
+    {
+     "repo": "ggml-org/gpt-oss-20b-GGUF",
+     "path": "gpt-oss-20b-MXFP4.gguf",
+     "size": 12109566624,
+     "sha256": "",
+     "name": "gpt-oss-20b-MXFP4.gguf"
+    }
+   ],
+   "summary": "OpenAI's open 21B-parameter mixture-of-experts model (3.6B active, 32 experts per layer) in its native MXFP4 format. Small enough to try the tuner and the expert cache view on a 16 GB GPU.",
+   "kld": null,
+   "speed": "",
+   "measured": {},
+   "mtp": false,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "license": "Apache-2.0",
+   "notes": [
+    "Not measured by FLE Studio: no speed or KL numbers yet. Run the tuner to find the best settings for your machine."
+   ],
+   "size": 12109566624,
+   "url": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF"
+  },
+  {
+   "id": "gpt-oss-120b",
+   "name": "gpt-oss-120b (MXFP4)",
+   "family": "gpt-oss",
+   "repo": "ggml-org/gpt-oss-120b-GGUF",
+   "files": [
+    {
+     "repo": "ggml-org/gpt-oss-120b-GGUF",
+     "path": "gpt-oss-120b-MXFP4.gguf",
+     "size": 63387346208,
+     "sha256": "",
+     "name": "gpt-oss-120b-MXFP4.gguf"
+    }
+   ],
+   "summary": "OpenAI's open 117B-parameter mixture-of-experts model (5.1B active, 128 experts per layer) in its native MXFP4 format. Needs about 64 GB of RAM plus a GPU for the attention layers.",
+   "kld": null,
+   "speed": "",
+   "measured": {},
+   "mtp": false,
+   "sampling": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0
+   },
+   "license": "Apache-2.0",
+   "notes": [
+    "Not measured by FLE Studio: no speed or KL numbers yet. Run the tuner to find the best settings for your machine."
+   ],
+   "size": 63387346208,
+   "url": "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF"
+  }
+ ],
+ "mtp_head": {
+  "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+  "path": "mtp/mtp-Qwen3.8-Flash-Next-FLE-IQ4_NL.gguf",
+  "size": 1528277056,
+  "sha256": "25217613e5e4659186db0b81ce2be77ab5955d01817732e4597b8f2bf0e292fa",
+  "name": "mtp-Qwen3.8-Flash-Next-FLE-IQ4_NL.gguf"
+ },
+ "mtp_vocab": {
+  "repo": "sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF",
+  "path": "mtp/fle-mtp-vocab-32k.txt",
+  "size": 281159,
+  "sha256": "8385f0457511fe600986bbd0ecb0b32766cbe31859c12e78a033685c28eef0d8",
+  "name": "fle-mtp-vocab-32k.txt"
+ }
+}

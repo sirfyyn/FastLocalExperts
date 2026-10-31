@@ -520,7 +520,9 @@ dependencies = [
  "fle-core",
  "form_urlencoded",
  "getrandom 0.2.17",
+ "hex",
  "serde_json",
+ "sha1",
  "tokio",
 ]
 

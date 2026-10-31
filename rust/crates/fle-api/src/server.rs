@@ -1,6 +1,8 @@
 //! The HTTP side of FLE Studio: the guard (host name, origin, session token), the JSON conventions and the static page.
 //! Port of the plumbing in `fle_studio/server.py`; routes live next to the code they call.
 use crate::chats::{ChatError, Chats, MAX_BYTES as MAX_CHAT};
+use crate::downloads::Downloads;
+use crate::library::{LibError, Library};
 use crate::settings::Config;
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, State};
@@ -28,6 +30,8 @@ pub struct Studio {
     pub config: Mutex<Config>,
     pub chats: Chats,
     pub chat_lock: Mutex<()>,
+    pub library: Mutex<Library>,
+    pub downloads: Mutex<Downloads>,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -43,13 +47,16 @@ fn make_token() -> String {
 
 pub fn new_studio(opts: Options) -> Ctx {
     let config = Config::load(&opts.home.join("settings.json"));
-    let chats = Chats::new(&opts.home);
+    let home = opts.home.clone();
+    let chats = Chats::new(&home);
     Arc::new(Studio {
         opts,
         token: make_token(),
         config: Mutex::new(config),
         chats,
         chat_lock: Mutex::new(()),
+        library: Mutex::new(Library::new(&home)),
+        downloads: Mutex::new(Downloads::new(&home)),
     })
 }
 
@@ -265,6 +272,63 @@ fn chat_id(p: &str) -> Option<&str> {
     .then_some(id)
 }
 
+impl Studio {
+    pub fn models_dir(&self) -> std::path::PathBuf {
+        self.config.lock().unwrap().models_dir()
+    }
+
+    /// Which of the two MTP files are in the models folder (`extras_view`).
+    pub fn extras_view(&self) -> Value {
+        let root = self.models_dir();
+        let one = |r: &Value| {
+            let dest = root
+                .join(r["repo"].as_str().unwrap_or(""))
+                .join(r["path"].as_str().unwrap_or(""));
+            json!({"name": r["name"], "size": r["size"], "present": dest.exists()})
+        };
+        json!({"mtp_head": one(crate::catalog::mtp_head()), "mtp_vocab": one(crate::catalog::mtp_vocab())})
+    }
+
+    /// The catalog with what is already on disk and what is being downloaded (`catalog_view`).
+    pub fn catalog_view(&self) -> Value {
+        let info = crate::system::info(&self.models_dir());
+        let models = self.library.lock().unwrap().scan(&self.models_dir());
+        let jobs = self.downloads.lock().unwrap().list();
+        let mut out = vec![];
+        for mut entry in crate::catalog::catalog(&info) {
+            let id = entry["id"].clone();
+            let local = models
+                .iter()
+                .rev()
+                .find(|m| !m["catalog_id"].is_null() && m["catalog_id"] == id)
+                .cloned();
+            let key = format!("catalog:{}", id.as_str().unwrap_or(""));
+            let job = jobs
+                .iter()
+                .rev()
+                .find(|j| {
+                    j["dedupe"] == key.as_str()
+                        && !matches!(j["state"].as_str(), Some("done" | "cancelled"))
+                })
+                .cloned();
+            entry.insert("local".into(), local.unwrap_or(Value::Null));
+            entry.insert("job".into(), job.unwrap_or(Value::Null));
+            out.push(Value::Object(entry));
+        }
+        Value::Array(out)
+    }
+}
+
+/// `/api/models/<12 hex>/remove` -> the id
+fn model_remove_id(p: &str) -> Option<&str> {
+    let id = p.strip_prefix("/api/models/")?.strip_suffix("/remove")?;
+    (id.len() == 12
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(id)
+}
+
 fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
     let (m, p) = (r.method.as_str(), r.path.as_str());
     Some(match (m, p) {
@@ -278,6 +342,38 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 .update(&body)
                 .map_err(|e| ApiError(400, e))
         }),
+        ("GET", "/api/models") => {
+            let models = st.library.lock().unwrap().scan(&st.models_dir());
+            Ok(json!({"models": models, "extras": st.extras_view()}))
+        }
+        ("POST", "/api/models/add") => r.json(MAX_JSON).and_then(|body| {
+            let path = body
+                .get("path")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            st.library
+                .lock()
+                .unwrap()
+                .add(&st.models_dir(), &path)
+                .map_err(|e| ApiError(400, e))
+        }),
+        ("POST", _) if model_remove_id(p).is_some() => r.json(MAX_JSON).and_then(|body| {
+            let delete = body.get("delete").is_some_and(crate::settings::py_truthy);
+            match st.library.lock().unwrap().remove(
+                &st.models_dir(),
+                model_remove_id(p).unwrap(),
+                delete,
+            ) {
+                Ok(()) => Ok(json!({"ok": true})),
+                Err(LibError::NotFound) => Err(ApiError(404, "Not found".into())),
+                Err(LibError::Invalid(m)) => Err(ApiError(400, m)),
+            }
+        }),
+        ("GET", "/api/catalog") => {
+            Ok(json!({"catalog": st.catalog_view(), "extras": st.extras_view()}))
+        }
+        ("GET", "/api/downloads") => Ok(json!({"downloads": st.downloads.lock().unwrap().list()})),
         ("GET", "/api/chats") => Ok(json!({"chats": st.chats.list()})),
         ("POST", "/api/chats") => r.json(MAX_CHAT).and_then(|body| {
             let _g = st.chat_lock.lock().unwrap();
