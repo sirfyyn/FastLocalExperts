@@ -3,6 +3,7 @@
 use crate::chats::{ChatError, Chats, MAX_BYTES as MAX_CHAT};
 use crate::downloads::Downloads;
 use crate::engines::{EngineError, Engines};
+use crate::launch::Profiles;
 use crate::library::{LibError, Library};
 use crate::settings::Config;
 use axum::body::{to_bytes, Body};
@@ -36,6 +37,7 @@ pub struct Studio {
     pub library: Mutex<Library>,
     pub downloads: Downloads,
     pub engines: Engines,
+    pub profiles: Mutex<Profiles>,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -74,6 +76,7 @@ pub fn new_studio(opts: Options) -> Ctx {
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
         engines,
+        profiles: Mutex::new(Profiles::new(&home)),
         downloads,
     })
 }
@@ -408,6 +411,16 @@ fn engine_remove_id(p: &str) -> Option<&str> {
     .then_some(id)
 }
 
+/// `/api/profiles/<id>/delete` -> the profile id (`[\w.-]+`)
+fn profile_delete_id(p: &str) -> Option<&str> {
+    let id = p.strip_prefix("/api/profiles/")?.strip_suffix("/delete")?;
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    .then_some(id)
+}
+
 /// `/api/models/<12 hex>/remove` -> the id
 fn model_remove_id(p: &str) -> Option<&str> {
     let id = p.strip_prefix("/api/models/")?.strip_suffix("/remove")?;
@@ -509,6 +522,27 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 Ok(()) => Ok(json!({"ok": true})),
                 Err(_) => Err(ApiError(404, "Not found".into())),
             }
+        }
+        ("GET", "/api/profiles") => Ok(
+            json!({"profiles": st.profiles.lock().unwrap().all().iter().map(|p| p.public()).collect::<Vec<_>>()}),
+        ),
+        ("POST", "/api/profiles") => r.json(MAX_JSON).and_then(|body| {
+            st.profiles
+                .lock()
+                .unwrap()
+                .save(&body)
+                .map(|p| p.public())
+                .map_err(|e| ApiError(400, e.0))
+        }),
+        ("POST", _) if profile_delete_id(p).is_some() => {
+            let id = profile_delete_id(p).unwrap();
+            st.profiles.lock().unwrap().delete(id);
+            let mut cfg = st.config.lock().unwrap();
+            if cfg.get("launch.profile").and_then(Value::as_str) == Some(id) {
+                let patch = json!({"launch": {"profile": "auto"}});
+                let _ = cfg.update(patch.as_object().unwrap());
+            }
+            Ok(json!({"ok": true}))
         }
         ("GET", "/api/catalog") => {
             Ok(json!({"catalog": st.catalog_view(), "extras": st.extras_view()}))
