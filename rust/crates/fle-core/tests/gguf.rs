@@ -54,11 +54,24 @@ fn write(path: &Path, kv: &[(&str, V)], tensors: &[(&str, Vec<u64>)], cut: usize
     std::fs::write(path, h).unwrap();
 }
 
-fn tmp(n: &str) -> PathBuf {
+/// A scratch folder that is removed when the test ends, also when it fails.
+struct Tmp(PathBuf);
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn tmp(n: &str) -> Tmp {
     let d = std::env::temp_dir().join(format!("fle-gguf-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 
 fn moe_kv() -> Vec<(&'static str, V)> {

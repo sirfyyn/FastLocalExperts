@@ -66,25 +66,38 @@ pub fn kv(arch: &'static str, name: &'static str, experts: bool) -> Vec<(&'stati
     v
 }
 pub fn tensors(experts: bool) -> Vec<(String, Vec<u64>)> {
-    let mut t = vec![("token_embd.weight".to_string(), vec![1024, 512])];
+    let mut t = vec![("token_embd.weight".to_string(), vec![64, 32])];
     for l in 0..4 {
-        t.push((format!("blk.{l}.attn_q.weight"), vec![1024, 1024]));
+        t.push((format!("blk.{l}.attn_q.weight"), vec![64, 64]));
         if experts {
-            t.push((format!("blk.{l}.ffn_up_exps.weight"), vec![256, 512, 64]));
-            t.push((format!("blk.{l}.ffn_down_exps.weight"), vec![512, 256, 64]));
+            t.push((format!("blk.{l}.ffn_up_exps.weight"), vec![16, 32, 8]));
+            t.push((format!("blk.{l}.ffn_down_exps.weight"), vec![32, 16, 8]));
         } else {
-            t.push((format!("blk.{l}.ffn_up.weight"), vec![1024, 2048]));
+            t.push((format!("blk.{l}.ffn_up.weight"), vec![64, 128]));
         }
     }
-    t.push(("output.weight".to_string(), vec![1024, 512]));
+    t.push(("output.weight".to_string(), vec![64, 32]));
     t
 }
 
-pub fn tmp(n: &str) -> PathBuf {
+/// A scratch folder that is removed when the test ends, also when it fails.
+pub struct Tmp(pub PathBuf);
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+pub fn tmp(n: &str) -> Tmp {
     let d = std::env::temp_dir().join(format!("fle-launch-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 
 pub fn engine(dir: &Path, name: &str, fle: bool, spec: bool) -> String {

@@ -24,11 +24,24 @@ fn studio_src() -> Option<PathBuf> {
 fn dirs_home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
-fn tmp(n: &str) -> PathBuf {
+/// A scratch folder that is removed when the test ends, also when it fails.
+struct Tmp(PathBuf);
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn tmp(n: &str) -> Tmp {
     let d = std::env::temp_dir().join(format!("fle-api-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 
 struct Resp {
@@ -400,6 +413,37 @@ fn stage_zero_plumbing_matches_the_python_studio() {
         both("ping", "GET", "/api/ping", &[], None, false);
         both("head ping", "HEAD", "/api/ping", &[], None, false);
         both("settings", "GET", "/api/settings", &[], None, false);
+        {
+            // the machine is the same, but memory in use and free disk move between two calls: compare what stands still
+            let get = |addr: SocketAddr| {
+                let r = http(addr, "GET", "/api/system", &[], None);
+                assert_eq!(r.status, 200);
+                let mut v: Value = serde_json::from_slice(&r.body).unwrap();
+                v["python"] = json!("");
+                v["memory"]["available"] = json!(0);
+                v["disk_free"] = json!(0);
+                if let Some(gs) = v["gpus"].as_array_mut() {
+                    gs.iter_mut().for_each(|g| {
+                        for k in ["utilization", "power_w", "temperature_c", "memory_used"] {
+                            if g.get(k).is_some() {
+                                g[k] = json!(0);
+                            }
+                        }
+                    });
+                }
+                serde_json::from_str::<Value>(
+                    &v.to_string().replace("-rs", "-X").replace("-py", "-X"),
+                )
+                .unwrap()
+            };
+            let (a, b) = (get(rs), get(py.addr));
+            assert_eq!(a, b, "[{variant}] /api/system differs");
+            assert_eq!(
+                a.as_object().unwrap().keys().collect::<Vec<_>>(),
+                b.as_object().unwrap().keys().collect::<Vec<_>>(),
+                "[{variant}] /api/system key order"
+            );
+        }
         for (i, body) in [
             json!({"launch": {"context": "8192", "parallel": 3, "mtp": "off", "extra_args": "--x 1"}}),
             json!({"chat": {"temperature": "0.25", "top_k": 40.9, "thinking": 0, "system_prompt": null}, "theme": "dark"}),
