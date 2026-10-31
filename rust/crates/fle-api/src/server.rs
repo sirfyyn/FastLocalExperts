@@ -2,6 +2,7 @@
 //! Port of the plumbing in `fle_studio/server.py`; routes live next to the code they call.
 use crate::chats::{ChatError, Chats, MAX_BYTES as MAX_CHAT};
 use crate::downloads::Downloads;
+use crate::engine::{Engine, EngineErr};
 use crate::engines::{EngineError, Engines};
 use crate::launch::Profiles;
 use crate::library::{LibError, Library};
@@ -38,6 +39,7 @@ pub struct Studio {
     pub downloads: Downloads,
     pub engines: Engines,
     pub profiles: Mutex<Profiles>,
+    pub engine: Engine,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -67,6 +69,15 @@ pub fn new_studio(opts: Options) -> Ctx {
         }),
     );
     let engines = Engines::new(&home, downloads.clone(), config.clone(), &opts.github_api);
+    let engine = Engine::new(&home);
+    engine.set_restart_on_crash(
+        config
+            .lock()
+            .unwrap()
+            .get("launch.restart_on_crash")
+            .map(crate::settings::py_truthy)
+            .unwrap_or(false),
+    );
     let chats = Chats::new(&home);
     Arc::new(Studio {
         opts,
@@ -76,6 +87,7 @@ pub fn new_studio(opts: Options) -> Ctx {
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
         engines,
+        engine,
         profiles: Mutex::new(Profiles::new(&home)),
         downloads,
     })
@@ -298,6 +310,179 @@ impl Studio {
         self.config.lock().unwrap().models_dir()
     }
 
+    /// The engine a start should use (`engine_for`).
+    pub fn engine_for(&self, want: &str, info: &Value) -> Result<Value, ApiError> {
+        let (custom_path, choice) = {
+            let c = self.config.lock().unwrap();
+            let g = |k: &str| {
+                c.get("engine")
+                    .and_then(|e| e.get(k))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            (g("custom_path"), g("choice"))
+        };
+        let custom = if custom_path.is_empty() {
+            None
+        } else {
+            self.engines.resolve("custom", info).ok()
+        };
+        if want == "custom" {
+            return custom.ok_or_else(|| {
+                ApiError(
+                    400,
+                    "Set a working llama-server path on the Engine page".into(),
+                )
+            });
+        }
+        if let Some(c) = &custom {
+            if (want == "fle" || want == "upstream") && c["flavor"] == want && choice == "custom" {
+                return Ok(c.clone());
+            }
+        }
+        match self.engines.resolve(want, info) {
+            Ok(e) => Ok(e),
+            Err(EngineError::Runtime(m)) => match custom {
+                Some(c) if want == "auto" || c["flavor"] == want => Ok(c),
+                _ => Err(ApiError(409, m)),
+            },
+            Err(_) => Err(ApiError(409, "No engine".into())),
+        }
+    }
+
+    /// The command a start would run (`make_plan`).
+    pub fn make_plan(
+        &self,
+        model_ident: &str,
+        profile_ident: Option<&Value>,
+    ) -> Result<crate::launch::Plan, ApiError> {
+        use crate::launch::{
+            auto_plan, free_port, profile_plan, AutoInput, PlanError, ProfileInput,
+        };
+        enum Fail {
+            Api(ApiError),
+            Plan(PlanError),
+        }
+        let model = if model_ident.is_empty() {
+            None
+        } else {
+            self.library
+                .lock()
+                .unwrap()
+                .get(&self.models_dir(), model_ident)
+        };
+        let settings = Value::Object(self.config.lock().unwrap().data.clone());
+        let given = profile_ident
+            .filter(|v| crate::settings::py_truthy(v))
+            .map(crate::settings::py_str);
+        let prof_id = given
+            .clone()
+            .unwrap_or_else(|| match settings["launch"].get("profile") {
+                Some(v) if crate::settings::py_truthy(v) => crate::settings::py_str(v),
+                _ => "auto".into(),
+            });
+        let info = self.sysinfo();
+        let want_port = settings["launch"]
+            .get("port")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .clamp(0, 65535) as u16;
+        let port = i64::from(free_port(want_port));
+        let data_dir = self.opts.home.clone();
+        let attempt = || -> Result<crate::launch::Plan, Fail> {
+            if prof_id == "auto" {
+                let Some(m) = &model else {
+                    return Err(Fail::Api(ApiError(404, "Choose a model first".into())));
+                };
+                if m["complete"] != json!(true) {
+                    return Err(Fail::Api(ApiError(
+                        409,
+                        "This model is not completely downloaded yet".into(),
+                    )));
+                }
+                let eng = self.engine_for("auto", &info).map_err(Fail::Api)?;
+                return auto_plan(&AutoInput {
+                    model: m,
+                    engine: &eng,
+                    settings: &settings,
+                    sysinfo: &info,
+                    port,
+                    data_dir: &data_dir,
+                })
+                .map_err(Fail::Plan);
+            }
+            let prof =
+                self.profiles.lock().unwrap().get(&prof_id).ok_or_else(|| {
+                    Fail::Api(ApiError(404, format!("No launch profile {prof_id}")))
+                })?;
+            let pengine = crate::settings::py_str(&prof.engine);
+            let eng: Option<Value> = if pengine == "custom" {
+                let bin = crate::settings::py_str(&prof.binary);
+                // Only to learn which flags its binary knows; the profile still starts that binary.
+                if !bin.is_empty() && !bin.contains('{') {
+                    Some(self.engines.detect(&bin))
+                } else {
+                    None
+                }
+            } else {
+                Some(self.engine_for(&pengine, &info).map_err(Fail::Api)?)
+            };
+            profile_plan(&ProfileInput {
+                profile: &prof,
+                model: model.as_ref(),
+                engine: eng.as_ref(),
+                settings: &settings,
+                sysinfo: &info,
+                port,
+                data_dir: &data_dir,
+            })
+            .map_err(Fail::Plan)
+        };
+        match attempt() {
+            Ok(p) => Ok(p),
+            Err(Fail::Api(e)) => Err(e),
+            Err(Fail::Plan(exc)) => {
+                // Plan-time upstream fallback: if the FLE plan cannot be built (no NVIDIA GPU for the FLE engine, say),
+                // retry once with an installed upstream llama-server and speculation off.
+                if given.is_some()
+                    || settings["launch"]
+                        .get("profile")
+                        .and_then(Value::as_str)
+                        .unwrap_or("auto")
+                        != "auto"
+                {
+                    return Err(ApiError(400, exc.0));
+                }
+                let Some(up) = self.engines.resolve("upstream", &info).ok() else {
+                    return Err(ApiError(
+                        400,
+                        format!(
+                            "{} No upstream llama.cpp is installed to fall back to.",
+                            exc.0
+                        ),
+                    ));
+                };
+                let mut fb = settings.clone();
+                fb["launch"]["mtp"] = json!(false);
+                fb["launch"]["spec"] = json!("none");
+                let m = model.clone().unwrap_or(Value::Null);
+                let mut plan = auto_plan(&AutoInput {
+                    model: &m,
+                    engine: &up,
+                    settings: &fb,
+                    sysinfo: &info,
+                    port,
+                    data_dir: &data_dir,
+                })
+                .map_err(|e| ApiError(400, e.0))?;
+                plan.notes.insert(0, format!("FLE plan failed: {}", exc.0));
+                plan.notes.insert(1, "Falling back to upstream llama.cpp; FLE features and speculation are disabled.".into());
+                Ok(plan)
+            }
+        }
+    }
+
     pub fn sysinfo(&self) -> Value {
         crate::system::info(&self.models_dir())
     }
@@ -419,6 +604,19 @@ fn profile_delete_id(p: &str) -> Option<&str> {
             .chars()
             .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')))
     .then_some(id)
+}
+
+fn engine_err(e: EngineErr) -> ApiError {
+    match e {
+        EngineErr::Busy(m) => ApiError(409, m),
+        EngineErr::Invalid(m) => ApiError(400, m),
+    }
+}
+
+/// `/api/engine/service/<start|stop|restart>` -> the action
+fn engine_service_action(p: &str) -> Option<&str> {
+    p.strip_prefix("/api/engine/service/")
+        .filter(|a| matches!(*a, "start" | "stop" | "restart"))
 }
 
 /// `/api/models/<12 hex>/remove` -> the id
@@ -544,6 +742,111 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
             }
             Ok(json!({"ok": true}))
         }
+        ("GET", "/api/engine") => Ok(st.engine.status()),
+        ("GET", "/api/engine/log") => Ok(st.engine.log_since(
+            r.query
+                .get("since")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0),
+            2000,
+        )),
+        ("POST", "/api/engine/preview") => r.json(MAX_JSON).and_then(|body| {
+            let model = body
+                .get("model")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            st.make_plan(&model, body.get("profile"))
+                .map(|p| p.public())
+        }),
+        ("POST", "/api/engine/start") => r.json(MAX_JSON).and_then(|body| {
+            let last = st
+                .config
+                .lock()
+                .unwrap()
+                .get("last_model")
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            let model = body
+                .get("model")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or(last);
+            let cfg_profile = st.config.lock().unwrap().get("launch.profile").cloned();
+            let profile = body
+                .get("profile")
+                .filter(|v| crate::settings::py_truthy(v))
+                .cloned()
+                .or(cfg_profile);
+            let plan = st.make_plan(&model, profile.as_ref())?;
+            let roc = st
+                .config
+                .lock()
+                .unwrap()
+                .get("launch.restart_on_crash")
+                .map(crate::settings::py_truthy)
+                .unwrap_or(false);
+            st.engine.set_restart_on_crash(roc);
+            st.engine.start(plan).map_err(engine_err)?;
+            let shown = profile
+                .filter(crate::settings::py_truthy)
+                .unwrap_or(json!("auto"));
+            let patch = json!({"last_model": model, "launch": {"profile": shown}});
+            st.config
+                .lock()
+                .unwrap()
+                .update(patch.as_object().unwrap())
+                .map_err(|e| ApiError(400, e))?;
+            Ok(st.engine.status())
+        }),
+        ("POST", "/api/engine/stop") => {
+            if !st.engine.bound().is_empty() {
+                let _ = st
+                    .config
+                    .lock()
+                    .unwrap()
+                    .update(json!({"attach_auto": false}).as_object().unwrap());
+            }
+            st.engine.stop();
+            Ok(st.engine.status())
+        }
+        ("POST", "/api/engine/attach") => r.json(MAX_JSON).and_then(|body| {
+            let get = |k: &str| {
+                body.get(k)
+                    .filter(|v| crate::settings::py_truthy(v))
+                    .map(crate::settings::py_str)
+                    .unwrap_or_default()
+            };
+            let (url, unit) = (get("url"), get("service").trim().to_string());
+            let mut patch = json!({"attach_url": url, "attach_service": unit});
+            if let Some(k) = body.get("key").filter(|k| !k.is_null()) {
+                patch["attach_key"] = json!(crate::settings::py_str(k));
+            }
+            st.config
+                .lock()
+                .unwrap()
+                .update(patch.as_object().unwrap())
+                .map_err(|e| ApiError(400, e))?;
+            let key = st
+                .config
+                .lock()
+                .unwrap()
+                .get("attach_key")
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            let status = st.engine.attach(&url, &key, &unit).map_err(engine_err)?;
+            let _ = st
+                .config
+                .lock()
+                .unwrap()
+                .update(json!({"attach_auto": true}).as_object().unwrap());
+            Ok(status)
+        }),
+        ("POST", _) if engine_service_action(p).is_some() => Err(ApiError(
+            400,
+            "FLE Studio is not connected to a service.".into(),
+        )),
         ("GET", "/api/catalog") => {
             Ok(json!({"catalog": st.catalog_view(), "extras": st.extras_view()}))
         }
