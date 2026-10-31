@@ -510,7 +510,7 @@ pub fn resolve_model(path: &Path) -> Result<PathBuf> {
     Ok(p)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Model {
     pub first: PathBuf,
     pub parts: Vec<PathBuf>,
@@ -647,6 +647,17 @@ pub fn read_model(path: &Path) -> Result<Model> {
 impl Model {
     pub fn complete(&self) -> bool {
         self.missing.is_empty() && self.incomplete.is_empty()
+    }
+    pub fn context_length(&self) -> Option<u64> {
+        self.num("context_length")
+    }
+    /// Experts per layer; `None` for a dense model.
+    pub fn experts(&self) -> Option<u64> {
+        self.num("expert_count")
+    }
+    /// Same rule as `Model.is_moe` in the Python helper.
+    pub fn is_moe(&self) -> bool {
+        self.experts().unwrap_or(0) > 0 && self.expert_bytes > 0
     }
     fn num(&self, key: &str) -> Option<u64> {
         let full = format!("{}.{key}", self.arch);

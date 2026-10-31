@@ -8,6 +8,7 @@ pub mod config;
 pub mod download;
 pub mod engines;
 pub mod gguf;
+pub mod launch;
 pub mod plan;
 pub mod policy;
 pub mod server;
