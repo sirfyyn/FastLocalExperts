@@ -122,13 +122,13 @@ pub fn tensor_nbytes(shape: &[u64], type_id: u32, layout: &str) -> u64 {
     let Some((_, block, size, row_meta)) = type_info(type_id, layout) else {
         return 0;
     };
-    if shape.is_empty() || shape.iter().any(|d| *d == 0) || block == 0 {
+    if shape.is_empty() || shape.contains(&0) || block == 0 {
         return 0;
     }
     if block == 1 {
         return size * shape.iter().product::<u64>();
     }
-    if shape[0] % block != 0 {
+    if !shape[0].is_multiple_of(block) {
         return 0;
     }
     let row = row_meta + size * (shape[0] / block);
@@ -191,8 +191,8 @@ impl<T: Read + Seek> R<T> {
         Some(match t {
             0 | 1 | 7 => 1,
             2 | 3 => 2,
-            4 | 5 | 6 => 4,
-            10 | 11 | 12 => 8,
+            4..=6 => 4,
+            10..=12 => 8,
             _ => return None,
         })
     }
@@ -688,7 +688,7 @@ impl Model {
             per = per
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| (*i as u64 + 1) % iv == 0)
+                .filter(|(i, _)| (*i as u64 + 1).is_multiple_of(iv))
                 .map(|(_, h)| *h)
                 .collect();
         }
