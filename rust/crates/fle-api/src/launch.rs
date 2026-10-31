@@ -121,8 +121,10 @@ fn fle_policy_env() -> Vec<(String, String)> {
 /// `PlanError`: the message is what the page shows. Two arguments (as the Python code sometimes passes) print as a tuple.
 #[derive(Debug, Clone)]
 pub struct PlanError(pub String);
+/// A message with its hint. The Python Studio printed the pair as a tuple (`('…', '…')`) by mistake; here it reads as
+/// two sentences (deliberate difference D1, see DEVIATIONS.md).
 fn plan_err2(a: &str, b: &str) -> PlanError {
-    PlanError(format!("({}, {})", py_repr(&json!(a)), py_repr(&json!(b))))
+    PlanError(format!("{a} {b}"))
 }
 type R<T> = Result<T, PlanError>;
 /// `KEY=VALUE` pairs in the order they were written.

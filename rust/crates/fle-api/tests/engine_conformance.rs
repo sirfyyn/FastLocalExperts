@@ -606,17 +606,19 @@ fn the_engine_matches_the_python_studio() {
         ])
     };
     assert_eq!(flags(&a), flags(&b), "the settings after attach");
-    cmp_resp(
-        "start while attached",
-        &post(rs, &tr, "/api/engine/start", &json!({"model": mr})),
-        &post(py.addr, &tp, "/api/engine/start", &json!({"model": mp})),
+    // Deliberate difference D2: the Python Studio starts a second engine next to an attached server, this one refuses.
+    let refused = post(rs, &tr, "/api/engine/start", &json!({"model": mr}));
+    assert_eq!(refused.status, 409);
+    assert!(
+        String::from_utf8_lossy(&refused.body).contains("A server is attached"),
+        "{}",
+        String::from_utf8_lossy(&refused.body)
     );
     let (a, b) = (
         post(rs, &tr, "/api/engine/stop", &json!({})),
         post(py.addr, &tp, "/api/engine/stop", &json!({})),
     );
     cmp_resp("detach", &a, &b);
-    // a start while attached is allowed (in both) and starts an engine, so this stop ends a process
     settle("stopped after detach", &["stopped"], "engine exited");
     same("detached", &status(rs), &status(py.addr));
     let (a, b) = (

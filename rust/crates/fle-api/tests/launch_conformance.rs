@@ -480,7 +480,7 @@ fn start_commands_match_the_python_studio() {
     }
     let same = |label: &str, i: usize, got: Result<Plan, PlanError>, want: &Value| match got {
         Ok(p) => assert_eq!(p.public(), *want, "{label} #{i}"),
-        Err(e) => assert_eq!(json!({"error": e.0}), *want, "{label} #{i}"),
+        Err(e) => assert_eq!(json!({"error": e.0}), untuple(want), "{label} #{i}"),
     };
     for (i, c) in auto.iter().enumerate() {
         let got = auto_plan(&AutoInput {
@@ -557,4 +557,31 @@ fn reference_env_json() -> Value {
             .map(|(k, v)| (k.to_string(), json!(v)))
             .collect(),
     )
+}
+
+/// Deliberate difference D1: Python printed a message with its hint as a tuple, `('message', 'hint')`; here they are two
+/// sentences. Turn the Python text into ours before comparing.
+fn untuple(v: &Value) -> Value {
+    let Some(t) = v["error"].as_str() else {
+        return v.clone();
+    };
+    let Some(inner) = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')) else {
+        return v.clone();
+    };
+    let q = match inner.chars().next() {
+        Some(c @ ('\'' | '"')) => c,
+        _ => return v.clone(),
+    };
+    let sep = format!("{q}, ");
+    let Some(at) = inner.find(&sep).filter(|a| *a > 0) else {
+        return v.clone();
+    };
+    let (first, rest) = (&inner[1..at], &inner[at + 3..]);
+    let q2 = match rest.chars().next() {
+        Some(c @ ('\'' | '"')) if rest.ends_with(c) => c,
+        _ => return v.clone(),
+    };
+    let second = &rest[1..rest.len() - 1];
+    let _ = q2;
+    json!({"error": format!("{} {}", first.replace("\\'", "'"), second.replace("\\'", "'"))})
 }
