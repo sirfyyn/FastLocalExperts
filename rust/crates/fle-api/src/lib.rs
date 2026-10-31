@@ -6,6 +6,7 @@ pub mod downloads;
 pub mod engines;
 pub mod gguf;
 pub mod hf;
+pub mod launch;
 pub mod library;
 pub mod server;
 pub mod settings;

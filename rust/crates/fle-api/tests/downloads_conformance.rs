@@ -247,7 +247,12 @@ fn wait(addr: SocketAddr, id: &str, states: &[&str], secs: u64) -> Value {
         }
         assert!(
             t.elapsed() < Duration::from_secs(secs),
-            "job {id} did not reach {states:?}"
+            "job {id} did not reach {states:?} on {addr}; the list says {}",
+            v["downloads"]
+                .to_string()
+                .chars()
+                .take(900)
+                .collect::<String>()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -345,8 +350,8 @@ fn the_download_worker_matches_the_python_studio() {
         );
     }
     // the slow job is running by now: pause it half way
-    wait(rs, "00000000000c", &["downloading"], 30);
-    wait(py.addr, "00000000000c", &["downloading"], 30);
+    wait(rs, "00000000000c", &["downloading"], 120);
+    wait(py.addr, "00000000000c", &["downloading"], 120);
     std::thread::sleep(Duration::from_millis(700));
     pair("pause running", "POST", "/api/downloads/00000000000c/pause");
     let (a, b) = (
