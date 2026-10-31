@@ -134,9 +134,8 @@ impl Library {
             .map(|a| {
                 a.into_iter()
                     .filter(|i| {
-                        i.as_object().is_some_and(|o| {
-                            o.get("path").is_some_and(|p| crate::settings::py_truthy(p))
-                        })
+                        i.as_object()
+                            .is_some_and(|o| o.get("path").is_some_and(crate::settings::py_truthy))
                     })
                     .collect()
             })
