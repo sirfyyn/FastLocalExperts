@@ -6,11 +6,24 @@ use std::sync::Mutex;
 
 static ENV: Mutex<()> = Mutex::new(()); // the tests below change process-wide environment variables
 
-fn tmp(n: &str) -> PathBuf {
+/// A scratch folder that is removed when the test ends, also when it fails.
+struct Tmp(PathBuf);
+impl std::ops::Deref for Tmp {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn tmp(n: &str) -> Tmp {
     let d = std::env::temp_dir().join(format!("fle-cfg-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 fn clear_env() {
     for k in [
@@ -61,7 +74,8 @@ fn defaults_come_in_the_documented_order() {
 fn missing_file_gives_the_defaults() {
     let _g = ENV.lock().unwrap();
     clear_env();
-    let p = tmp("none").join("c.toml");
+    let dir = tmp("none");
+    let p = dir.join("c.toml");
     assert_eq!(load_at(&p), defaults());
 }
 
@@ -69,7 +83,8 @@ fn missing_file_gives_the_defaults() {
 fn file_values_are_coerced_like_python() {
     let _g = ENV.lock().unwrap();
     clear_env();
-    let p = tmp("coerce").join("c.toml");
+    let dir = tmp("coerce");
+    let p = dir.join("c.toml");
     std::fs::write(&p, "profile = \"MAX\"\nport = \"9000\"\ncontext = 4096.7\nmtp = \"no\"\nthreads = true\nhost = 7\n[env]\nA = 1\nB = true\n").unwrap();
     let d = load_at(&p);
     assert_eq!(d["profile"], "MAX"); // load only validates; `effective` lower-cases
@@ -89,7 +104,8 @@ fn file_values_are_coerced_like_python() {
 fn unknown_profile_is_refused_with_a_hint() {
     let _g = ENV.lock().unwrap();
     clear_env();
-    let p = tmp("badprof").join("c.toml");
+    let dir = tmp("badprof");
+    let p = dir.join("c.toml");
     std::fs::write(&p, "profile = \"turbo\"\n").unwrap();
     let e = load(Some(p.to_str().unwrap())).unwrap_err();
     let fe = e.downcast_ref::<fle_core::FleError>().unwrap();
@@ -103,7 +119,8 @@ fn unknown_profile_is_refused_with_a_hint() {
 fn precedence_is_cli_then_environment_then_file_then_defaults() {
     let _g = ENV.lock().unwrap();
     clear_env();
-    let p = tmp("prec").join("c.toml");
+    let dir = tmp("prec");
+    let p = dir.join("c.toml");
     std::fs::write(&p, "port = 9001\nprofile = \"balanced\"\nthreads = 4\n[env]\nFLE_X = \"file\"\nFLE_Y = \"file\"\n").unwrap();
     let data = load_at(&p);
     let e = effective(&Default::default(), &data).unwrap();
@@ -154,7 +171,8 @@ fn bad_profile_from_the_environment_is_refused() {
 fn save_and_load_round_trip_and_dotted_keys_work() {
     let _g = ENV.lock().unwrap();
     clear_env();
-    let p = tmp("rt").join("sub").join("c.toml");
+    let dir = tmp("rt");
+    let p = dir.join("sub").join("c.toml");
     let mut d = defaults();
     set_dotted(&mut d, "port", json!(9100));
     set_dotted(&mut d, "model", json!("/mödel/ü.gguf"));

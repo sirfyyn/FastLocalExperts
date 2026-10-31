@@ -269,6 +269,7 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
     let (m, p) = (r.method.as_str(), r.path.as_str());
     Some(match (m, p) {
         ("GET", "/api/ping") => Ok(json!({"app": "fle-studio", "version": st.opts.version})),
+        ("GET", "/api/system") => Ok(crate::system::info(&st.config.lock().unwrap().models_dir())),
         ("GET", "/api/settings") => Ok(st.config.lock().unwrap().public()),
         ("POST", "/api/settings") => r.json(MAX_JSON).and_then(|body| {
             st.config

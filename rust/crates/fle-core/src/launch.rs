@@ -201,6 +201,16 @@ impl Host {
     }
 }
 
+/// Output of a short command, only when it succeeded (`system._run` in Studio); empty when it is missing, fails or hangs.
+pub fn run_ok(exe: &str, args: &[&str], timeout: u64) -> String {
+    let (code, out) = run_capture(Path::new(exe), args, timeout, None, None);
+    if code == 0 {
+        out
+    } else {
+        String::new()
+    }
+}
+
 /// stdout and stderr of a short command, trimmed; empty when it cannot run.
 pub fn run_text(exe: &str, args: &[&str]) -> String {
     run_capture(Path::new(exe), args, 5, None, None)
