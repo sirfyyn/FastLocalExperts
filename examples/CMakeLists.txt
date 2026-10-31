@@ -17,7 +17,6 @@ else()
     add_subdirectory(batched)
     add_subdirectory(debug)
     add_subdirectory(embedding)
-    add_subdirectory(fle-capture-layers)
     add_subdirectory(eval-callback)
 
     add_subdirectory(gguf-hash)

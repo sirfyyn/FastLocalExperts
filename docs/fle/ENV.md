@@ -177,9 +177,6 @@ pager variables are **experimental** unless marked otherwise; none of them is pa
 
 | Variable | Used by | Meaning |
 |----------|---------|---------|
-| `FLE_CAP_CORPUS`, `FLE_CAP_OUTDIR`, `FLE_CAP_CHUNKS` (12), `FLE_CAP_SKIP` (0), `FLE_CAP_HNEXTN`, `FLE_CAP_LAYERS` | `fle-moe-capture` | Text corpus, output directory, number of chunks, chunks to skip, additionally dump the pre-head state, `0` = no layer capture. |
-| `FLE_CAP_LAYERS`, `FLE_CAP_CORPUS`, `FLE_CAP_OUT`, `FLE_CAP_N` (500), `FLE_CAP_MAXTOK` (64) | `fle-capture-layers` | Layers to capture (csv), texts file, output directory, sample count, tokens per sample. |
-| `FLE_DUMP_AUX` (2,30,57), `FLE_DUMP_CORPUS`, `FLE_DUMP_OUTDIR`, `FLE_DUMP_START` (0) | `fle-eagle3-dump` | Auxiliary layer ids, corpus, output directory, first line. |
 | `FLE_BENCH_CORPUS`, `FLE_BENCH_M` (1), `FLE_BENCH_STEPS` (300), `FLE_BENCH_WARM` (150), `FLE_BENCH_PREFILL` (512), `FLE_BENCH_STRIDE` (6000) | `fle-step-bench` | Cost curve of verifying m tokens per step with the expert cache. |
 | `FLE_KB_ITERS` (300), `FLE_KB_TOKENS` (1), `FLE_KB_TYPES` | `fle-kernel-bench` | Iterations, tokens per call and quantization types of the expert kernel benchmark. |
 

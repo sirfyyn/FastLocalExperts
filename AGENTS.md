@@ -230,7 +230,6 @@ gh issue create
 
 To conserve context space, load these resources as needed:
 
-Skills: reusable task workflows live in the [skills/](skills/) directory - check there for a skill matching your task before starting.
 
 General documentations:
 - [Contributing guidelines](CONTRIBUTING.md)

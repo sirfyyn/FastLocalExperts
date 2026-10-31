@@ -225,11 +225,7 @@ measurements behind this table are on the [model card](https://huggingface.co/si
 
 ## Tools and documentation
 
-- [`tools/fle-hybrid/`](tools/fle-hybrid/): build a GGUF from whole expert layers of existing quantizations
-  (`gguf_splice.py`), choose the donor per layer for a target size (`fle_select.py`), check where every layer of a
-  finished file came from (`gguf_provenance.py`), and prune experts by REAP saliency (`reap_prune.py`).
-- [`tools/fle-reap/`](tools/fle-reap/) (`llama-fle-reap`): records how often each expert was routed and its REAP
-  saliency, the input for `reap_prune.py`.
+- [`tools/fle-kernel-bench/`](tools/fle-kernel-bench/), [`tools/fle-step-bench/`](tools/fle-step-bench/): kernel and decode-step measurement tools (with `llama-bench`, `llama-perplexity`, `llama-batched-bench`).
 - [`docs/fle/ENV.md`](docs/fle/ENV.md): every `FLE_*` variable and every flag the fork adds.
 - [`docs/fle/fle-paper-v1.0.1.pdf`](docs/fle/fle-paper-v1.0.1.pdf): the technical report as archived with `v1.0.1`.
 
