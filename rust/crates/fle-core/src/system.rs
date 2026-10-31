@@ -29,6 +29,15 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+#[cfg(target_arch = "x86_64")]
+fn has_avx2() -> bool {
+    std::is_x86_feature_detected!("avx2")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn has_avx2() -> bool {
+    false
+}
+
 pub fn detect(dir: &Path) -> SysInfo {
     let os = std::env::consts::OS.to_string();
     let arch = match std::env::consts::ARCH {
@@ -40,13 +49,12 @@ pub fn detect(dir: &Path) -> SysInfo {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let (mut cpu, mut ram, mut avx2) = (String::new(), 0u64, false);
+    let (mut cpu, mut ram) = (String::new(), 0u64);
     if os == "macos" {
         cpu = run("sysctl", &["-n", "machdep.cpu.brand_string"]).unwrap_or_default();
         ram = run("sysctl", &["-n", "hw.memsize"])
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        avx2 = run("sysctl", &["-n", "machdep.cpu.leaf7_features"])
             .is_some_and(|s| s.contains("AVX2"));
     } else if os == "linux" {
         let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
@@ -82,10 +90,7 @@ pub fn detect(dir: &Path) -> SysInfo {
         cpu = ps("(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
             .unwrap_or_default();
     }
-    #[cfg(target_arch = "x86_64")]
-    {
-        avx2 = std::is_x86_feature_detected!("avx2"); // the CPU says so itself, on every OS
-    }
+    let avx2 = has_avx2(); // the CPU says so itself, on every OS
     let mut gpus = Vec::new();
     if let Some(out) = run(
         "nvidia-smi",
