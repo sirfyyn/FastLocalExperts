@@ -72,7 +72,7 @@ enum Cmd {
         json: bool,
     },
     /// Show the llama-server command and the numbers behind it
-    Plan(plancmd::PlanArgs),
+    Plan(Box<plancmd::PlanArgs>),
     /// Ask one question and print the answer (loads the model for the duration)
     Ask {
         model: String,
@@ -197,7 +197,7 @@ fn run() -> Result<()> {
             json,
             action,
         }) => run_config(config, json, action),
-        Some(Cmd::Plan(a)) => plancmd::run(a, &home),
+        Some(Cmd::Plan(a)) => plancmd::run(*a, &home),
         Some(Cmd::Doctor) => {
             let s = system::detect(&home);
             println!("OS        {} {}\nCPU       {} ({} cores)\nMemory    {}\nGPU       {}\nDisk free {} (in {})", s.os, s.arch, s.cpu, s.cores, system::gib(s.ram_bytes),
