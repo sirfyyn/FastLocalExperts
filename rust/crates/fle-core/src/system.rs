@@ -68,6 +68,24 @@ pub fn detect(dir: &Path) -> SysInfo {
             .lines()
             .any(|l| l.starts_with("flags") && l.contains(" avx2"));
     }
+    if os == "windows" {
+        // PowerShell is on every supported Windows; wmic is gone from newer ones
+        let ps = |cmd: &str| {
+            run(
+                "powershell",
+                &["-NoProfile", "-NonInteractive", "-Command", cmd],
+            )
+        };
+        ram = ps("(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        cpu = ps("(Get-CimInstance Win32_Processor | Select-Object -First 1).Name")
+            .unwrap_or_default();
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        avx2 = std::is_x86_feature_detected!("avx2"); // the CPU says so itself, on every OS
+    }
     let mut gpus = Vec::new();
     if let Some(out) = run(
         "nvidia-smi",
