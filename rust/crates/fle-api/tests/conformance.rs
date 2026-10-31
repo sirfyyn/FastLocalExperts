@@ -70,7 +70,8 @@ fn http(
     req += "Connection: close\r\n\r\n";
     s.write_all(req.as_bytes()).unwrap();
     if let Some(b) = body {
-        s.write_all(b).unwrap();
+        // a server may answer (413) and hang up before the whole body is sent; the answer is still there to read
+        let _ = s.write_all(b);
     }
     let mut raw = vec![];
     let _ = s.read_to_end(&mut raw);
@@ -195,6 +196,63 @@ fn token_of(r: &Resp) -> String {
         .to_string()
 }
 
+fn is_hex(s: &str, n: usize) -> bool {
+    s.len() == n
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Ids and times that the servers make up (random ids, "now") become fixed names, so the rest can be compared.
+fn canon(v: Value) -> Value {
+    fn collect(v: &Value, map: &mut Vec<String>) {
+        match v {
+            Value::Object(o) => {
+                if let Some(Value::String(id)) = o.get("id") {
+                    if (is_hex(id, 12) || is_hex(id, 16)) && !map.contains(id) {
+                        map.push(id.clone());
+                    }
+                }
+                o.values().for_each(|x| collect(x, map));
+            }
+            Value::Array(a) => a.iter().for_each(|x| collect(x, map)),
+            _ => {}
+        }
+    }
+    fn apply(v: Value, map: &[String], now: f64) -> Value {
+        match v {
+            Value::String(s) => match map.iter().position(|m| *m == s) {
+                Some(i) => Value::String(format!("<id{i}>")),
+                None => Value::String(s),
+            },
+            Value::Array(a) => Value::Array(a.into_iter().map(|x| apply(x, map, now)).collect()),
+            Value::Object(o) => Value::Object(
+                o.into_iter()
+                    .map(|(k, x)| {
+                        let near_now = (k == "created" || k == "updated")
+                            && x.as_f64().is_some_and(|f| (f - now).abs() < 120.0);
+                        (
+                            k,
+                            if near_now {
+                                json!("<now>")
+                            } else {
+                                apply(x, map, now)
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    let mut map = vec![];
+    collect(&v, &mut map);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    apply(v, &map, now)
+}
+
 const KEEP: [&str; 7] = [
     "content-type",
     "cache-control",
@@ -225,7 +283,7 @@ fn compare(label: &str, a: &Resp, b: &Resp, ta: &str, tb: &str) {
             )
             .unwrap()
         };
-        let (x, y): (Value, Value) = (norm(&a.body), norm(&b.body));
+        let (x, y): (Value, Value) = (canon(norm(&a.body)), canon(norm(&b.body)));
         assert_eq!(x, y, "[{label}] JSON body differs");
     } else {
         let (x, y) = (
@@ -266,6 +324,34 @@ fn stage_zero_plumbing_matches_the_python_studio() {
                 _ => {}
             }
         }
+        for h in [&hp, &hr] {
+            let c = h.join("chats");
+            std::fs::create_dir_all(&c).unwrap();
+            let seeds: [(&str, &str); 7] = [
+                (
+                    "1111111111111111.json",
+                    r#"{"id": "1111111111111111", "title": "Old list", "updated": 1000, "model": "m1", "messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]}"#,
+                ),
+                (
+                    "2222222222222222.json",
+                    r#"{"id": "2222222222222222", "title": "Branchy", "updated": 3000, "model": "m2", "leaf": "b2", "created": 5, "messages": [{"id": "a", "parent": null, "role": "user", "content": "q"}, {"id": "b1", "parent": "a", "role": "assistant", "content": "x"}, {"id": "b2", "parent": "a", "role": "assistant", "content": "y"}, {"id": "c", "parent": "b1", "role": "user", "content": "z"}]}"#,
+                ),
+                (
+                    "3333333333333333.json",
+                    r#"{"id": "3333333333333333", "updated": -5, "messages": "nope"}"#,
+                ),
+                ("4444444444444444.json", "[]"),
+                ("5555555555555555.json", "{broken"),
+                (
+                    "6666666666666666.json",
+                    r#"{"title": null, "model": null, "updated": 2000, "messages": [{"id": "p", "parent": "q", "role": "user", "content": "1"}, {"id": "q", "parent": "p", "role": "assistant", "content": [{"text": "two"}, "three", {"nope": 1}, 7]}, {"id": "p", "parent": "zz", "role": "user", "content": "dup"}]}"#,
+                ),
+                ("not-a-chat.json", r#"{"id": "x"}"#),
+            ];
+            for (n, t) in seeds {
+                std::fs::write(c.join(n), t).unwrap();
+            }
+        }
         let py = start_python(&src, &hp);
         let rs = start_rust(&src, &hr);
         let (ia, ib) = (
@@ -274,20 +360,40 @@ fn stage_zero_plumbing_matches_the_python_studio() {
         );
         let (tr, tp) = (token_of(&ia), token_of(&ib));
         compare(&format!("{variant} index"), &ia, &ib, &tr, &tp);
+        let ids: std::cell::RefCell<(Vec<String>, Vec<String>)> = Default::default();
         let mut both = |label: &str,
                         method: &str,
                         path: &str,
                         hdrs: &[(&str, &str)],
                         body: Option<&[u8]>,
                         tokened: bool| {
-            let run = |addr: SocketAddr, tok: &str| {
+            let run = |addr: SocketAddr, tok: &str, mine: bool| {
                 let mut h: Vec<(&str, &str)> = hdrs.to_vec();
                 if tokened {
                     h.push(("X-FLE-Token", tok));
                 }
-                http(addr, method, path, &h, body)
+                let mut p = path.to_string();
+                for i in 0..10 {
+                    let list = ids.borrow();
+                    let known = if mine { &list.0 } else { &list.1 };
+                    if let Some(id) = known.get(i) {
+                        p = p.replace(&format!("{{{i}}}"), id);
+                    }
+                }
+                http(addr, method, &p, &h, body)
             };
-            let (a, b) = (run(rs, &tr), run(py.addr, &tp));
+            let (a, b) = (run(rs, &tr, true), run(py.addr, &tp, false));
+            if method == "POST" && path == "/api/chats" && a.status == 200 {
+                let id = |r: &Resp| {
+                    serde_json::from_slice::<Value>(&r.body).unwrap()["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                };
+                let mut l = ids.borrow_mut();
+                l.0.push(id(&a));
+                l.1.push(id(&b));
+            }
             compare(&format!("{variant} {label}"), &a, &b, &tr, &tp);
             checked += 1;
         };
@@ -326,6 +432,195 @@ fn stage_zero_plumbing_matches_the_python_studio() {
                 true,
             );
         }
+        both("chats list", "GET", "/api/chats", &[], None, false);
+        for id in [
+            "1111111111111111",
+            "2222222222222222",
+            "3333333333333333",
+            "4444444444444444",
+            "5555555555555555",
+            "6666666666666666",
+            "7777777777777777",
+        ] {
+            both(
+                &format!("seeded chat {id}"),
+                "GET",
+                &format!("/api/chats/{id}"),
+                &[],
+                None,
+                false,
+            );
+        }
+        for bad in [
+            "/api/chats/short",
+            "/api/chats/ZZZZZZZZZZZZZZZZ",
+            "/api/chats/0123456789abcdef0",
+            "/api/chats/not-a-chat",
+        ] {
+            both(&format!("bad chat id {bad}"), "GET", bad, &[], None, false);
+            both(
+                &format!("bad chat id put {bad}"),
+                "PUT",
+                bad,
+                &[],
+                Some(b"{}"),
+                true,
+            );
+            both(
+                &format!("bad chat id delete {bad}"),
+                "DELETE",
+                bad,
+                &[],
+                None,
+                true,
+            );
+        }
+        let long = "x".repeat(200);
+        let creates: Vec<Value> = vec![
+            json!({"messages": [{"role": "user", "content": "Hello    world  \n again"}, {"role": "assistant", "content": "Hi"}]}),
+            json!({"title": "  Mine  ", "model": "m", "system": "be brief", "created": 42, "leaf": "n2", "messages": [{"id": "n1", "role": "user", "content": "a", "parent": null}, {"id": "n2", "role": "assistant", "content": "b", "parent": "n1"}, {"id": "n3", "role": "assistant", "content": "c", "parent": "n1"}]}),
+            json!({"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": [{"type": "text", "text": "part one"}, "part two", {"x": 1}]}]}),
+            json!({"messages": [{"role": "user", "content": "ünï çödé — ".repeat(12)}]}),
+            json!({"title": 5, "messages": []}),
+            json!({"title": long, "messages": [{"role": "user", "content": "t"}]}),
+            json!({"title": null, "model": 7, "system": ["x"], "messages": [{"role": "assistant", "content": "only assistant"}]}),
+            json!({"messages": [{"id": "a", "parent": "b", "role": "user", "content": "1"}, {"id": "b", "parent": "a", "role": "assistant", "content": "2"}, {"id": "c", "parent": "c", "role": "user", "content": "3"}]}),
+            json!({"messages": [{"id": "dup", "role": "user", "content": "1", "parent": null}, {"id": "dup", "role": "assistant", "content": "2", "parent": "dup"}, {"id": "bad id!", "role": "user", "content": "3", "parent": "nope"}], "leaf": "missing"}),
+            json!({"messages": [1, "x", null, {"role": "user", "content": "kept"}, [1]]}),
+            json!({"messages": []}),
+            json!({"messages": "text"}),
+            json!({"model": "no messages"}),
+            json!({"messages": [{"role": "user", "content": "x", "tool_calls": [{"name": "calc"}], "attachments": [{"name": "f.txt", "kind": "text", "chars": 3}]}], "extra": "dropped"}),
+        ];
+        for (i, body) in creates.iter().enumerate() {
+            both(
+                &format!("chat create {i}"),
+                "POST",
+                "/api/chats",
+                &[],
+                Some(body.to_string().as_bytes()),
+                true,
+            );
+        }
+        for i in 0..8 {
+            both(
+                &format!("chat get created {i}"),
+                "GET",
+                &format!("/api/chats/{{{i}}}"),
+                &[],
+                None,
+                false,
+            );
+        }
+        both(
+            "chat put update",
+            "PUT",
+            "/api/chats/{0}",
+            &[],
+            Some(
+                json!({"title": "Renamed", "messages": [{"role": "user", "content": "new"}]})
+                    .to_string()
+                    .as_bytes(),
+            ),
+            true,
+        );
+        both("chat put keeps created", "PUT", "/api/chats/{1}", &[], Some(json!({"created": 7, "messages": [{"id": "z", "role": "user", "content": "new", "parent": null}]}).to_string().as_bytes()), true);
+        both(
+            "chat put invalid",
+            "PUT",
+            "/api/chats/{2}",
+            &[],
+            Some(b"{\"messages\": 1}"),
+            true,
+        );
+        both(
+            "chat put not found id",
+            "PUT",
+            "/api/chats/aaaaaaaaaaaaaaaa",
+            &[],
+            Some(json!({"messages": []}).to_string().as_bytes()),
+            true,
+        );
+        both(
+            "chat get not found",
+            "GET",
+            "/api/chats/bbbbbbbbbbbbbbbb",
+            &[],
+            None,
+            false,
+        );
+        both(
+            "chat create bad json",
+            "POST",
+            "/api/chats",
+            &[],
+            Some(b"{nope"),
+            true,
+        );
+        both(
+            "chat create array",
+            "POST",
+            "/api/chats",
+            &[],
+            Some(b"[]"),
+            true,
+        );
+        both(
+            "chat create no token",
+            "POST",
+            "/api/chats",
+            &[],
+            Some(b"{\"messages\": []}"),
+            false,
+        );
+        both("chats list after", "GET", "/api/chats", &[], None, false);
+        both("chat delete", "DELETE", "/api/chats/{0}", &[], None, true);
+        both(
+            "chat delete again",
+            "DELETE",
+            "/api/chats/{0}",
+            &[],
+            None,
+            true,
+        );
+        both(
+            "chat get deleted",
+            "GET",
+            "/api/chats/{0}",
+            &[],
+            None,
+            false,
+        );
+        both(
+            "chat delete seeded",
+            "DELETE",
+            "/api/chats/1111111111111111",
+            &[],
+            None,
+            true,
+        );
+        both("chats list end", "GET", "/api/chats", &[], None, false);
+        let big = format!(
+            "{{\"messages\": [{{\"role\": \"user\", \"content\": \"{}\"}}]}}",
+            "a".repeat(5 * 1024 * 1024)
+        );
+        both(
+            "chat create 5 MB is fine",
+            "POST",
+            "/api/chats",
+            &[],
+            Some(big.as_bytes()),
+            true,
+        );
+        let settings_big = format!("{{\"theme\": \"{}\"}}", "a".repeat(5 * 1024 * 1024));
+        both(
+            "settings 5 MB is too large",
+            "POST",
+            "/api/settings",
+            &[],
+            Some(settings_big.as_bytes()),
+            true,
+        );
         both("no token", "POST", "/api/settings", &[], Some(b"{}"), false);
         both(
             "wrong token",

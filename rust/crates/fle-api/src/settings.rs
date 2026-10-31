@@ -80,7 +80,7 @@ pub fn py_repr(v: &Value) -> String {
     }
 }
 
-fn py_truthy(v: &Value) -> bool {
+pub fn py_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -92,7 +92,7 @@ fn py_truthy(v: &Value) -> bool {
 }
 
 /// `str(value)` in Python.
-fn py_str(v: &Value) -> String {
+pub fn py_str(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         other => py_repr(other),

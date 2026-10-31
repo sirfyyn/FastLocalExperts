@@ -1,5 +1,6 @@
 //! The HTTP side of FLE Studio: the guard (host name, origin, session token), the JSON conventions and the static page.
 //! Port of the plumbing in `fle_studio/server.py`; routes live next to the code they call.
+use crate::chats::{ChatError, Chats, MAX_BYTES as MAX_CHAT};
 use crate::settings::Config;
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, State};
@@ -25,6 +26,8 @@ pub struct Studio {
     pub opts: Options,
     pub token: String,
     pub config: Mutex<Config>,
+    pub chats: Chats,
+    pub chat_lock: Mutex<()>,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -40,10 +43,13 @@ fn make_token() -> String {
 
 pub fn new_studio(opts: Options) -> Ctx {
     let config = Config::load(&opts.home.join("settings.json"));
+    let chats = Chats::new(&opts.home);
     Arc::new(Studio {
         opts,
         token: make_token(),
         config: Mutex::new(config),
+        chats,
+        chat_lock: Mutex::new(()),
     })
 }
 
@@ -221,11 +227,16 @@ pub struct Req {
     pub path: String,
     pub query: Map<String, Value>,
     pub body: Vec<u8>,
+    /// the body was larger than any route accepts
+    pub too_large: bool,
 }
 
 impl Req {
-    /// The JSON object in the body; an empty body is `{}`.
-    pub fn json(&self) -> Result<Map<String, Value>, ApiError> {
+    /// The JSON object in the body (an empty body is `{}`); more than `limit` bytes is a 413, like `read_json(limit)`.
+    pub fn json(&self, limit: usize) -> Result<Map<String, Value>, ApiError> {
+        if self.too_large || self.body.len() > limit {
+            return Err(ApiError(413, "Request too large".into()));
+        }
         if self.body.is_empty() {
             return Ok(Map::new());
         }
@@ -237,18 +248,50 @@ impl Req {
     }
 }
 
+fn chat_err(e: ChatError) -> ApiError {
+    match e {
+        ChatError::NotFound => ApiError(404, "Not found".into()),
+        ChatError::Invalid(m) => ApiError(400, m),
+    }
+}
+
+/// `/api/chats/<16 hex>` -> the id
+fn chat_id(p: &str) -> Option<&str> {
+    let id = p.strip_prefix("/api/chats/")?;
+    (id.len() == 16
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(id)
+}
+
 fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
-    let (m, p) = (&r.method, r.path.as_str());
-    Some(match (m.as_str(), p) {
+    let (m, p) = (r.method.as_str(), r.path.as_str());
+    Some(match (m, p) {
         ("GET", "/api/ping") => Ok(json!({"app": "fle-studio", "version": st.opts.version})),
         ("GET", "/api/settings") => Ok(st.config.lock().unwrap().public()),
-        ("POST", "/api/settings") => r.json().and_then(|body| {
+        ("POST", "/api/settings") => r.json(MAX_JSON).and_then(|body| {
             st.config
                 .lock()
                 .unwrap()
                 .update(&body)
                 .map_err(|e| ApiError(400, e))
         }),
+        ("GET", "/api/chats") => Ok(json!({"chats": st.chats.list()})),
+        ("POST", "/api/chats") => r.json(MAX_CHAT).and_then(|body| {
+            let _g = st.chat_lock.lock().unwrap();
+            st.chats.save(None, &body).map_err(chat_err)
+        }),
+        ("GET", _) if chat_id(p).is_some() => st.chats.get(chat_id(p).unwrap()).map_err(chat_err),
+        ("PUT", _) if chat_id(p).is_some() => r.json(MAX_CHAT).and_then(|body| {
+            let _g = st.chat_lock.lock().unwrap();
+            st.chats.save(chat_id(p), &body).map_err(chat_err)
+        }),
+        ("DELETE", _) if chat_id(p).is_some() => st
+            .chats
+            .delete(chat_id(p).unwrap())
+            .map(|_| json!({"ok": true}))
+            .map_err(chat_err),
         _ => return None,
     })
 }
@@ -346,26 +389,25 @@ async fn handler(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let body = if declared > MAX_JSON {
-        None
+    let (body, too_large) = if declared > MAX_CHAT {
+        (vec![], true)
     } else {
-        to_bytes(body, MAX_JSON).await.ok().map(|b| b.to_vec())
+        match to_bytes(body, MAX_CHAT).await {
+            Ok(b) => (b.to_vec(), false),
+            Err(_) => (vec![], true),
+        }
     };
     let r = Req {
         method: parts.method.clone(),
         path: path.clone(),
         query: query_of(parts.uri.query()),
-        body: body.clone().unwrap_or_default(),
+        body,
+        too_large,
     };
     let st2 = st.clone();
-    let routed = tokio::task::spawn_blocking(move || {
-        if body.is_none() {
-            return Some(Err(ApiError(413, "Request too large".into())));
-        }
-        route(&st2, &r)
-    })
-    .await
-    .unwrap_or(None);
+    let routed = tokio::task::spawn_blocking(move || route(&st2, &r))
+        .await
+        .unwrap_or(None);
     match routed {
         Some(Ok(v)) => send_json(200, &v, head),
         Some(Err(ApiError(s, m))) => error_json(s, &m, head),
