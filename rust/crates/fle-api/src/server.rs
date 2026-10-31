@@ -44,6 +44,8 @@ pub struct Studio {
     pub profiles: Mutex<Profiles>,
     pub engine: Engine,
     pub live: Live,
+    /// the server listens beyond this machine (host mode); set by the starter
+    pub lan: bool,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -91,6 +93,7 @@ pub fn new_studio(opts: Options) -> Ctx {
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
         engines,
+        lan: false,
         live: Live::new(engine.clone(), 1.0),
         engine,
         profiles: Mutex::new(Profiles::new(&home)),
@@ -488,6 +491,24 @@ impl Studio {
         }
     }
 
+    /// Everything the page needs at once (`Studio.state`).
+    pub fn state(&self) -> Value {
+        let info = self.sysinfo();
+        let (os, arch) = crate::engines::os_arch();
+        let models = self.library.lock().unwrap().scan(&self.models_dir());
+        json!({
+            "app": "fle-studio", "version": self.opts.version, "platform": info["platform"],
+            "systemd": cfg!(target_os = "linux") && fle_core::launch::which("systemctl").is_some(),
+            "data_dir": self.opts.home.to_string_lossy(), "lan": self.lan,
+            "settings": self.config.lock().unwrap().public(), "system": info.clone(), "engine": self.engine.status(), "models": models,
+            "catalog": self.catalog_view(), "extras": self.extras_view(),
+            "profiles": self.profiles.lock().unwrap().all().iter().map(|p| p.public()).collect::<Vec<_>>(),
+            "engines": {"installed": self.engines.installed(), "variants": crate::engines::variants(&info, os, &arch)},
+            "downloads": self.downloads.list(),
+            "reference": {"machine": crate::catalog::reference_machine(), "report": crate::catalog::report_url()},
+        })
+    }
+
     pub fn sysinfo(&self) -> Value {
         crate::system::info(&self.models_dir())
     }
@@ -639,6 +660,7 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
     Some(match (m, p) {
         ("GET", "/api/ping") => Ok(json!({"app": "fle-studio", "version": st.opts.version})),
         ("GET", "/api/system") => Ok(crate::system::info(&st.config.lock().unwrap().models_dir())),
+        ("GET", "/api/state") => Ok(st.state()),
         ("GET", "/api/settings") => Ok(st.config.lock().unwrap().public()),
         ("POST", "/api/settings") => r.json(MAX_JSON).and_then(|body| {
             st.config
@@ -915,6 +937,17 @@ const STATIC_TYPES: [(&str, &str); 12] = [
     (".map", "application/json"),
 ];
 
+/// The built web page: a folder when one is given (tests, development), else the copy inside the binary.
+static WEB: include_dir::Dir<'static> =
+    include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../../web/studio");
+
+fn read_web(st: &Studio, name: &str) -> Option<Vec<u8>> {
+    match &st.opts.web_dir {
+        Some(dir) => std::fs::read(dir.join(name)).ok(),
+        None => WEB.get_file(name).map(|f| f.contents().to_vec()),
+    }
+}
+
 fn static_file(st: &Studio, path: &str, head: bool) -> Response<Body> {
     let mut name = if path == "/" || path == "/index.html" {
         "index.html".to_string()
@@ -930,19 +963,19 @@ fn static_file(st: &Studio, path: &str, head: bool) -> Response<Body> {
             .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
         && !name.contains("..");
     let not_found = || error_json(404, "Not found", head);
-    let (Some(dir), true) = (&st.opts.web_dir, ok) else {
+    if !ok {
         return not_found();
-    };
-    let mut data = std::fs::read(dir.join(&name));
-    if data.is_err() {
+    }
+    let mut data: Option<Vec<u8>> = read_web(st, &name);
+    if data.is_none() {
         if !name.rsplit('/').next().unwrap_or("").contains('.') {
             name = "index.html".into(); // client-side routes fall back to the app
-            data = std::fs::read(dir.join(&name));
+            data = read_web(st, &name);
         } else {
             return not_found();
         }
     }
-    let Ok(mut data) = data else {
+    let Some(mut data) = data else {
         return not_found();
     };
     if name == "index.html" {
@@ -1031,6 +1064,20 @@ pub fn router(st: Ctx) -> Router {
     Router::new().fallback(handler).with_state(st)
 }
 
+/// Serve on an open socket until `shutdown` finishes.
+pub async fn serve_listener(
+    st: Ctx,
+    l: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(
+        l,
+        router(st).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+}
+
 /// Serve until the process ends. Returns the bound address through `ready` once the socket is open.
 pub async fn serve(
     st: Ctx,
@@ -1041,11 +1088,7 @@ pub async fn serve(
     if let Some(r) = ready {
         let _ = r.send(l.local_addr()?);
     }
-    axum::serve(
-        l,
-        router(st).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
+    serve_listener(st, l, std::future::pending()).await
 }
 
 /// Refuse a chat request that asks for tools and for a forced answer format together (`screen_proxy_body`).

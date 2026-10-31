@@ -69,6 +69,27 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Start FLE Studio: the web page and the local API (`http://127.0.0.1:8642`)
+    Studio {
+        /// data folder (settings, chats, engines, models); default: per-user app data
+        #[arg(long, value_name = "DIR")]
+        home: Option<std::path::PathBuf>,
+        /// address to listen on (only this machine for now)
+        #[arg(long)]
+        host: Option<String>,
+        /// port (default 8642; the next free one when it is taken)
+        #[arg(long)]
+        port: Option<u16>,
+        /// do not open the browser
+        #[arg(long)]
+        no_browser: bool,
+        /// use an already running llama.cpp / FLE server
+        #[arg(long, value_name = "URL")]
+        attach: Option<String>,
+        /// serve the page from this folder instead of the copy inside the binary
+        #[arg(long, value_name = "DIR", hide = true)]
+        web_dir: Option<std::path::PathBuf>,
+    },
     /// Show the llama-server command and the numbers behind it
     Plan(Box<plancmd::PlanArgs>),
     /// Check model, engine, memory, disk and the command that would start
@@ -387,6 +408,21 @@ fn run() -> Result<()> {
             json,
             action,
         }) => run_config(config, json, action),
+        Some(Cmd::Studio {
+            home,
+            host,
+            port,
+            no_browser,
+            attach,
+            web_dir,
+        }) => exit(fle_api::run::run(fle_api::run::RunOptions {
+            home,
+            host,
+            port,
+            no_browser,
+            attach: attach.unwrap_or_default(),
+            web_dir,
+        })),
         Some(Cmd::Plan(a)) => plancmd::run(*a, &home),
         Some(Cmd::System) => {
             let s = system::detect(&home);

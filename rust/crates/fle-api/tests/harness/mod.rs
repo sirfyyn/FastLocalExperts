@@ -186,9 +186,19 @@ pub fn start_rust(src: &Path, home: &Path) -> SocketAddr {
 }
 
 pub fn start_rust_with(src: &Path, home: &Path, github_api: &str) -> SocketAddr {
+    start_rust_full(src, home, github_api, true)
+}
+
+/// `with_web_dir`: serve the page from the Studio checkout; without it the copy inside the binary is served.
+pub fn start_rust_full(
+    src: &Path,
+    home: &Path,
+    github_api: &str,
+    with_web_dir: bool,
+) -> SocketAddr {
     let st = new_studio(Options {
         home: home.to_path_buf(),
-        web_dir: Some(src.join("fle_studio/web")),
+        web_dir: with_web_dir.then(|| src.join("fle_studio/web")),
         version: python_version(src),
         github_api: github_api.to_string(),
     });
