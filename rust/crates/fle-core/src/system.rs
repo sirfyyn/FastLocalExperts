@@ -55,7 +55,6 @@ pub fn detect(dir: &Path) -> SysInfo {
         ram = run("sysctl", &["-n", "hw.memsize"])
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-            .is_some_and(|s| s.contains("AVX2"));
     } else if os == "linux" {
         let mi = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
         ram = mi
@@ -72,9 +71,6 @@ pub fn detect(dir: &Path) -> SysInfo {
             .unwrap_or("")
             .trim()
             .to_string();
-        avx2 = ci
-            .lines()
-            .any(|l| l.starts_with("flags") && l.contains(" avx2"));
     }
     if os == "windows" {
         // PowerShell is on every supported Windows; wmic is gone from newer ones
