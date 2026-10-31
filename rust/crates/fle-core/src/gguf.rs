@@ -1009,6 +1009,18 @@ pub fn verify_model(m: &Model) -> Json {
 /// and `1e+16`; only the exponent of a number differs, so only exponents followed by a delimiter are rewritten.
 pub fn py_json(v: &Json) -> String {
     let t = serde_json::to_string_pretty(v).unwrap_or_default();
+    // ensure_ascii, Python's default: every non-ASCII character becomes \uXXXX (a surrogate pair above the BMP)
+    let t: String = t.chars().fold(String::with_capacity(t.len()), |mut o, c| {
+        if c.is_ascii() {
+            o.push(c);
+        } else {
+            let mut u = [0u16; 2];
+            for x in c.encode_utf16(&mut u) {
+                o.push_str(&format!("\\u{x:04x}"));
+            }
+        }
+        o
+    });
     let b: Vec<char> = t.chars().collect();
     let mut out = String::with_capacity(t.len() + 8);
     let mut i = 0;

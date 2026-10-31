@@ -4,6 +4,7 @@
 
 pub mod catalog;
 pub mod chat;
+pub mod config;
 pub mod download;
 pub mod engines;
 pub mod gguf;
@@ -54,3 +55,24 @@ pub enum Event {
 }
 
 pub mod flow;
+
+/// A problem the user can fix: the message is the whole story, the hint adds the next step (like `FleError` in tools/fle).
+#[derive(Debug, Clone)]
+pub struct FleError {
+    pub message: String,
+    pub hint: String,
+}
+impl FleError {
+    pub fn new(message: impl Into<String>, hint: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint: hint.into(),
+        }
+    }
+}
+impl std::fmt::Display for FleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+impl std::error::Error for FleError {}
