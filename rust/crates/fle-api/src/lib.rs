@@ -3,11 +3,13 @@
 pub mod catalog;
 pub mod chats;
 pub mod downloads;
+pub mod engine;
 pub mod engines;
 pub mod gguf;
 pub mod hf;
 pub mod launch;
 pub mod library;
+pub mod report_time;
 pub mod server;
 pub mod settings;
 pub mod system;
