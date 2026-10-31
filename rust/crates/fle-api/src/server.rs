@@ -6,6 +6,7 @@ use crate::engine::{Engine, EngineErr};
 use crate::engines::{EngineError, Engines};
 use crate::launch::Profiles;
 use crate::library::{LibError, Library};
+use crate::live::Live;
 use crate::settings::Config;
 use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, State};
@@ -16,8 +17,10 @@ use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub const MAX_JSON: usize = 4 * 1024 * 1024;
+pub const MAX_PROXY: usize = 64 * 1024 * 1024;
 const LOOPBACK_NAMES: [&str; 3] = ["127.0.0.1", "::1", "localhost"];
 
 pub struct Options {
@@ -40,6 +43,7 @@ pub struct Studio {
     pub engines: Engines,
     pub profiles: Mutex<Profiles>,
     pub engine: Engine,
+    pub live: Live,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -87,6 +91,7 @@ pub fn new_studio(opts: Options) -> Ctx {
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
         engines,
+        live: Live::new(engine.clone(), 1.0),
         engine,
         profiles: Mutex::new(Profiles::new(&home)),
         downloads,
@@ -742,6 +747,25 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
             }
             Ok(json!({"ok": true}))
         }
+        ("GET", "/api/live") => {
+            let since = r
+                .query
+                .get("since")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty());
+            match since.map(|v| v.parse::<f64>()) {
+                None => Ok(st.live.snapshot(0.0)),
+                Some(Ok(f)) => Ok(st.live.snapshot(f)),
+                Some(Err(_)) => Err(ApiError(
+                    400,
+                    format!(
+                        "could not convert string to float: {}",
+                        crate::settings::py_repr(&json!(since.unwrap_or("")))
+                    ),
+                )),
+            }
+        }
         ("GET", "/api/engine") => Ok(st.engine.status()),
         ("GET", "/api/engine/log") => Ok(st.engine.log_since(
             r.query
@@ -963,6 +987,9 @@ async fn handler(
     if let Some(r) = guard(&st, &parts.method, &path, &parts.headers, &peer, head) {
         return r;
     }
+    if path.starts_with("/v1/") {
+        return proxy(&st, parts, body, head).await;
+    }
     let declared: usize = parts
         .headers
         .get(header::CONTENT_LENGTH)
@@ -1019,4 +1046,238 @@ pub async fn serve(
         router(st).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
+}
+
+/// Refuse a chat request that asks for tools and for a forced answer format together (`screen_proxy_body`).
+fn screen_proxy_body(path: &str, body: &[u8]) -> Result<(), String> {
+    let p = path.split('?').next().unwrap_or("").trim_end_matches('/');
+    if body.is_empty()
+        || !p.ends_with("/chat/completions")
+        || !body.windows(7).any(|w| w == b"\"tools\"")
+    {
+        return Ok(());
+    }
+    let Ok(Value::Object(doc)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(());
+    }; // the engine will say what is wrong
+    if !doc.get("tools").is_some_and(crate::settings::py_truthy)
+        || doc.get("tool_choice") == Some(&json!("none"))
+    {
+        return Ok(());
+    }
+    let mut clash = vec![];
+    for key in ["response_format", "json_schema", "grammar"] {
+        let v = doc.get(key).cloned().unwrap_or(Value::Null);
+        if key == "response_format" {
+            if let Value::Object(o) = &v {
+                if matches!(o.get("type"), None | Some(Value::Null))
+                    || o.get("type") == Some(&json!("text"))
+                {
+                    continue;
+                }
+            }
+        }
+        if !(v.is_null() || v == json!("") || v == json!({}) || v == json!([])) {
+            clash.push(key);
+        }
+    }
+    if clash.is_empty() {
+        return Ok(());
+    }
+    Err(format!("A chat request must not carry both tools and {}: the model would not call the tools and would answer with substitute JSON. Send them in separate requests.", clash.join(", ")))
+}
+
+enum Upstream {
+    Failed(String),
+    Answer {
+        status: u16,
+        ctype: String,
+        stream: bool,
+    },
+}
+
+/// Pass /v1/* to the engine; streams (SSE) are forwarded as they arrive.
+async fn proxy(
+    st: &Ctx,
+    parts: axum::http::request::Parts,
+    body: Body,
+    head: bool,
+) -> Response<Body> {
+    let (state, base, key) = st.engine.target();
+    if !(state == "ready" || state == "attached") || base.is_empty() {
+        return send_json(
+            503,
+            &json!({"error": {"message": "No model is loaded. Load one in FLE Studio first.", "type": "unavailable_error", "code": 503}}),
+            head,
+        );
+    }
+    let declared: usize = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if declared > MAX_PROXY {
+        return error_json(413, "Request too large", head);
+    }
+    let Ok(bytes) = to_bytes(body, MAX_PROXY).await else {
+        return error_json(413, "Request too large", head);
+    };
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    if let Err(m) = screen_proxy_body(&path_q, &bytes) {
+        return error_json(400, &m, head);
+    }
+    let method = parts.method.to_string();
+    let ctype = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let accept = parts
+        .headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("*/*")
+        .to_string();
+    let live = st.live.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
+    let (meta_tx, meta_rx) = tokio::sync::oneshot::channel::<Upstream>();
+    std::thread::spawn(move || {
+        let url = format!("{}{}", base.trim_end_matches('/'), path_q);
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(Duration::from_secs(900))
+            .timeout_read(Duration::from_secs(900))
+            .build();
+        let mut req = agent
+            .request(&method, &url)
+            .set("Content-Type", &ctype)
+            .set("Accept", &accept);
+        if !key.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {key}"));
+        }
+        let result = if bytes.is_empty() && method == "GET" {
+            req.call()
+        } else {
+            req.send_bytes(&bytes)
+        };
+        let resp = match result {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => {
+                use std::error::Error;
+                let mut cur: &dyn Error = &e;
+                while let Some(s) = cur.source() {
+                    cur = s;
+                }
+                let _ = meta_tx.send(Upstream::Failed(cur.to_string()));
+                return;
+            }
+        };
+        let rtype = resp
+            .header("Content-Type")
+            .unwrap_or("application/json")
+            .to_string();
+        let stream = rtype.contains("text/event-stream");
+        let _ = meta_tx.send(Upstream::Answer {
+            status: resp.status(),
+            ctype: rtype,
+            stream,
+        });
+        let mut reader = resp.into_reader();
+        let mut all: Vec<u8> = vec![];
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = match std::io::Read::read(&mut reader, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if stream {
+                if tx
+                    .blocking_send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
+                    break; // the browser stopped reading (Stop button); closing our side cancels the generation
+                }
+                all.extend_from_slice(&buf[..n]);
+                if all.len() > 262144 {
+                    all.drain(..all.len() - 262144);
+                }
+            } else {
+                all.extend_from_slice(&buf[..n]);
+            }
+        }
+        if stream {
+            record_stream(&live, &all);
+        } else {
+            record_data(&live, &all);
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(all)));
+        }
+    });
+    let mut rx = rx;
+    match meta_rx.await {
+        Err(_) => error_json(502, "The engine did not answer", head),
+        Ok(Upstream::Failed(why)) => send_json(
+            502,
+            &json!({"error": {"message": format!("The engine did not answer: {why}"), "type": "bad_gateway"}}),
+            head,
+        ),
+        Ok(Upstream::Answer {
+            status,
+            ctype,
+            stream: false,
+        }) => {
+            let mut data = vec![];
+            while let Some(Ok(c)) = rx.recv().await {
+                data.extend_from_slice(&c);
+            }
+            send(status, data, &ctype, &[], head)
+        }
+        Ok(Upstream::Answer {
+            status,
+            ctype,
+            stream: true,
+        }) => {
+            let mut r = Response::new(Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ));
+            *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+            let h = r.headers_mut();
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&ctype)
+                    .unwrap_or(HeaderValue::from_static("text/event-stream")),
+            );
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            h.insert("x-accel-buffering", HeaderValue::from_static("no"));
+            h.insert(header::CONNECTION, HeaderValue::from_static("close"));
+            r
+        }
+    }
+}
+
+fn record_data(live: &Live, data: &[u8]) {
+    if let Ok(Value::Object(o)) = serde_json::from_slice::<Value>(data) {
+        if let Some(t) = o.get("timings").filter(|t| crate::settings::py_truthy(t)) {
+            live.record_response(t, o.get("usage"));
+        }
+    }
+}
+
+fn record_stream(live: &Live, tail: &[u8]) {
+    let text = String::from_utf8_lossy(tail).to_string();
+    for line in text.lines().rev() {
+        if line.starts_with("data:") && line.contains("\"timings\"") {
+            let Ok(obj) = serde_json::from_str::<Value>(line[5..].trim()) else {
+                continue;
+            };
+            live.record_response(obj.get("timings").unwrap_or(&json!({})), obj.get("usage"));
+            return;
+        }
+    }
 }

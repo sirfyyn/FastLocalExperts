@@ -134,7 +134,9 @@ fn norm(v: &Value, port: i64, home: &Path, fake: &Path) -> Value {
     v["load"]["read"] = json!(0);
     v["load"]["elapsed"] = json!(!v["load"]["elapsed"].is_null());
     if v["state"] == "starting" {
+        // the moment a status is taken decides whether the first log line is in yet
         v["load"]["progress"] = json!(0);
+        v["log_seq"] = json!(0);
     }
     if !v["cache"].is_null() {
         v["cache"].as_object_mut().map(|c| c.remove("at"));

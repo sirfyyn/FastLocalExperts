@@ -867,6 +867,19 @@ impl Engine {
         })
     }
 
+    /// The pid of the engine Studio started, if one runs.
+    pub fn proc_pid(&self) -> Option<u32> {
+        self.st.lock().unwrap().proc.as_ref().map(|p| p.1)
+    }
+
+    pub fn cache_snapshot(&self) -> Map<String, Value> {
+        self.st.lock().unwrap().cache.clone()
+    }
+
+    pub fn accept_logged(&self) -> Option<f64> {
+        self.st.lock().unwrap().accept_logged
+    }
+
     /// (state, base url, key) for the samplers and the chat proxy.
     pub fn target(&self) -> (String, String, String) {
         let s = self.st.lock().unwrap();
