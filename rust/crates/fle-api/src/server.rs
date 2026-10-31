@@ -27,11 +27,11 @@ pub struct Options {
 pub struct Studio {
     pub opts: Options,
     pub token: String,
-    pub config: Mutex<Config>,
+    pub config: Arc<Mutex<Config>>,
     pub chats: Chats,
     pub chat_lock: Mutex<()>,
     pub library: Mutex<Library>,
-    pub downloads: Mutex<Downloads>,
+    pub downloads: Downloads,
 }
 
 /// An error the page shows as `{"error": {"message": ...}}`.
@@ -48,15 +48,27 @@ fn make_token() -> String {
 pub fn new_studio(opts: Options) -> Ctx {
     let config = Config::load(&opts.home.join("settings.json"));
     let home = opts.home.clone();
+    let config = Arc::new(Mutex::new(config));
+    let tok = config.clone();
+    let downloads = Downloads::new(
+        &home,
+        Box::new(move || {
+            tok.lock()
+                .unwrap()
+                .get("hf_token")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default()
+        }),
+    );
     let chats = Chats::new(&home);
     Arc::new(Studio {
         opts,
         token: make_token(),
-        config: Mutex::new(config),
+        config,
         chats,
         chat_lock: Mutex::new(()),
         library: Mutex::new(Library::new(&home)),
-        downloads: Mutex::new(Downloads::new(&home)),
+        downloads,
     })
 }
 
@@ -289,11 +301,46 @@ impl Studio {
         json!({"mtp_head": one(crate::catalog::mtp_head()), "mtp_vocab": one(crate::catalog::mtp_vocab())})
     }
 
+    /// The files of a catalog model (and its MTP head and vocabulary): name for the job, and `[{url, dest, size, sha256}]`.
+    pub fn catalog_files(
+        ident: &str,
+        with_mtp: bool,
+        root: &std::path::Path,
+    ) -> Result<(String, Vec<Value>), ApiError> {
+        let model = crate::catalog::by_id(ident)
+            .ok_or_else(|| ApiError(404, "Unknown catalog model".into()))?;
+        let mut refs: Vec<Value> = model["files"].as_array().cloned().unwrap_or_default();
+        if with_mtp && model["mtp"].as_bool() == Some(true) {
+            refs.push(crate::catalog::mtp_head().clone());
+            refs.push(crate::catalog::mtp_vocab().clone());
+        }
+        let files = refs
+            .iter()
+            .map(|r| {
+                let (repo, path) = (r["repo"].as_str().unwrap_or(""), r["path"].as_str().unwrap_or(""));
+                json!({"url": crate::hf::resolve_url(repo, path, "main"), "dest": root.join(repo).join(path).to_string_lossy(), "size": r["size"], "sha256": r["sha256"]})
+            })
+            .collect();
+        Ok((model["name"].as_str().unwrap_or("").to_string(), files))
+    }
+
+    /// Queue a catalog model for download (`download_catalog`).
+    pub fn download_catalog(&self, ident: &str, with_mtp: bool) -> Result<Value, ApiError> {
+        let (name, files) = Self::catalog_files(ident, with_mtp, &self.models_dir())?;
+        Ok(self.downloads.add(
+            &name,
+            &files,
+            "model",
+            json!({"catalog_id": ident}),
+            &format!("catalog:{ident}"),
+        ))
+    }
+
     /// The catalog with what is already on disk and what is being downloaded (`catalog_view`).
     pub fn catalog_view(&self) -> Value {
         let info = crate::system::info(&self.models_dir());
         let models = self.library.lock().unwrap().scan(&self.models_dir());
-        let jobs = self.downloads.lock().unwrap().list();
+        let jobs = self.downloads.list();
         let mut out = vec![];
         for mut entry in crate::catalog::catalog(&info) {
             let id = entry["id"].clone();
@@ -317,6 +364,28 @@ impl Studio {
         }
         Value::Array(out)
     }
+}
+
+/// `/api/downloads/<hex>/<pause|resume|cancel|remove>` -> (id, action)
+fn download_action(p: &str) -> Option<(&str, &str)> {
+    let rest = p.strip_prefix("/api/downloads/")?;
+    let (id, what) = rest.split_once('/')?;
+    (!id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && matches!(what, "pause" | "resume" | "cancel" | "remove"))
+    .then_some((id, what))
+}
+
+/// `/api/catalog/<id>/download` -> the catalog id (`[\w.-]+`)
+fn catalog_download_id(p: &str) -> Option<&str> {
+    let id = p.strip_prefix("/api/catalog/")?.strip_suffix("/download")?;
+    (!id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-')))
+    .then_some(id)
 }
 
 /// `/api/models/<12 hex>/remove` -> the id
@@ -370,10 +439,23 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
                 Err(LibError::Invalid(m)) => Err(ApiError(400, m)),
             }
         }),
+        ("POST", _) if catalog_download_id(p).is_some() => r.json(MAX_JSON).and_then(|body| {
+            let mtp = body
+                .get("mtp")
+                .map(crate::settings::py_truthy)
+                .unwrap_or(true);
+            st.download_catalog(catalog_download_id(p).unwrap(), mtp)
+        }),
         ("GET", "/api/catalog") => {
             Ok(json!({"catalog": st.catalog_view(), "extras": st.extras_view()}))
         }
-        ("GET", "/api/downloads") => Ok(json!({"downloads": st.downloads.lock().unwrap().list()})),
+        ("POST", _) if download_action(p).is_some() => {
+            let (id, what) = download_action(p).unwrap();
+            st.downloads
+                .action(id, what)
+                .ok_or(ApiError(404, "Not found".into()))
+        }
+        ("GET", "/api/downloads") => Ok(json!({"downloads": st.downloads.list()})),
         ("GET", "/api/chats") => Ok(json!({"chats": st.chats.list()})),
         ("POST", "/api/chats") => r.json(MAX_CHAT).and_then(|body| {
             let _g = st.chat_lock.lock().unwrap();

@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod chats;
 pub mod downloads;
 pub mod gguf;
+pub mod hf;
 pub mod library;
 pub mod server;
 pub mod settings;
