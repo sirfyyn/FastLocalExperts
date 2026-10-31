@@ -52,7 +52,7 @@ pub struct Resp {
     pub body: Vec<u8>,
 }
 impl Resp {
-    fn h(&self, k: &str) -> Vec<&str> {
+    pub fn h(&self, k: &str) -> Vec<&str> {
         self.headers
             .iter()
             .filter(|(n, _)| n == k)
