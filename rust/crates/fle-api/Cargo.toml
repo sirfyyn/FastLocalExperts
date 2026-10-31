@@ -25,6 +25,12 @@ regex = "1"
 tokio-stream = "0.1"
 bytes = "1"
 include_dir = "0.7"
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

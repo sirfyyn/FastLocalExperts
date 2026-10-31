@@ -509,6 +509,163 @@ impl Studio {
         })
     }
 
+    /// What the loaded model can do, as far as the engine says (`capabilities`).
+    pub fn capabilities(&self) -> Value {
+        let props = self.engine.props();
+        let modalities = props
+            .get("modalities")
+            .filter(|m| m.is_object())
+            .cloned()
+            .unwrap_or(json!({}));
+        let caps = props
+            .get("chat_template_caps")
+            .filter(|m| m.is_object())
+            .cloned()
+            .unwrap_or(json!({}));
+        let limit = match self.config.lock().unwrap().get("chat.max_upload_mb") {
+            Some(v) => v.as_i64().unwrap_or(25).clamp(1, 512),
+            None => 25,
+        };
+        json!({"vision": modalities.get("vision").is_some_and(crate::settings::py_truthy), "tools": caps.get("supports_tools").cloned().unwrap_or(Value::Null),
+            "n_ctx": self.engine.status()["n_ctx"], "max_upload_mb": limit, "pdf": false})
+    }
+
+    /// One tool call (`ToolBox.call`).
+    pub fn tools_call(&self, body: &Map<String, Value>) -> Result<Value, ApiError> {
+        let s = self
+            .config
+            .lock()
+            .unwrap()
+            .get("tools")
+            .cloned()
+            .unwrap_or(json!({}));
+        let name = body
+            .get("name")
+            .filter(|v| crate::settings::py_truthy(v))
+            .map(crate::settings::py_str)
+            .unwrap_or_default();
+        let Some(tool) = crate::tools::tools(&s).into_iter().find(|t| t.name == name) else {
+            return Err(ApiError(
+                404,
+                "That tool is not available (turned off, or its server is not connected).".into(),
+            ));
+        };
+        if tool.confirm && body.get("approved") != Some(&json!(true)) {
+            return Err(ApiError(409, "This tool needs your approval first.".into()));
+        }
+        let mut args = body
+            .get("arguments")
+            .filter(|v| crate::settings::py_truthy(v))
+            .cloned()
+            .unwrap_or(json!({}));
+        if let Value::String(t) = &args {
+            args = if t.trim().is_empty() {
+                json!({})
+            } else {
+                match serde_json::from_str::<Value>(t) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Ok(
+                            json!({"content": "The arguments are not valid JSON.", "is_error": true, "ms": 0}),
+                        )
+                    }
+                }
+            };
+        }
+        if !args.is_object() {
+            return Ok(
+                json!({"content": "The arguments must be a JSON object.", "is_error": true, "ms": 0}),
+            );
+        }
+        let t0 = std::time::Instant::now();
+        let (content, is_error) = match crate::tools::run(&tool, &s, &args) {
+            Ok(c) => (c, false),
+            Err(e) => (e.0, true),
+        };
+        Ok(json!({"content": content, "is_error": is_error, "ms": t0.elapsed().as_millis() as i64}))
+    }
+
+    /// The hosts this Studio can switch to, as the page lists them (`api_hosts`; adding a host comes with the remote stage).
+    pub fn hosts_view(&self) -> Value {
+        let file = self.opts.home.join("hosts.json");
+        let hosts: Vec<Value> = match std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        {
+            Some(Value::Array(a)) => a,
+            _ => vec![],
+        };
+        let public: Vec<Value> = hosts
+            .iter()
+            .map(|h| {
+                let mut o: Map<String, Value> = [
+                    "id",
+                    "name",
+                    "color",
+                    "kind",
+                    "scheme",
+                    "address",
+                    "fingerprint",
+                    "mirror",
+                    "ssh",
+                    "paired",
+                ]
+                .iter()
+                .map(|k| (k.to_string(), h.get(*k).cloned().unwrap_or(Value::Null)))
+                .collect();
+                let fp = h
+                    .get("fingerprint")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_lowercase()
+                    .replace(':', "");
+                let pretty = fp
+                    .as_bytes()
+                    .chunks(2)
+                    .map(|c| String::from_utf8_lossy(c).to_uppercase())
+                    .collect::<Vec<_>>()
+                    .join(":");
+                o.insert("fingerprint_pretty".into(), json!(pretty));
+                o.insert("tunnel".into(), Value::Null);
+                Value::Object(o)
+            })
+            .collect();
+        let ssh = std::env::var("FLE_STUDIO_SSH")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            || fle_core::launch::which("ssh").is_some();
+        let name = {
+            let n = self
+                .config
+                .lock()
+                .unwrap()
+                .get("remote.name")
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            if !n.trim().is_empty() {
+                n.trim().to_string()
+            } else {
+                fle_core::launch::run_text("hostname", &[])
+                    .split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            }
+        };
+        json!({"hosts": public, "ssh": ssh, "client_name": name})
+    }
+
+    /// What the update panel shows. This program updates itself with its first release; until then nothing is offered.
+    pub fn update_view(&self) -> Value {
+        let c = self.config.lock().unwrap();
+        let g = |k: &str| c.get(k).is_some_and(crate::settings::py_truthy);
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        json!({"enabled": g("updates.check"), "prereleases": g("updates.prereleases"), "current": self.opts.version, "checked": Value::Null, "checking": false, "error": "", "app": Value::Null,
+            "engines": [], "install": {"kind": "binary", "source": exe, "service": false}, "run": {"state": "idle", "tag": "", "message": "", "tail": []}, "result": Value::Null})
+    }
+
     pub fn sysinfo(&self) -> Value {
         crate::system::info(&self.models_dir())
     }
@@ -660,6 +817,48 @@ fn route(st: &Ctx, r: &Req) -> Option<Result<Value, ApiError>> {
     Some(match (m, p) {
         ("GET", "/api/ping") => Ok(json!({"app": "fle-studio", "version": st.opts.version})),
         ("GET", "/api/system") => Ok(crate::system::info(&st.config.lock().unwrap().models_dir())),
+        ("GET", "/api/chat/capabilities") => Ok(st.capabilities()),
+        ("GET", "/api/tools") => Ok(crate::tools::status(
+            &st.config
+                .lock()
+                .unwrap()
+                .get("tools")
+                .cloned()
+                .unwrap_or(json!({})),
+        )),
+        ("POST", "/api/tools/reload") => Ok(crate::tools::status(
+            &st.config
+                .lock()
+                .unwrap()
+                .get("tools")
+                .cloned()
+                .unwrap_or(json!({})),
+        )),
+        ("POST", "/api/tools/call") => r.json(MAX_JSON).and_then(|body| st.tools_call(&body)),
+        ("GET", "/api/hosts") => Ok(st.hosts_view()),
+        ("GET", "/api/update") => Ok(st.update_view()),
+        ("POST", "/api/update/check") => Ok(st.update_view()),
+        ("POST", "/api/update/ack") => Ok(st.update_view()),
+        ("POST", "/api/update/dismiss") => r.json(MAX_JSON).and_then(|body| {
+            let version = body
+                .get("version")
+                .filter(|v| crate::settings::py_truthy(v))
+                .map(crate::settings::py_str)
+                .unwrap_or_default();
+            if !version.is_empty() {
+                let patch = json!({"updates": {"dismissed": version}});
+                st.config
+                    .lock()
+                    .unwrap()
+                    .update(patch.as_object().unwrap())
+                    .map_err(|e| ApiError(400, e))?;
+            }
+            Ok(st.update_view())
+        }),
+        ("POST", "/api/update/apply") => Err(ApiError(
+            409,
+            "Updating from inside this program comes with its first release.".into(),
+        )),
         ("GET", "/api/state") => Ok(st.state()),
         ("GET", "/api/settings") => Ok(st.config.lock().unwrap().public()),
         ("POST", "/api/settings") => r.json(MAX_JSON).and_then(|body| {
@@ -1056,8 +1255,41 @@ async fn handler(
         {
             static_file(&st, &path, head)
         }
-        None => error_json(404, "Not found", head),
+        None => match not_yet(&path, &parts.method) {
+            Some(what) => error_json(
+                501,
+                &format!("{what} is not in this version of FLE yet."),
+                head,
+            ),
+            None => error_json(404, "Not found", head),
+        },
     }
+}
+
+/// Features of the Python Studio that this server does not have yet: a clear 501 instead of a 404 that looks like a bug.
+fn not_yet(path: &str, method: &Method) -> Option<&'static str> {
+    let is = |p: &str| path == p || path.starts_with(&format!("{p}/"));
+    Some(if is("/api/hf") {
+        "Searching and downloading from Hugging Face"
+    } else if is("/api/bench") {
+        "The speed test"
+    } else if is("/api/forge") {
+        "The model forge"
+    } else if is("/api/tuning") {
+        "The tuner"
+    } else if is("/api/quality") {
+        "The quality measurements"
+    } else if is("/api/cache") {
+        "The expert cache view"
+    } else if is("/api/flags") {
+        "The engine flag help"
+    } else if is("/api/mcp") || is("/oauth") || is("/api/apps") || is("/app-frame") {
+        "MCP servers"
+    } else if is("/api/remote") || is("/h") || (is("/api/hosts") && *method != Method::GET) {
+        "Remote access"
+    } else {
+        return None;
+    })
 }
 
 pub fn router(st: Ctx) -> Router {

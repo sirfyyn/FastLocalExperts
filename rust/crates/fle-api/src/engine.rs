@@ -215,6 +215,13 @@ impl Engine {
     // ------------------------------------------------------------------ control
 
     fn refuse_start(s: &State) -> Result<(), EngineErr> {
+        // A start next to an attached server would run two engines at once (the Python Studio allowed it by an
+        // oversight; deliberate difference D2, see DEVIATIONS.md).
+        if s.state == "attached" {
+            return Err(EngineErr::Busy(
+                "A server is attached. Disconnect it on the Engine page first.".into(),
+            ));
+        }
         if matches!(s.state.as_str(), "starting" | "ready" | "stopping") {
             return Err(EngineErr::Busy(
                 "An engine is already running. Stop it first.".into(),
@@ -870,6 +877,10 @@ impl Engine {
     /// The pid of the engine Studio started, if one runs.
     pub fn proc_pid(&self) -> Option<u32> {
         self.st.lock().unwrap().proc.as_ref().map(|p| p.1)
+    }
+
+    pub fn props(&self) -> Value {
+        self.st.lock().unwrap().props.clone()
     }
 
     pub fn cache_snapshot(&self) -> Map<String, Value> {
