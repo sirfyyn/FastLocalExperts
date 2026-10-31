@@ -26,6 +26,8 @@ def say(t):
 if mode == "exit0":
     say("srv main: nothing to do"); sys.exit(0)
 ready_at = time.time() + (2.0 if mode == "slow" else 0.3)
+if mode in ("crash", "badarg"):
+    ready_at = time.time() + 3600  # an engine that dies while loading never answers /health with 200
 class H(BaseHTTPRequestHandler):
     def log_message(self, *x): pass
     def _send(self, code, body):
@@ -166,6 +168,14 @@ fn norm(v: &Value, port: i64, home: &Path, fake: &Path) -> Value {
         // the moment a status is taken decides whether the first log line is in yet
         v["load"]["progress"] = json!(0);
         v["log_seq"] = json!(0);
+        // whether the process has been spawned yet at this moment is not the same on two servers
+        v["pid"] = json!(false);
+        v["started"] = json!(false);
+        v["load"]["total"] = json!(0);
+        v["rss"] = json!(false);
+    }
+    if v["state"] != "ready" && v["state"] != "attached" {
+        v["rss"] = json!(false); // read once or not before the engine died
     }
     if !v["cache"].is_null() {
         v["cache"].as_object_mut().map(|c| c.remove("at"));
@@ -347,11 +357,25 @@ fn the_engine_matches_the_python_studio() {
     };
     let same = |label: &str, a: &Value, b: &Value| {
         let (pa, pb) = (port_of(a), port_of(b));
-        assert_eq!(
-            norm(a, pa, &hr, &fr),
-            norm(b, pb, &hp, &fp),
-            "[{label}] status"
-        );
+        let (x, y) = (norm(a, pa, &hr, &fr), norm(b, pb, &hp, &fp));
+        if x != y {
+            let diff: Vec<String> = x
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, v)| y.get(k.as_str()) != Some(v))
+                .map(|(k, v)| {
+                    format!(
+                        "{k}: rust {v} python {}",
+                        y.get(k.as_str()).cloned().unwrap_or_default()
+                    )
+                })
+                .collect();
+            panic!(
+                "[{label}] status differs in {}",
+                diff.join(" | ").chars().take(1500).collect::<String>()
+            );
+        }
         n.set(n.get() + 1);
     };
     let same_log = |label: &str, a: &Value, b: &Value| {
@@ -444,8 +468,8 @@ fn the_engine_matches_the_python_studio() {
     };
     set_engine("crashy-llama-server");
     config(json!({"launch": {"fallback_on_failure": true}}));
-    let (a0, b0) = start("fallback", "");
-    same("fallback just started", &a0, &b0);
+    // (no look at the state right after the start: the engine dies and the second one starts within moments)
+    let _ = start("fallback", "");
     let (a, b) = settle("fallback ready", &["ready"], "draft acceptance");
     same("fallback ready", &a, &b);
     assert!(

@@ -678,7 +678,11 @@ fn pow_num(base: &Num, exp: &Num) -> Result<Num, Fail> {
     }
     let r = b.powf(e);
     if r.is_infinite() && b.is_finite() && e.is_finite() {
-        return Err(tool("Cannot calculate that: (34, 'Result too large')"));
+        return Err(tool(if cfg!(target_os = "linux") {
+            "Cannot calculate that: (34, 'Numerical result out of range')"
+        } else {
+            "Cannot calculate that: (34, 'Result too large')" // the C library's wording of ERANGE: macOS, Windows
+        }));
     }
     Ok(Num::Float(r))
 }
