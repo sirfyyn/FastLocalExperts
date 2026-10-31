@@ -20,7 +20,36 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum ConfigAction {
+    /// print the config path
+    Path,
+    /// write a default config
+    Init {
+        #[arg(long)]
+        force: bool,
+    },
+    /// show the effective settings
+    Show,
+    /// set KEY VALUE
+    Set { key: String, value: String },
+    /// remove KEY
+    Unset { key: String },
+    /// open the file in $EDITOR
+    Edit,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
+    /// Show or change the global settings (~/.config/fle/config.toml)
+    Config {
+        /// use another config file
+        #[arg(long, global = true, value_name = "FILE")]
+        config: Option<String>,
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// What this machine can do, and which engine fits it
     Doctor,
     /// The models FLE knows, and whether each fits this machine
@@ -75,11 +104,95 @@ fn print_event(e: &Event) {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = run() {
+        // same words as the Python helper: "fle: message", then "hint: ..."; exit code 2
+        if let Some(fe) = e.downcast_ref::<fle_core::FleError>() {
+            eprintln!("fle: {fe}");
+            if !fe.hint.is_empty() {
+                eprintln!("hint: {}", fe.hint);
+            }
+        } else {
+            eprintln!("fle: {e:#}");
+        }
+        std::process::exit(2);
+    }
+}
+
+fn run_config(config: Option<String>, json: bool, action: ConfigAction) -> Result<()> {
+    use fle_core::{config, FleError};
+    let path = config::config_path(config.as_deref());
+    match action {
+        ConfigAction::Path => println!("{}", path.display()),
+        ConfigAction::Init { force } => {
+            if path.exists() && !force {
+                return Err(FleError::new(
+                    format!("{} already exists", path.display()),
+                    "Use --force to replace it.",
+                )
+                .into());
+            }
+            let (data, _) = config::load(config.as_deref())?;
+            println!("{}", config::save(&data, config.as_deref())?.display());
+        }
+        ConfigAction::Edit => {
+            if !path.exists() {
+                let (data, _) = config::load(config.as_deref())?;
+                config::save(&data, config.as_deref())?;
+            }
+            let editor = std::env::var("VISUAL")
+                .or_else(|_| std::env::var("EDITOR"))
+                .unwrap_or_else(|_| "vi".into());
+            let st = std::process::Command::new(&editor).arg(&path).status()?;
+            std::process::exit(st.code().unwrap_or(1));
+        }
+        ConfigAction::Show => {
+            let (data, resolved) = config::load(config.as_deref())?;
+            let settings = config::effective(&serde_json::Map::new(), &data)?;
+            if json {
+                let v =
+                    serde_json::json!({"path": resolved.to_string_lossy(), "settings": settings});
+                println!("{}", fle_core::gguf::py_json(&v));
+            } else {
+                print!("{}", config::show_text(&resolved, &settings));
+            }
+        }
+        ConfigAction::Set { key, value } => {
+            let (mut data, _) = config::load(config.as_deref())?;
+            if key == "profile" && !config::PROFILES.contains(&value.as_str()) {
+                return Err(FleError::new(
+                    format!("Unknown profile '{value}'"),
+                    format!("Use one of: {}.", config::PROFILES.join(", ")),
+                )
+                .into());
+            }
+            let v = if key.starts_with("env.") {
+                serde_json::Value::String(value)
+            } else {
+                config::parse_value(&value)
+            };
+            config::set_dotted(&mut data, &key, v);
+            println!("{}", config::save(&data, config.as_deref())?.display());
+        }
+        ConfigAction::Unset { key } => {
+            let (mut data, _) = config::load(config.as_deref())?;
+            config::unset_dotted(&mut data, &key);
+            println!("{}", config::save(&data, config.as_deref())?.display());
+        }
+    }
+    Ok(())
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(data_dir);
     match cli.cmd {
         None => tui::run(&home),
+        Some(Cmd::Config {
+            config,
+            json,
+            action,
+        }) => run_config(config, json, action),
         Some(Cmd::Doctor) => {
             let s = system::detect(&home);
             println!("OS        {} {}\nCPU       {} ({} cores)\nMemory    {}\nGPU       {}\nDisk free {} (in {})", s.os, s.arch, s.cpu, s.cores, system::gib(s.ram_bytes),
