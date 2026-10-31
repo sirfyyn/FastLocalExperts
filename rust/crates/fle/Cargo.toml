@@ -1,0 +1,13 @@
+[package]
+name = "fle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fle-core = { path = "../fle-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+serde_json = "1"
