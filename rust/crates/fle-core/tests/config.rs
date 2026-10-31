@@ -235,11 +235,9 @@ fn matches_the_python_helper() {
         load(Some(rs.to_str().unwrap())).unwrap()
     };
     save(&data_rs, Some(rs.to_str().unwrap())).unwrap();
-    assert_eq!(
-        std::fs::read(&rs).unwrap(),
-        std::fs::read(&pf).unwrap(),
-        "the saved files differ"
-    );
+    // Python's write_text writes CRLF on Windows; both are valid TOML
+    let text = |p: &Path| std::fs::read_to_string(p).unwrap().replace("\r\n", "\n");
+    assert_eq!(text(&rs), text(&pf), "the saved files differ");
     for envs in [
         vec![],
         vec![
