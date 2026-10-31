@@ -184,6 +184,11 @@ fn set_value_conversion_matches_the_cli() {
     assert_eq!(parse_value("auto"), json!("auto"));
 }
 
+/// A path as it appears inside JSON text (Windows backslashes are doubled).
+fn esc(p: &Path) -> String {
+    p.to_str().unwrap().replace('\\', "\\\\")
+}
+
 fn py(args: &[&str], envs: &[(&str, &str)]) -> Option<(String, bool)> {
     let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fle");
     if !helper.exists() {
@@ -258,8 +263,8 @@ fn matches_the_python_helper() {
             py(&["--config", pf.to_str().unwrap(), "--json", "show"], &envs).unwrap();
         assert!(ok);
         assert_eq!(
-            mine.replace(rs.to_str().unwrap(), "X"),
-            theirs.replace(pf.to_str().unwrap(), "X"),
+            mine.replace(&esc(&rs), "X"),
+            theirs.replace(&esc(&pf), "X"),
             "show --json differs (env {envs:?})"
         );
     }
