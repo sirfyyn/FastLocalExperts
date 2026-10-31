@@ -52,8 +52,6 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// What this machine can do, and which engine fits it
-    Doctor,
     /// The models FLE knows, and whether each fits this machine
     Models,
     /// Load a model and keep serving it (OpenAI-compatible API) until Ctrl+C
@@ -73,6 +71,65 @@ enum Cmd {
     },
     /// Show the llama-server command and the numbers behind it
     Plan(Box<plancmd::PlanArgs>),
+    /// Check model, engine, memory, disk and the command that would start
+    Doctor {
+        #[command(flatten)]
+        common: plancmd::Common,
+        /// exit 1 on warnings too
+        #[arg(long)]
+        strict: bool,
+    },
+    /// What this computer has and which engines `fle` could install
+    System,
+    /// Start llama-server with the plan
+    Serve {
+        #[command(flatten)]
+        plan: Box<plancmd::PlanArgs>,
+        /// print the plan, do not start
+        #[arg(long)]
+        dry_run: bool,
+        /// skip doctor before starting
+        #[arg(long)]
+        no_preflight: bool,
+        /// start even if doctor finds a failure
+        #[arg(long)]
+        force: bool,
+        /// with --fallback: how long to watch the start for a crash before leaving the server alone
+        #[arg(long, default_value_t = 3600.0, value_name = "SEC")]
+        ready_timeout: f64,
+    },
+    /// List the llama-server builds this program can find
+    Engines {
+        #[command(flatten)]
+        common: plancmd::Common,
+        /// also show candidate paths that do not exist
+        #[arg(long)]
+        all: bool,
+    },
+    /// Download the MTP head and vocabulary for a known model
+    FetchSidecars {
+        #[command(flatten)]
+        common: plancmd::Common,
+        /// show what would be downloaded, change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// replace files that are already there
+        #[arg(long)]
+        force: bool,
+    },
+    /// Write a redacted diagnostic report
+    Report {
+        #[command(flatten)]
+        common: plancmd::Common,
+        /// file to write, - for stdout
+        #[arg(long, default_value = "-")]
+        out: String,
+        /// write a zip with report.json and plan.sh
+        #[arg(long)]
+        zip: bool,
+    },
+    /// Measure tokens per second through /v1
+    Bench(Box<BenchArgs>),
     /// Ask one question and print the answer (loads the model for the duration)
     Ask {
         model: String,
@@ -121,6 +178,131 @@ fn main() {
         }
         std::process::exit(2);
     }
+}
+
+#[derive(clap::Args)]
+struct BenchArgs {
+    /// server base URL
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    url: String,
+    /// also benchmark a second running server/model at URL
+    #[arg(long, value_name = "URL")]
+    compare: Option<String>,
+    /// model name (default: first in /v1/models)
+    #[arg(long = "model", default_value = "")]
+    model_name: String,
+    #[arg(
+        long,
+        default_value = "Write a short paragraph about why local language models are useful."
+    )]
+    prompt: String,
+    /// read the prompt from a file
+    #[arg(long, value_name = "FILE")]
+    prompt_file: Option<String>,
+    #[arg(long, default_value_t = 128)]
+    max_tokens: i64,
+    #[arg(long, default_value_t = 3)]
+    runs: i64,
+    #[arg(long, default_value_t = 1)]
+    warmup: i64,
+    #[arg(long, default_value_t = 600.0)]
+    timeout: f64,
+    /// write the JSON result to a file
+    #[arg(long, value_name = "FILE")]
+    output: Option<String>,
+    /// JSON from an earlier --output; compare the median tok/s with it
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<String>,
+    /// with --baseline: exit 2 when the median drops by more than PCT percent
+    #[arg(long, default_value_t = fle_core::bench::DEFAULT_MAX_REGRESSION, value_name = "PCT")]
+    max_regression: f64,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, hide = true)]
+    color: Option<String>,
+    #[arg(long, hide = true)]
+    debug: bool,
+}
+
+fn run_bench(a: BenchArgs) -> Result<i32> {
+    use fle_core::{bench, FleError};
+    let mut prompt = a.prompt.clone();
+    if let Some(f) = &a.prompt_file {
+        prompt = std::fs::read_to_string(f)
+            .map_err(|e| FleError::new(format!("Cannot read {f}: {e}"), "Check the path."))?;
+    }
+    if a.max_regression < 0.0 {
+        return Err(FleError::new(
+            "--max-regression must not be negative.",
+            "Use a percentage such as 10.",
+        )
+        .into());
+    }
+    let baseline = a
+        .baseline
+        .as_deref()
+        .map(bench::load_baseline)
+        .transpose()?;
+    let mut urls = vec![a.url.clone()];
+    urls.extend(a.compare.clone());
+    let mut results = vec![];
+    for u in &urls {
+        let p = bench::Params {
+            url: u.clone(),
+            model: a.model_name.clone(),
+            prompt: prompt.clone(),
+            max_tokens: a.max_tokens,
+            runs: a.runs,
+            warmup: a.warmup,
+            timeout: a.timeout,
+        };
+        results.push(bench::run(&p)?);
+    }
+    let payload = if results.len() == 1 {
+        results[0].clone()
+    } else {
+        serde_json::json!({"primary": results[0], "compare": results[1]})
+    };
+    let comparison = baseline
+        .as_ref()
+        .map(|b| bench::compare_baseline(&results[0], b, a.max_regression));
+    if let Some(o) = &a.output {
+        std::fs::write(o, serde_json::to_string_pretty(&payload)?)
+            .map_err(|e| FleError::new(format!("Cannot write {o}: {e}"), "Check the path."))?;
+    }
+    if a.json {
+        let mut shown = payload.clone();
+        if let (Some(c), Some(m)) = (&comparison, shown.as_object_mut()) {
+            m.insert("baseline_comparison".into(), c.clone());
+        }
+        println!("{}", fle_core::gguf::py_json(&shown));
+    } else {
+        print!("{}", bench::result_text(&results[0]));
+        if results.len() > 1 {
+            print!("\n{}", bench::result_text(&results[1]));
+            let med = |r: &serde_json::Value| r["median_tok_s"].as_f64().unwrap_or(0.0);
+            println!(
+                "\ncompare: {:.2} vs {:.2} tok/s ({} vs {})",
+                med(&results[0]),
+                med(&results[1]),
+                results[0]["url"].as_str().unwrap_or(""),
+                results[1]["url"].as_str().unwrap_or("")
+            );
+        }
+        if let Some(c) = &comparison {
+            print!("\n{}", bench::comparison_text(c));
+        }
+    }
+    Ok(
+        if comparison
+            .as_ref()
+            .is_some_and(|c| c["status"] == "regression")
+        {
+            2
+        } else {
+            0
+        },
+    )
 }
 
 fn run_config(config: Option<String>, json: bool, action: ConfigAction) -> Result<()> {
@@ -187,6 +369,14 @@ fn run_config(config: Option<String>, json: bool, action: ConfigAction) -> Resul
     Ok(())
 }
 
+/// Exit with `code` unless it is 0.
+fn exit(code: i32) -> Result<()> {
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = cli.home.unwrap_or_else(data_dir);
@@ -198,7 +388,7 @@ fn run() -> Result<()> {
             action,
         }) => run_config(config, json, action),
         Some(Cmd::Plan(a)) => plancmd::run(*a, &home),
-        Some(Cmd::Doctor) => {
+        Some(Cmd::System) => {
             let s = system::detect(&home);
             println!("OS        {} {}\nCPU       {} ({} cores)\nMemory    {}\nGPU       {}\nDisk free {} (in {})", s.os, s.arch, s.cpu, s.cores, system::gib(s.ram_bytes),
                 if s.gpus.is_empty() { "none".into() } else { s.gpus.iter().map(|g| g.name.clone()).collect::<Vec<_>>().join(", ") }, system::gib(s.disk_free_bytes), home.display());
@@ -223,6 +413,31 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Some(Cmd::Doctor { common, strict }) => exit(plancmd::run_doctor(common, strict, &home)?),
+        Some(Cmd::Serve {
+            plan,
+            dry_run,
+            no_preflight,
+            force,
+            ready_timeout,
+        }) => exit(plancmd::run_serve(
+            *plan,
+            dry_run,
+            no_preflight,
+            force,
+            ready_timeout,
+            &home,
+        )?),
+        Some(Cmd::Engines { common, all }) => exit(plancmd::run_engines(common, all, &home)?),
+        Some(Cmd::FetchSidecars {
+            common,
+            dry_run,
+            force,
+        }) => exit(plancmd::run_fetch_sidecars(common, dry_run, force)?),
+        Some(Cmd::Report { common, out, zip }) => {
+            exit(plancmd::run_report(common, out, zip, &home)?)
+        }
+        Some(Cmd::Bench(a)) => exit(run_bench(*a)?),
         Some(Cmd::Models) => {
             let s = system::detect(&home);
             for m in catalog::builtin() {

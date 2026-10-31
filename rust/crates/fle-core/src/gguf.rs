@@ -481,10 +481,11 @@ pub fn resolve_model(path: &Path) -> Result<PathBuf> {
             firsts = std::mem::take(&mut c);
         }
         if firsts.is_empty() {
-            bail!(
-                "No GGUF model in {}. Pass the model file or a folder that contains it.",
-                p.display()
-            );
+            return Err(crate::FleError::new(
+                format!("No GGUF model in {}", p.display()),
+                "Pass the model file or a folder that contains it.",
+            )
+            .into());
         }
         firsts
             .sort_by_key(|q| std::cmp::Reverse(std::fs::metadata(q).map(|m| m.len()).unwrap_or(0)));
@@ -496,10 +497,11 @@ pub fn resolve_model(path: &Path) -> Result<PathBuf> {
         }
     }
     if !p.exists() {
-        bail!(
-            "No model at {}. Check the path, or start the download again.",
-            p.display()
-        );
+        return Err(crate::FleError::new(
+            format!("No model at {}", p.display()),
+            "Check the path, or start the download again.",
+        )
+        .into());
     }
     if !p
         .extension()
@@ -554,10 +556,14 @@ pub fn read_model(path: &Path) -> Result<Model> {
     let parts = split_parts(&first)?;
     let (present, missing): (Vec<_>, Vec<_>) = parts.iter().cloned().partition(|p| p.exists());
     if !present.contains(&first) {
-        bail!(
-            "The first part is missing: {}. Wait for the download to finish or pick another model.",
-            first.display()
-        );
+        return Err(crate::FleError::new(
+            format!(
+                "The first part is missing: {}",
+                first.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            "Wait for the download to finish or pick another model.",
+        )
+        .into());
     }
     let mut shards = present
         .iter()

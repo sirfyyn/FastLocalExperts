@@ -2,16 +2,21 @@
 //! to "model answering": hardware, engines, model catalog, resumable downloads, start plan, server, chat.
 //! No Python, no uv, no git. One static binary on top of this.
 
+pub mod bench;
 pub mod catalog;
 pub mod chat;
 pub mod config;
+pub mod doctor;
 pub mod download;
 pub mod engines;
 pub mod gguf;
 pub mod launch;
 pub mod plan;
 pub mod policy;
+pub mod report;
+pub mod serve;
 pub mod server;
+pub mod sidecars;
 pub mod system;
 
 use std::path::PathBuf;

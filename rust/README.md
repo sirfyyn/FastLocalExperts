@@ -6,7 +6,8 @@ the machine, installs the engine that fits (checked against the SHA-256 GitHub p
 
 ```bash
 fle            # the terminal interface
-fle doctor     # what this machine can do, and which engine fits it
+fle system     # what this machine can do, and which engine fits it
+fle doctor MODEL   # model, engine, memory and the command that would start
 fle models     # known models and whether each fits (before anything is downloaded)
 fle run MODEL  # load a model and serve it (OpenAI-compatible API) until Ctrl+C
 fle ask MODEL "question"
