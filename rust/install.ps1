@@ -38,5 +38,5 @@ try {
     Write-Host "==> Installing FLE Studio (the browser interface)"
     try { & ([scriptblock]::Create((Invoke-RestMethod 'https://raw.githubusercontent.com/sirfyyn/fle-studio/main/install.ps1'))) -NoStart } catch { Write-Warning "FLE Studio could not be installed; fle itself is ready." }
   }
-  Write-Host "`nDone. Start with:  fle   (terminal)   |   fle doctor   (what this machine can do)"
+  Write-Host "`nDone. Start with:  fle   (terminal)   |   fle system   (what this machine can do)"
 } finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }

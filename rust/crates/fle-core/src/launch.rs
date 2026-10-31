@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const MIB: u64 = 1024 * 1024;
+pub const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
 
 pub fn profile_help(p: &str) -> &'static str {
@@ -201,6 +201,14 @@ impl Host {
     }
 }
 
+/// stdout and stderr of a short command, trimmed; empty when it cannot run.
+pub fn run_text(exe: &str, args: &[&str]) -> String {
+    run_capture(Path::new(exe), args, 5, None, None)
+        .1
+        .trim()
+        .to_string()
+}
+
 pub fn nvidia_gpus() -> Vec<GpuInfo> {
     let Some(smi) = which("nvidia-smi") else {
         return vec![];
@@ -357,6 +365,32 @@ fn expand(p: &str) -> PathBuf {
         Some(r) => dirs::home_dir().unwrap_or_default().join(r),
         None => PathBuf::from(p),
     }
+}
+
+/// `hardware.engine_candidates`, in the order of the Python helper (the explicit one is added by the caller).
+pub fn engine_candidates(installed: &[PathBuf]) -> Vec<String> {
+    let mut c: Vec<String> = vec![];
+    if let Ok(e) = std::env::var("FLE_ENGINE") {
+        if !e.trim().is_empty() {
+            c.push(e.trim().to_string());
+        }
+    }
+    if let Some(p) = which("llama-server") {
+        c.push(p.to_string_lossy().to_string());
+    }
+    c.extend(installed.iter().map(|p| p.to_string_lossy().to_string()));
+    let mut seen = vec![];
+    c.into_iter()
+        .map(|s| expand(&s).to_string_lossy().to_string())
+        .filter(|s| {
+            if seen.contains(s) {
+                false
+            } else {
+                seen.push(s.clone());
+                true
+            }
+        })
+        .collect()
 }
 
 /// The places `hardware.find_engine` looks, plus the engines `fle` installed itself.
@@ -740,7 +774,7 @@ fn threads(requested: i64, h: &Host) -> i64 {
     }
 }
 
-fn context(profile: &str, model: &Model, requested: i64) -> i64 {
+pub fn context(profile: &str, model: &Model, requested: i64) -> i64 {
     let mut ctx = if requested > 0 {
         requested
     } else {

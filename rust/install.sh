@@ -85,4 +85,4 @@ case ":$PATH:" in *":$BIN_DIR:"*) ;; *) printf '\nAdd this to your shell profile
 printf '\nDone. Start with:\n'
 [ "$MODE" != studio ] && printf '  fle            the terminal interface (first run sets everything up)\n'
 [ "$MODE" != terminal ] && printf '  fle-studio     the browser interface\n'
-printf '  fle doctor     what this machine can do\n'
+printf '  fle system     what this machine can do\n'
