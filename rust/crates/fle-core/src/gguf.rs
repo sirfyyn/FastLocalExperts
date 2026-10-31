@@ -2,7 +2,6 @@
 //! `tests/gguf.rs` and the conformance check compare against it).
 use anyhow::{bail, Result};
 use serde_json::{json, Map, Value as Json};
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -526,7 +525,7 @@ pub struct Model {
     pub expert_bytes: u64,
     pub input_bytes: u64,
     pub gpu_bytes: u64,
-    pub type_histogram: BTreeMap<String, (u64, u64)>,
+    pub type_histogram: Vec<(String, (u64, u64))>,
     pub unknown_types: Vec<u32>,
     pub incomplete: Vec<String>,
 }
@@ -583,7 +582,7 @@ pub fn read_model(path: &Path) -> Result<Model> {
         _ => "unknown".into(),
     };
     let (mut expert, mut inputs, mut other) = (0u64, 0u64, 0u64);
-    let mut hist: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut hist: Vec<(String, (u64, u64))> = Vec::new();
     let mut unknown = std::collections::BTreeSet::new();
     let mut seen = std::collections::HashSet::new();
     for s in &shards {
@@ -602,9 +601,15 @@ pub fn read_model(path: &Path) -> Result<Model> {
             } else {
                 other += have
             }
-            let e = hist.entry(t.type_name.clone()).or_default();
-            e.0 += 1;
-            e.1 += have;
+            let at = match hist.iter().position(|(n, _)| *n == t.type_name) {
+                Some(i) => i,
+                None => {
+                    hist.push((t.type_name.clone(), (0, 0)));
+                    hist.len() - 1
+                }
+            };
+            hist[at].1 .0 += 1;
+            hist[at].1 .1 += have;
         }
     }
     let name = match get("general.name") {
@@ -707,6 +712,7 @@ impl Model {
     }
 
     /// Same keys as `Model.summary()` in the Python helper.
+    /// Same keys, same order as `inspect --json` in the Python helper.
     pub fn summary(&self) -> Json {
         let meta: Map<String, Json> = self
             .meta
@@ -723,17 +729,314 @@ impl Model {
             _ => Json::Null,
         };
         let opt = |v: Option<u64>| v.map(|x| json!(x)).unwrap_or(Json::Null);
+        let names = |v: &[PathBuf]| {
+            v.iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
         json!({
             "path": self.first.to_string_lossy(), "name": self.name, "arch": self.arch, "layout": self.layout, "complete": self.complete(),
-            "missing": self.missing.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect::<Vec<_>>(),
-            "incomplete": self.incomplete, "size": self.size, "parts": self.parts.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect::<Vec<_>>(),
-            "shards_present": self.shards.len(), "tensor_count": self.tensor_count,
+            "missing": names(&self.missing), "incomplete": self.incomplete, "size": self.size, "size_human": human_bytes(self.size),
+            "parts": names(&self.parts), "shards_present": self.shards.len(), "tensor_count": self.tensor_count,
             "context_length": opt(self.num("context_length")), "layers": opt(self.num("block_count")),
             "experts": opt(self.num("expert_count")), "experts_used": opt(self.num("expert_used_count")),
-            "expert_bytes": self.expert_bytes, "input_bytes": self.input_bytes, "gpu_bytes": self.gpu_bytes, "file_type": file_type,
+            "expert_bytes": self.expert_bytes, "expert_bytes_human": human_bytes(self.expert_bytes), "input_bytes": self.input_bytes,
+            "gpu_bytes": self.gpu_bytes, "gpu_bytes_human": human_bytes(self.gpu_bytes), "file_type": file_type,
             "kv_bytes_per_token_q8": self.kv_bytes_per_token("q8_0", "q8_0").round() as u64,
             "kv_bytes_per_token_f16": self.kv_bytes_per_token("f16", "f16").round() as u64,
-            "type_histogram": hist, "unknown_types": self.unknown_types, "meta": meta,
+            "type_histogram": hist, "unknown_types": self.unknown_types, "meta": meta, "sidecars": sidecars(&self.first),
         })
     }
+}
+
+/// Same text as `human_bytes` in the Python helper: "770.3 MiB", "512 B".
+pub fn human_bytes(n: u64) -> String {
+    let mut v = n as f64;
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"] {
+        if v.abs() < 1024.0 || unit == "TiB" {
+            return if unit == "B" {
+                format!("{} B", v as u64)
+            } else {
+                format!("{v:.1} {unit}")
+            };
+        }
+        v /= 1024.0;
+    }
+    format!("{v:.1} TiB")
+}
+
+/// MTP head, MTP vocabulary and mmproj next to the model (same rules as `sidecars()` in the Python helper).
+pub fn sidecars(first: &Path) -> Json {
+    let folder = first.parent().unwrap_or(Path::new("."));
+    let mut names: Vec<PathBuf> = std::fs::read_dir(folder)
+        .map(|r| {
+            r.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let low = |p: &Path| p.file_name().unwrap().to_string_lossy().to_lowercase();
+    let ext = |p: &Path, e: &str| p.extension().is_some_and(|x| x.eq_ignore_ascii_case(e));
+    let find = |f: &dyn Fn(&PathBuf) -> bool| {
+        names
+            .iter()
+            .find(|p| f(p))
+            .map(|p| json!(p.to_string_lossy()))
+            .unwrap_or(Json::Null)
+    };
+    json!({
+        "mtp_head": find(&|p| is_sidecar(&p.file_name().unwrap().to_string_lossy()) && low(p).contains("mtp") && ext(p, "gguf")),
+        "mtp_vocab": find(&|p| low(p).contains("mtp") && low(p).contains("vocab") && ext(p, "txt")),
+        "mmproj": find(&|p| low(p).contains("mmproj") && ext(p, "gguf")),
+    })
+}
+
+/// Parts, tensor count, offsets and types; same checks, texts and order as `verify_model` in the Python helper.
+pub fn verify_model(m: &Model) -> Json {
+    let (mut errors, mut warnings, mut checks): (Vec<String>, Vec<String>, Vec<Json>) =
+        (vec![], vec![], vec![]);
+    let mut add = |name: &str, ok: Option<bool>, detail: String, hint: &str| {
+        let status = match ok {
+            None => "warn",
+            Some(true) => "ok",
+            Some(false) => "fail",
+        };
+        checks.push(json!({"name": name, "status": status, "detail": detail, "hint": hint}));
+    };
+    let fname = |p: &Path| p.file_name().unwrap().to_string_lossy().to_string();
+    add(
+        "first part",
+        Some(m.first.exists()),
+        m.first.to_string_lossy().to_string(),
+        "Check the path.",
+    );
+    if !m.missing.is_empty() || !m.incomplete.is_empty() {
+        let mut d = format!("{} of {} parts missing", m.missing.len(), m.parts.len());
+        if !m.incomplete.is_empty() {
+            d += &format!(", {} incomplete", m.incomplete.len());
+        }
+        if !m.missing.is_empty() {
+            errors.push(format!(
+                "Missing model parts: {}",
+                m.missing
+                    .iter()
+                    .take(6)
+                    .map(|p| fname(p))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !m.incomplete.is_empty() {
+            errors.push(format!(
+                "Incomplete model parts: {}",
+                m.incomplete
+                    .iter()
+                    .take(6)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        add(
+            "all parts",
+            Some(false),
+            d,
+            "Wait for the download to finish, then run verify again.",
+        );
+    } else {
+        add(
+            "all parts",
+            Some(true),
+            format!("{} part(s) present", m.parts.len()),
+            "",
+        );
+    }
+    let mut split_counts = std::collections::BTreeSet::new();
+    let mut archs = std::collections::BTreeSet::new();
+    let meta_of = |s: &Shard, k: &str| {
+        s.meta
+            .iter()
+            .find(|(kk, _)| kk == k)
+            .map(|(_, v)| v.clone())
+    };
+    for (index, s) in m.shards.iter().enumerate() {
+        let name = fname(&s.path);
+        if let Some(Val::Int(no)) = meta_of(s, "split.no") {
+            if no != index as i128 {
+                warnings.push(format!("{name}: split.no is {no}, expected {index}"));
+            }
+        }
+        if let Some(Val::Int(c)) = meta_of(s, "split.count") {
+            split_counts.insert(c);
+        }
+        if let Some(Val::Str(a)) = meta_of(s, "general.architecture") {
+            archs.insert(a);
+        }
+        let mut iv: Vec<(u64, u64, &str)> = s
+            .tensors
+            .iter()
+            .map(|t| (t.offset, t.offset + t.nbytes, t.name.as_str()))
+            .collect();
+        iv.sort();
+        let mut overlap = false;
+        for w in iv.windows(2) {
+            if w[1].0 < w[0].1 {
+                overlap = true;
+                errors.push(format!("{name}: tensors {} and {} overlap", w[0].2, w[1].2));
+            }
+        }
+        if !s.complete() {
+            let expected = s.data_start + s.expected_end;
+            warnings.push(format!(
+                "{name}: still downloading or truncated ({} of about {})",
+                human_bytes(s.file_size),
+                human_bytes(expected)
+            ));
+            add(
+                &format!("{name} layout"),
+                Some(false),
+                format!("{} tensors, file is incomplete", s.tensors.len()),
+                "",
+            );
+            continue;
+        }
+        let out: Vec<_> = s
+            .tensors
+            .iter()
+            .filter(|t| t.offset + t.nbytes > s.payload())
+            .collect();
+        if !out.is_empty() {
+            errors.push(format!(
+                "{name}: {} tensor(s) end behind the file",
+                out.len()
+            ));
+        }
+        if overlap || !out.is_empty() {
+            add(
+                &format!("{name} layout"),
+                Some(false),
+                format!("{} tensors, offsets do not fit", s.tensors.len()),
+                "",
+            );
+        } else {
+            add(
+                &format!("{name} layout"),
+                Some(true),
+                format!(
+                    "{} tensors, {} payload",
+                    s.tensors.len(),
+                    human_bytes(s.payload())
+                ),
+                "",
+            );
+        }
+    }
+    if split_counts.len() > 1 {
+        errors.push(format!(
+            "Shards disagree about split.count: {:?}",
+            split_counts.iter().collect::<Vec<_>>()
+        ));
+    }
+    if archs.len() > 1 {
+        errors.push(format!(
+            "Shards disagree about the architecture: {:?}",
+            archs.iter().collect::<Vec<_>>()
+        ));
+    }
+    let expected = m
+        .shards
+        .iter()
+        .find_map(|s| match meta_of(s, "split.tensors.count") {
+            Some(Val::Int(i)) => Some(i as usize),
+            _ => None,
+        });
+    if let Some(e) = expected {
+        if m.complete() && m.tensor_count != e {
+            errors.push(format!(
+                "Header says {e} tensors; the shards contain {}",
+                m.tensor_count
+            ));
+        }
+        add(
+            "tensor count",
+            Some(m.tensor_count == e || !m.complete()),
+            format!(
+                "{} in the files, {e} in split.tensors.count",
+                m.tensor_count
+            ),
+            "",
+        );
+    }
+    if !m.unknown_types.is_empty() {
+        errors.push(format!(
+            "Unknown or unsupported tensor types: {:?}",
+            m.unknown_types
+        ));
+        add(
+            "tensor types",
+            Some(false),
+            format!("unknown ids {:?}", m.unknown_types),
+            "Use an engine that knows these types, or repair the file.",
+        );
+    } else {
+        add(
+            "tensor types",
+            Some(true),
+            format!("{} types, all known", m.type_histogram.len()),
+            "",
+        );
+    }
+    let (ex, used) = (m.num("expert_count"), m.num("expert_used_count"));
+    if m.expert_bytes > 0
+        && ex.is_some()
+        && matches!((used, ex), (Some(u), Some(e)) if u > 0 && u > e)
+    {
+        errors.push("expert_used_count is larger than expert_count".into());
+    }
+    let side = sidecars(&m.first);
+    if !side["mtp_head"].is_null() && side["mtp_vocab"].is_null() {
+        warnings.push(
+            "An MTP head is present but no MTP vocabulary file was found; MTP stays off.".into(),
+        );
+    }
+    json!({"ok": errors.is_empty(), "errors": errors, "warnings": warnings, "checks": checks, "layout": m.layout, "tensor_count": m.tensor_count,
+           "parts": m.parts.len(), "present": m.shards.len(), "size": m.size, "sidecars": side})
+}
+
+/// Pretty JSON exactly as Python's `json.dumps(indent=2)` writes it. serde writes `9.99e-6` and `1e16`, Python `9.99e-06`
+/// and `1e+16`; only the exponent of a number differs, so only exponents followed by a delimiter are rewritten.
+pub fn py_json(v: &Json) -> String {
+    let t = serde_json::to_string_pretty(v).unwrap_or_default();
+    let b: Vec<char> = t.chars().collect();
+    let mut out = String::with_capacity(t.len() + 8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        out.push(c);
+        i += 1;
+        if c == 'e' && i >= 2 && b[i - 2].is_ascii_digit() {
+            let mut j = i;
+            let neg = b.get(j) == Some(&'-');
+            if neg {
+                j += 1;
+            }
+            let start = j;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let end_ok = j == b.len() || matches!(b[j], ',' | '\n' | ' ' | '}' | ']');
+            if j > start && end_ok {
+                let digits: String = b[start..j].iter().collect();
+                out.push(if neg { '-' } else { '+' });
+                if digits.len() < 2 {
+                    out.push('0');
+                }
+                out.push_str(&digits);
+                i = j;
+            }
+        }
+    }
+    out
 }

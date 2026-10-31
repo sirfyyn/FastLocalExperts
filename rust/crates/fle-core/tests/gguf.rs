@@ -248,7 +248,119 @@ fn matches_the_python_helper() {
     }
     let py: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let rs = read_model(&p).unwrap().summary();
+    assert_eq!(
+        py_json(&rs) + "\n",
+        String::from_utf8_lossy(&out.stdout),
+        "the text differs from the Python helper"
+    );
     for (k, v) in rs.as_object().unwrap() {
         assert_eq!(&py[k], v, "field {k} differs from the Python helper");
     }
+    let (mut a, mut b): (Vec<_>, Vec<_>) = (
+        rs.as_object().unwrap().keys().collect(),
+        py.as_object().unwrap().keys().collect(),
+    );
+    a.sort();
+    b.sort();
+    assert_eq!(a, b, "the set of fields differs from the Python helper");
+}
+
+fn python_verify(p: &Path) -> Option<serde_json::Value> {
+    let helper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../fle");
+    if !helper.exists() {
+        return None;
+    }
+    let out = std::process::Command::new("python3")
+        .arg(&helper)
+        .args(["verify", p.to_str().unwrap(), "--json"])
+        .output()
+        .ok()?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+#[test]
+fn verify_matches_the_python_helper_in_every_situation() {
+    let d = tmp("verify");
+    write(&d.join("ok.gguf"), &moe_kv(), &moe_tensors(), 0);
+    write(
+        &d.join("s-00001-of-00002.gguf"),
+        &moe_kv(),
+        &moe_tensors()[..4],
+        0,
+    );
+    let cut = tmp("verify-cut");
+    write(
+        &cut.join("c-00001-of-00002.gguf"),
+        &moe_kv(),
+        &moe_tensors()[..4],
+        0,
+    );
+    write(
+        &cut.join("c-00002-of-00002.gguf"),
+        &moe_kv(),
+        &moe_tensors()[4..],
+        100,
+    );
+    let mtp = tmp("verify-mtp");
+    write(&mtp.join("m.gguf"), &moe_kv(), &moe_tensors(), 0);
+    write(
+        &mtp.join("mtp-head.gguf"),
+        &moe_kv(),
+        &moe_tensors()[..1],
+        0,
+    );
+    let mut seen = 0;
+    for (p, ok, n_err, n_warn) in [
+        (d.join("ok.gguf"), true, 0, 0),
+        (d.join("s-00001-of-00002.gguf"), false, 1, 0),
+        (cut.join("c-00001-of-00002.gguf"), false, 1, 1),
+        (mtp.join("m.gguf"), true, 0, 1),
+    ] {
+        let r = verify_model(&read_model(&p).unwrap());
+        assert_eq!(r["ok"], ok, "{}", p.display());
+        assert_eq!(
+            r["errors"].as_array().unwrap().len(),
+            n_err,
+            "{}: {r}",
+            p.display()
+        );
+        assert_eq!(
+            r["warnings"].as_array().unwrap().len(),
+            n_warn,
+            "{}: {r}",
+            p.display()
+        );
+        if let Some(py) = python_verify(&p) {
+            assert_eq!(
+                py,
+                r,
+                "verify differs from the Python helper for {}",
+                p.display()
+            );
+            seen += 1;
+        }
+    }
+    eprintln!("compared with the Python helper in {seen} of 4 situations");
+}
+
+#[test]
+fn human_bytes_reads_like_the_python_helper() {
+    assert_eq!(human_bytes(0), "0 B");
+    assert_eq!(human_bytes(1023), "1023 B");
+    assert_eq!(human_bytes(1024), "1.0 KiB");
+    assert_eq!(human_bytes(807_694_464), "770.3 MiB");
+    assert_eq!(human_bytes(5 * (1u64 << 40)), "5.0 TiB");
+}
+
+#[test]
+fn json_exponents_are_written_like_python() {
+    let v = serde_json::json!({"a": 9.999999747378752e-6, "b": 1e16, "c": 2.5, "d": "gemma3e4b", "e": "x1e5", "f": [1e-7, 3e20]});
+    let t = py_json(&v);
+    assert!(t.contains("9.999999747378752e-06"), "{t}");
+    assert!(t.contains("1e+16") && t.contains("2.5"), "{t}");
+    assert!(
+        t.contains("\"gemma3e4b\"") && t.contains("\"x1e5\""),
+        "strings are left alone: {t}"
+    );
+    assert!(t.contains("1e-07") && t.contains("3e+20"), "{t}");
 }
