@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -951,6 +952,57 @@ void prefill_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert,
 // the init above skips layers whose `data` is null); with mmap the pages are faulted in by this read, with
 // `--load-mode none` they are plain host memory. Slots are copied one by one, synchronously (a few seconds for
 // ~20 GB); the decode path never sees a half-filled slot because no graph has run yet.
+// FLE_MOE_HOT_MLOCK_GB=<n> (default off, needs FLE_MOE_PROFILE): keep the most-routed experts that do NOT get a GPU
+// slot resident in host RAM with mlock(), up to n GB. On models larger than RAM (DeepSeek-V4.1 ISTA: 129 GiB experts +
+// 103 GB Engram on 120 GB) the page cache otherwise evicts hot expert slices and the CPU miss path reads them back from
+// the NVMe. Needs RLIMIT_MEMLOCK large enough (e.g. prlimit --memlock=unlimited); failures are counted, not fatal.
+void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
+#ifndef _WIN32
+    const char * e = std::getenv("FLE_MOE_HOT_MLOCK_GB");
+    if (!e || atof(e) <= 0.0) { return; }
+    const uint64_t budget = (uint64_t) (atof(e) * 1e9);
+    struct cand { uint64_t cnt; layer_state * ls; int32_t expert; };
+    std::vector<cand> cs;
+    for (auto & ls : mc->layers) {
+        const prof_layer * pl = pf.find(ls.pub.il);
+        if (!pl) { continue; }
+        const int64_t n_expert = ls.pub.up_src->ne[2];
+        if (pl->cnt.size() != (size_t) n_expert) { continue; }
+        std::vector<int32_t> order((size_t) n_expert);
+        for (int32_t x = 0; x < (int32_t) n_expert; ++x) { order[(size_t) x] = x; }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return pl->cnt[(size_t) a] > pl->cnt[(size_t) b]; });
+        // the first n_use go to the GPU cache (prof_prefill); the next ones are the hottest CPU-side experts
+        for (int64_t k = ls.n_use; k < n_expert; ++k) {
+            const int32_t x = order[(size_t) k];
+            if (pl->cnt[(size_t) x] == 0) { break; }
+            cs.push_back({ pl->cnt[(size_t) x], &ls, x });
+        }
+    }
+    std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    uint64_t locked = 0, n_ok = 0, n_fail = 0; int err = 0;
+    for (const auto & c : cs) {
+        uint64_t sz = 0;
+        for (const ggml_tensor * t : { c.ls->pub.gate_src, c.ls->pub.up_src, c.ls->pub.down_src }) { if (t) { sz += t->nb[2]; } }
+        if (locked + sz > budget) { break; }
+        bool ok = true;
+        for (const ggml_tensor * t : { c.ls->pub.gate_src, c.ls->pub.up_src, c.ls->pub.down_src }) {
+            if (!t || !t->data) { continue; }
+            const uintptr_t a  = (uintptr_t) t->data + (uintptr_t) c.expert * t->nb[2];
+            const uintptr_t a0 = a & ~(pg - 1);
+            if (mlock((void *) a0, a + t->nb[2] - a0) != 0) { ok = false; err = errno; }
+        }
+        if (ok) { locked += sz; n_ok++; } else { n_fail++; if (n_fail > 8) { break; } }
+    }
+    LLAMA_LOG_INFO("%s: FLE_MOE_HOT_MLOCK_GB: %llu experts locked (%.1f GB of %.1f GB), %llu failed%s%s\n", __func__,
+        (unsigned long long) n_ok, locked / 1e9, budget / 1e9, (unsigned long long) n_fail,
+        n_fail ? ", errno: " : "", n_fail ? strerror(err) : "");
+    std::fprintf(stderr, "[hot-mlock] %llu experts locked (%.1f GB), %llu failed\n", (unsigned long long) n_ok, locked / 1e9, (unsigned long long) n_fail);
+#else
+    (void) mc; (void) pf;
+#endif
+}
+
 void prof_prefill(moe_cache * mc, const prof_file & pf) {
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t n_fill = 0, n_cap = 0, n_lay = 0, n_lay_prof = 0;
@@ -1563,6 +1615,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 if (!live) { mc->prof_keep.push_back(pl); }
             }
             prof_prefill(mc, pf);
+            prof_hot_mlock(mc, pf);
         }
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:

@@ -7,6 +7,10 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <stdexcept>
 #include <string>
 
@@ -385,6 +389,29 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
                 ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
             }
         }
+        // FLE_ENGRAM_COLD=1 (decode): the Engram rows of the previous step are not needed again soon (one row per n-gram
+        // hash, 4 KiB page for ~144 bytes). Mark their pages MADV_COLD so the kernel reclaims them before the expert
+        // pages of the CPU miss path, which share the same page cache on models larger than RAM.
+#ifndef _WIN32
+        static const bool fle_engram_cold = std::getenv("FLE_ENGRAM_COLD") != nullptr;
+        if (fle_engram_cold && ubatch->n_tokens <= 8) {
+            static std::vector<std::pair<uintptr_t, size_t>> prev;
+            static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+            for (const auto & r : prev) { madvise((void *) r.first, r.second, MADV_COLD); }
+            prev.clear();
+            for (size_t e = 0; e < engram_ids.size(); ++e) {
+                const ggml_tensor * table = !model.per_layer_tok_embd_layers.empty() ? model.per_layer_tok_embd_layers[e] : model.per_layer_tok_embd;
+                if (!table || !table->data || !table->buffer || !ggml_backend_buffer_is_host(table->buffer)) { continue; }
+                const size_t row_bytes = ggml_row_size(table->type, table->ne[0]);
+                for (int32_t row : ids[e]) {
+                    if (row < 0 || row >= table->ne[1]) { continue; }
+                    const uintptr_t a = (uintptr_t) table->data + (size_t) row * table->nb[1];
+                    const uintptr_t a0 = a & ~(pg - 1);
+                    prev.push_back({ a0, (size_t) (a + row_bytes - a0) });
+                }
+            }
+        }
+#endif
     }
 
     // embedding (image) tokens are hashed DEAD and get no Engram contribution (gate 0)
