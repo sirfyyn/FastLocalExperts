@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-impl.h"
+#include "llama-moecache.h"
 
 #include "llama-kv-cache-dsv4.h"
 
@@ -992,6 +993,31 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             exp_probs_b = layer.ffn_exp_probs_b_vl;
         }
 
+        // FLE: cache-aware routing (as qwen4exp): the bonus for resident experts joins the selection bias, the weights stay unbiased;
+        // only where the cache graph runs (decode, not the MTP/drafter context)
+        if (cparams.moe_cache_bias > 0.0f && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
+            cur->ne[1] <= std::min<int64_t>(llama_moe_cache_max_tokens(),
+                                            cparams.n_moe_active_max_tokens > 0 ? cparams.n_moe_active_max_tokens : 8)) {
+            const llama_moe_cache_layer * mcache = llama_moe_cache_lookup(layer.ffn_up_exps);
+            if (mcache && mcache->dev_bias) {
+                exp_probs_b = exp_probs_b ? ggml_add(ctx0, exp_probs_b, mcache->dev_bias) : mcache->dev_bias;
+                cb(exp_probs_b, "ffn_moe_probs_b_cache", il);
+            }
+        }
+
+        // shared expert first: with FLE_MC_OVERLAP=2 build_moe_ffn places it behind the GPU hit chain (fle_early_extra),
+        // so the GPU computes it while the CPU computes the misses
+        ggml_tensor * ffn_shexp = build_ffn(cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(ffn_shexp, "ffn_shexp", il);
+        static const bool fle_sx = [] { const char * e = std::getenv("FLE_MC_OVERLAP"); return e && std::atoi(e) >= 2; }();
+        if (fle_sx) {
+            fle_early_extra = ffn_shexp;
+        }
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1005,13 +1031,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
                 il, logits);
         cb(moe_out, "ffn_moe_out", il);
-
-        ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
+        fle_early_extra = nullptr;
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

@@ -704,7 +704,7 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     const int32_t v = slot_or_dummy;
     if (pub.dev_bias) {
         // uploaded once per layer and step (llama_moe_cache_step), not per entry
-        pub.bias_host[expert] = slot_or_dummy == pub.n_slots ? 0.0f : pub.bias_val;
+        pub.bias_host[expert] = slot_or_dummy != pub.n_slots ? pub.bias_val : pub.hot_bias.empty() ? 0.0f : pub.hot_bias[expert];
         pub.bias_dirty = true;
     }
     if (fle_slowdown_tab_us > 0) {
@@ -1004,7 +1004,17 @@ void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
             const uintptr_t a0 = a & ~(pg - 1);
             if (mlock((void *) a0, a + t->nb[2] - a0) != 0) { ok = false; err = errno; }
         }
-        if (ok) { locked += sz; n_ok++; } else { n_fail++; if (n_fail > 8) { break; } }
+        if (ok) {
+            locked += sz; n_ok++;
+            // FLE_MOE_HOT_BIAS: the router may prefer a RAM-held expert over one that would come from the SSD (below the GPU-cache bonus)
+            static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+            auto & pub = c.ls->pub;
+            if (hb > 0.0f && pub.dev_bias) {
+                if (pub.hot_bias.empty()) { pub.hot_bias.assign(pub.bias_host.size(), 0.0f); }
+                pub.hot_bias[(size_t) c.expert] = hb;
+                if (c.ls->expert_slot[(size_t) c.expert] < 0) { pub.bias_host[(size_t) c.expert] = hb; pub.bias_dirty = true; }
+            }
+        } else { n_fail++; if (n_fail > 8) { break; } }
     }
     LLAMA_LOG_INFO("%s: FLE_MOE_HOT_MLOCK_GB: %llu experts locked (%.1f GB of %.1f GB), %llu failed%s%s\n", __func__,
         (unsigned long long) n_ok, locked / 1e9, budget / 1e9, (unsigned long long) n_fail,

@@ -57,6 +57,7 @@ struct llama_moe_cache_layer {
     std::vector<float> bias_host;
     bool               bias_dirty = false;
     float              bias_val   = 0.0f;   // bonus of this layer (FLE_MOE_CACHE_BIAS_LAYERS, otherwise the global value)
+    std::vector<float> hot_bias;            // FLE_MOE_HOT_BIAS: smaller bonus for uncached experts held in RAM (mlock), empty when off
 };
 
 // build the cache for every host-resident expert layer of the model.
