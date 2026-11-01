@@ -534,8 +534,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ATTN_OUT_B,                             "blk.%d.attn_output_b" },
     { LLM_TENSOR_DSPARK_MAIN_PROJ,           "dspark.main_proj"  },
     { LLM_TENSOR_DSPARK_MAIN_NORM,           "dspark.main_norm"  },
-    { LLM_TENSOR_DSPARK_MARKOV_W1,           "dspark.markov_w1"  },
-    { LLM_TENSOR_DSPARK_MARKOV_W2,           "dspark.markov_w2"  },
+    { LLM_TENSOR_DSPARK_MARKOV_W1,           "markov_w1"  },   // as written by gguf-py (constants.py) and detected in common/speculative.cpp
+    { LLM_TENSOR_DSPARK_MARKOV_W2,           "markov_w2"  },
     { LLM_TENSOR_DFLASH_AUX_NORM,            "enc.aux_norm"      },
     { LLM_TENSOR_HC_HEAD_FN,                             "output_hc_fn" },
     { LLM_TENSOR_HC_HEAD_BASE,                           "output_hc_base" },
