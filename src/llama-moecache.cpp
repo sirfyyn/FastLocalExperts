@@ -221,6 +221,8 @@ static std::mutex              g_wn_mtx;
 static std::condition_variable g_wn_cv;
 static std::deque<wn_range>    g_wn_q;
 
+// FLE_MOE_WILLNEED_THREADS=N (default 1) workers and FLE_MOE_WILLNEED_CHUNK_KB (default 0 = whole slice): the slices
+// are cut into chunks and N workers request them at once, so the NVMe sees N requests in flight instead of ~3 page faults.
 static void wn_worker() {
     for (;;) {
         wn_range r;
@@ -239,12 +241,22 @@ static void wn_willneed(const ggml_tensor * src, int32_t expert) {
 #ifndef _WIN32
     if (!src || !src->data) { return; }
     static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    static const int    n_thr = [] { const char * e = std::getenv("FLE_MOE_WILLNEED_THREADS"); return (e && *e) ? std::max(1, atoi(e)) : 1; }();
+    static const size_t chunk = [] { const char * e = std::getenv("FLE_MOE_WILLNEED_CHUNK_KB"); return (e && *e) ? (size_t) std::max(0, atoi(e)) * 1024 : (size_t) 0; }();
     const uintptr_t a  = (uintptr_t) src->data + (uintptr_t) expert * src->nb[2];
     const uintptr_t a0 = a & ~(pg - 1);
+    const size_t    n  = (size_t) (a + src->nb[2] - a0);
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(wn_worker).detach(); });
-    { std::lock_guard<std::mutex> lk(g_wn_mtx); g_wn_q.push_back({ (void *) a0, (size_t) (a + src->nb[2] - a0) }); }
-    g_wn_cv.notify_one();
+    std::call_once(started, [] { for (int i = 0; i < n_thr; ++i) { std::thread(wn_worker).detach(); } });
+    {
+        std::lock_guard<std::mutex> lk(g_wn_mtx);
+        if (chunk == 0) {
+            g_wn_q.push_back({ (void *) a0, n });
+        } else {
+            for (size_t o = 0; o < n; o += chunk) { g_wn_q.push_back({ (void *) (a0 + o), std::min(chunk, n - o) }); }
+        }
+    }
+    if (chunk == 0) { g_wn_cv.notify_one(); } else { g_wn_cv.notify_all(); }
 #else
     (void) src; (void) expert;
 #endif
@@ -264,9 +276,9 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                 for (int64_t i = 0; i < ids->ne[0]; ++i) {
                     const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
                     if (e < 0 || e >= (int32_t) l0->expert_slot.size() || l0->expert_slot[e] >= 0) { continue; }
+                    wn_willneed(l0->pub.gate_src, e);
                     wn_willneed(l0->pub.up_src,   e);
                     wn_willneed(l0->pub.down_src, e);
-                    wn_willneed(l0->pub.gate_src, e);
                 }
             }
         }
