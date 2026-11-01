@@ -501,7 +501,12 @@ struct llama_mmap::impl {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
+        // FLE_MMAP_NO_RANDOM=1: keep the kernel read-ahead on the lazy (host-resident expert) ranges. With MADV_RANDOM a
+        // page fault on an uncached expert slice reads 4 KiB at a time; the CPU MoE then waits on many small NVMe reads.
+        // Measured with FLE_MOE_WILLNEED_NOW on DeepSeek-V4.1 ISTA (titan, 01.11.2026): +7-8 % decode.
+        static const bool fle_no_random = getenv("FLE_MMAP_NO_RANDOM") != nullptr;
         for (const auto & range : lazy_ranges) {
+            if (fle_no_random) { break; }
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
