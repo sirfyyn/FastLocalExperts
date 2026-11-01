@@ -29,6 +29,7 @@
 #define getpid _getpid
 #else
 #include <unistd.h>
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -210,8 +211,65 @@ int parse_layer_from_name(const char * name) {
     return atoi(name + 4);
 }
 
+// ---- FLE_MOE_WILLNEED_NOW: request the pages of the experts the CPU is about to read --------------------------------
+// When the CPU mul_mat_id of gate_exps(L) starts, the experts of layer L are known (ids on the host). For those not in
+// the GPU cache, madvise(WILLNEED) on the whole gate/up/down slices, on a worker thread: the NVMe reads them in large
+// parallel chunks while the CPU starts on gate, instead of page fault by page fault. No prediction, no upload.
+struct wn_range { void * a; size_t n; };
+static std::mutex              g_wn_mtx;
+static std::condition_variable g_wn_cv;
+static std::deque<wn_range>    g_wn_q;
+
+static void wn_worker() {
+    for (;;) {
+        wn_range r;
+        {
+            std::unique_lock<std::mutex> lk(g_wn_mtx);
+            g_wn_cv.wait(lk, [] { return !g_wn_q.empty(); });
+            r = g_wn_q.front(); g_wn_q.pop_front();
+        }
+#ifndef _WIN32
+        madvise(r.a, r.n, MADV_WILLNEED);
+#endif
+    }
+}
+
+static void wn_willneed(const ggml_tensor * src, int32_t expert) {
+#ifndef _WIN32
+    if (!src || !src->data) { return; }
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t a  = (uintptr_t) src->data + (uintptr_t) expert * src->nb[2];
+    const uintptr_t a0 = a & ~(pg - 1);
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(wn_worker).detach(); });
+    { std::lock_guard<std::mutex> lk(g_wn_mtx); g_wn_q.push_back({ (void *) a0, (size_t) (a + src->nb[2] - a0) }); }
+    g_wn_cv.notify_one();
+#else
+    (void) src; (void) expert;
+#endif
+}
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
+
+    static const bool wn_on = std::getenv("FLE_MOE_WILLNEED_NOW") != nullptr;
+    if (wn_on && ids->ne[1] <= 4) {
+        const int il0 = parse_layer_from_name(name);
+        layer_state * l0 = nullptr;
+        for (auto & l : mc->layers) { if (l.pub.il == il0) { l0 = &l; break; } }
+        if (l0) {
+            std::lock_guard<std::mutex> lock(mc->mtx);
+            for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                    const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                    if (e < 0 || e >= (int32_t) l0->expert_slot.size() || l0->expert_slot[e] >= 0) { continue; }
+                    wn_willneed(l0->pub.up_src,   e);
+                    wn_willneed(l0->pub.down_src, e);
+                    wn_willneed(l0->pub.gate_src, e);
+                }
+            }
+        }
+    }
 
     const int64_t n_ids    = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
