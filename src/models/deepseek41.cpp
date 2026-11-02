@@ -461,7 +461,9 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         if (fle_engram_cold && ubatch->n_tokens <= 8) {
             static std::vector<std::pair<uintptr_t, size_t>> prev;
             static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+#ifdef MADV_COLD
             for (const auto & r : prev) { madvise((void *) r.first, r.second, MADV_COLD); }
+#endif
             prev.clear();
             for (size_t e = 0; e < engram_ids.size(); ++e) {
                 const ggml_tensor * table = !model.per_layer_tok_embd_layers.empty() ? model.per_layer_tok_embd_layers[e] : model.per_layer_tok_embd;
