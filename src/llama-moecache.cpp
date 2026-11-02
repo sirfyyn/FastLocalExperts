@@ -274,13 +274,28 @@ static void wn_willneed(const ggml_tensor * src, int32_t expert) {
 // (over the last 512 prefetches) moves the depth between 1 and the predicted k; nothing is read while the store's readers are busy.
 static void moe_pred_cb(const char * name, const struct ggml_tensor * pred, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
-    if (!g_store || !pred || !pred->data) { return; }
+    if (!pred || !pred->data) { return; }
     const int il = parse_layer_from_name(name);
     size_t li1 = SIZE_MAX;
     for (size_t li = 0; li < mc->layers.size(); ++li) { if (mc->layers[li].pub.il == il + 1) { li1 = li; break; } }
     if (li1 == SIZE_MAX) { return; }
     layer_state & l1 = mc->layers[li1];
     const int64_t kmax = pred->ne[0];
+    // FLE_MOE_PREFETCH without the store: madvise(WILLNEED) on the predicted CPU-side experts of the next layer, one layer ahead,
+    // so the NVMe reads them while this layer computes instead of page faults stalling one compute thread (and the other 15 at
+    // the barrier). FLE_MOE_PREFETCH_WN_DEPTH (default: all predicted ranks) limits how many ranks are requested.
+    if (!g_store) {
+        static const int64_t wn_depth = [] { const char * e = std::getenv("FLE_MOE_PREFETCH_WN_DEPTH"); return (e && *e) ? (int64_t) std::max(1, atoi(e)) : (int64_t) 64; }();
+        std::lock_guard<std::mutex> lock(mc->mtx);
+        for (int64_t r = 0; r < std::min(kmax, wn_depth); ++r) {
+            const int32_t x = *(const int32_t *) ((const char *) pred->data + r*pred->nb[0]);   // first token of the batch
+            if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[x] >= 0) { continue; }   // in the GPU cache
+            wn_willneed(l1.pub.gate_src, x);
+            wn_willneed(l1.pub.up_src,   x);
+            wn_willneed(l1.pub.down_src, x);
+        }
+        return;
+    }
     static int depth = 3;
     static uint64_t last_issued = 0, last_used = 0;
     const auto & st = g_store->stats();
@@ -1798,6 +1813,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             prof_hot_mlock(mc, pf);
         }
         store_init(mc, pf.ok ? &pf : nullptr);
+        if (!g_store && std::getenv("FLE_MOE_PREFETCH")) {
+            ggml_set_moe_pred_callback(moe_pred_cb, mc);   // WILLNEED one layer ahead (moe_pred_cb without the store)
+        }
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:
         // buffer -> buft -> device -> dev_init. This is not a workaround: the thread
