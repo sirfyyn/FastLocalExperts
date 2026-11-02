@@ -293,6 +293,10 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(cons
     return std::make_unique<graph>(*this, params);
 }
 
+// FLE_ENGRAM_PREVIEW: the newest tokens of the last single-token step (newest first) and its position, for the next step's hash
+static std::vector<llama_token> g_dsv41_hist;
+static int64_t                  g_dsv41_hist_pos = -1;
+
 // Engram n-gram hash (engram.py NgramHashState.forward)
 int llama_model_deepseek41::engram_index(int il) const {
     const auto it = std::find(engram_layers.begin(), engram_layers.end(), il);
@@ -414,10 +418,6 @@ private:
         return cand_csa ? mctx->get_csa_plan(ubatch) : mctx->get_hca_plan(ubatch);
     }
 };
-
-// FLE_ENGRAM_PREVIEW: the newest tokens of the last single-token step (newest first) and its position, for the next step's hash
-static std::vector<llama_token> g_dsv41_hist;
-static int64_t                  g_dsv41_hist_pos = -1;
 
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {

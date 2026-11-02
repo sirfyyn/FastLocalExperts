@@ -173,7 +173,11 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
             if (!es_file_of(t->data, path, foff)) { ok = false; break; }
             auto it = fd_of.find(path);
             if (it == fd_of.end()) {
+                #ifdef O_DIRECT
                 const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+#else
+                const int fd = ::open(path.c_str(), O_RDONLY);   // (no O_DIRECT here: buffered reads)
+#endif
                 if (fd < 0) { ok = false; break; }
                 it = fd_of.emplace(path, fd).first;
                 d->fds.push_back(fd);
@@ -209,7 +213,9 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         delete d;
         return nullptr;
     }
+#ifdef MADV_HUGEPAGE
     madvise(a, d->arena_bytes, MADV_HUGEPAGE);
+#endif
     d->arena = (char *) a;
     d->slots.resize(n_slots);
     d->inflight.reset(new std::atomic<int>[n_slots]);
