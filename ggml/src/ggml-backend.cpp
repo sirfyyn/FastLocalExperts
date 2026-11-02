@@ -1906,6 +1906,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (split->n_inputs == 0) { return false; }
         if (cpu) {
             ggml_backend_t gb = sched->backends[gpu_id];
+            // the host copies of this split's inputs may reuse memory a still running CPU split reads (the allocator assumes the
+            // splits run in order): the copies wait on the stream until the worker is done with every split handed to it
+            if (g_fle_as_submitted > fle_async_waited[gpu_id] && g_fle_as_submitted > fle_async_first) {
+                g_fle_host_func(gb, fle_async_wait, (void *) (uintptr_t) g_fle_as_submitted);
+                fle_async_waited[gpu_id] = g_fle_as_submitted;
+            }
             for (int i = 0; i < split->n_inputs; i++) {
                 struct ggml_tensor * input = split->inputs[i];
                 struct ggml_tensor * cpy   = tensor_copy(input, bid, sched->cur_copy);
