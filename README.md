@@ -1,6 +1,4 @@
-> **New: [FLE Link](https://flelink.run)** sets up and runs FLE (or plain llama.cpp) for you: it reads your machine, installs
-> the engine that fits, downloads a model that fits and serves an OpenAI-compatible API, a browser Studio and a desktop app.
-> One command: `curl -fsSL https://flelink.run/install.sh | sh`. This repository stays the engine.
+[![FLE Link: run FLE in one command](https://flelink.run/media/banner-engine.jpg)](https://flelink.run)
 
 <div align="center">
 
