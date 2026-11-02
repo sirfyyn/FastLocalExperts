@@ -205,6 +205,8 @@ moe_cache * g_cache = nullptr;
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
+static std::unique_ptr<llama_expert_store> g_store;   // FLE_MOE_STORE_GB (store_init below)
+
 int parse_layer_from_name(const char * name) {
     // "blk.<il>.ffn_gate_exps.weight"
     if (strncmp(name, "blk.", 4) != 0) {
@@ -1048,8 +1050,6 @@ void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
 }
 
 // ---- FLE_MOE_STORE_GB: RAM tier for the CPU-side experts (llama-expertstore.cpp) ---------------------------------------
-static std::unique_ptr<llama_expert_store> g_store;
-
 static void store_init(moe_cache * mc, const prof_file * pf) {
     const char * e = std::getenv("FLE_MOE_STORE_GB");
     if (!e || atof(e) <= 0.0 || mc->layers.empty()) { return; }
