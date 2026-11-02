@@ -303,7 +303,22 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                     if (!dup) { want[nw++] = x; }
                 }
             }
-            g_store->ensure(li, want, nw);
+            static std::vector<std::pair<int32_t, int32_t>> ev;
+            ev.clear();
+            g_store->ensure(li, want, nw, &ev);
+            // FLE_MOE_HOT_BIAS also for the store: resident CPU-side experts get the smaller bonus, given-up ones lose it
+            static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+            if (hb > 0.0f) {
+                auto set_hot = [&](layer_state & L, int32_t x, float v) {
+                    if (!L.pub.dev_bias || x < 0 || x >= (int32_t) L.expert_slot.size()) { return; }
+                    if (L.pub.hot_bias.empty()) { L.pub.hot_bias.assign(L.pub.bias_host.size(), 0.0f); }
+                    if (L.pub.hot_bias[(size_t) x] == v) { return; }
+                    L.pub.hot_bias[(size_t) x] = v;
+                    if (L.expert_slot[(size_t) x] < 0) { L.pub.bias_host[(size_t) x] = v; L.pub.bias_dirty = true; }
+                };
+                for (size_t k = 0; k < nw; ++k) { if (g_store->resident(li, want[k])) { set_hot(l, want[k], hb); } }
+                for (const auto & x : ev) { set_hot(mc->layers[(size_t) x.first], x.second, 0.0f); }
+            }
             break;
         }
     }
@@ -1080,6 +1095,19 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
         std::vector<std::pair<int32_t, int32_t>> want;
         for (const auto & c : cs) { want.push_back({ c.li, c.x }); }
         const size_t n = g_store->preload(want);
+        static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+        if (hb > 0.0f) {
+            for (size_t li = 0; li < mc->layers.size(); ++li) {
+                auto & L = mc->layers[li];
+                if (!L.pub.dev_bias) { continue; }
+                for (int32_t x = 0; x < (int32_t) L.expert_slot.size(); ++x) {
+                    if (!g_store->resident(li, x)) { continue; }
+                    if (L.pub.hot_bias.empty()) { L.pub.hot_bias.assign(L.pub.bias_host.size(), 0.0f); }
+                    L.pub.hot_bias[(size_t) x] = hb;
+                    if (L.expert_slot[(size_t) x] < 0) { L.pub.bias_host[(size_t) x] = hb; L.pub.bias_dirty = true; }
+                }
+            }
+        }
         std::fprintf(stderr, "[fle-store] warm start: %zu experts (%.1f GB) in %.1f s\n", n,
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }

@@ -266,7 +266,7 @@ size_t llama_expert_store::preload(const std::vector<std::pair<int32_t, int32_t>
     return n;
 }
 
-void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n) {
+void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, std::vector<std::pair<int32_t, int32_t>> * evicted) {
     if (li >= d->layers.size()) { return; }
     impl::layer_t & L = d->layers[li];
     std::vector<es_job> jobs;
@@ -321,6 +321,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n) {
         for (size_t k = 0; k < np; ++k) {
             auto & S = d->slots[ps[k].s];
             if (S.li >= 0) {
+                if (evicted) { evicted->push_back({ S.li, S.e }); }
                 auto & O = d->layers[(size_t) S.li];
                 O.slot_of[(size_t) S.e] = -1;
                 for (int r = 0; r < 3; ++r) { O.ptr[r][(size_t) S.e] = nullptr; }

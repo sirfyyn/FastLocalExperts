@@ -36,7 +36,8 @@ public:
 
     // make the given experts of layer li resident (read the missing ones, evicting the least used), count the use of all.
     // Called on compute thread 0 before the layer's CPU experts run. `keep` are experts of this call that must not be evicted.
-    void ensure(size_t li, const int32_t * experts, size_t n);
+    // evicted (optional): the (layer index, expert) pairs this call gave up
+    void ensure(size_t li, const int32_t * experts, size_t n, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr);
 
     bool resident(size_t li, int32_t e) const;
 
