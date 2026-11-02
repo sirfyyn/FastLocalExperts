@@ -18,6 +18,8 @@
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -224,6 +226,17 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
     d->inflight.reset(new std::atomic<int>[n_slots]);
     for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); }
     for (int i = 0; i < std::max(1, threads); ++i) { d->pool.emplace_back([d] { d->reader(); }); }
+#if defined(__linux__)
+    // FLE_MOE_STORE_READER_CPUS="16-31": the readers wait on the SSD most of the time; keep them off the cores the compute threads use
+    if (const char * rc = std::getenv("FLE_MOE_STORE_READER_CPUS")) {
+        int lo = -1, hi = -1;
+        if (std::sscanf(rc, "%d-%d", &lo, &hi) == 2 && lo >= 0 && hi >= lo) {
+            cpu_set_t set; CPU_ZERO(&set);
+            for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) { CPU_SET(c, &set); }
+            for (auto & t : d->pool) { pthread_setaffinity_np(t.native_handle(), sizeof(set), &set); }
+        }
+    }
+#endif
     LLAMA_LOG_INFO("%s: FLE_MOE_STORE: %zu slots of %.1f MB (%.1f GB), %d unbuffered readers, %zu layers\n", __func__,
         n_slots, d->blob / 1e6, d->arena_bytes / 1e9, std::max(1, threads), d->layers.size());
     return std::unique_ptr<llama_expert_store>(new llama_expert_store(d));
