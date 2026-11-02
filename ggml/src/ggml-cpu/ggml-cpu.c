@@ -1843,6 +1843,9 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    void * moe_data_ud = NULL;
+    const ggml_moe_data_cb_t moe_data_cb = ggml_get_moe_data_callback(&moe_data_ud);
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1858,6 +1861,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (moe_data_cb) {   // FLE expert store: the same bytes from the RAM store instead of the mmap
+            const void * p = moe_data_cb(src0, cur_a, moe_data_ud);
+            if (p) { src0_cur = (const char *) p; }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

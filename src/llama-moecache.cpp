@@ -1,4 +1,5 @@
 #include "llama-moecache.h"
+#include "llama-expertstore.h"
 
 #include <algorithm>
 
@@ -266,7 +267,7 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
     static const bool wn_on = std::getenv("FLE_MOE_WILLNEED_NOW") != nullptr;
-    if (wn_on && ids->ne[1] <= 4) {
+    if (wn_on && !g_store && ids->ne[1] <= 4) {
         const int il0 = parse_layer_from_name(name);
         layer_state * l0 = nullptr;
         for (auto & l : mc->layers) { if (l.pub.il == il0) { l0 = &l; break; } }
@@ -281,6 +282,27 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                     wn_willneed(l0->pub.down_src, e);
                 }
             }
+        }
+    }
+
+    if (g_store) {   // make this layer's CPU-side experts resident before they run (compute thread 0, the others wait)
+        const int il_s = parse_layer_from_name(name);
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            layer_state & l = mc->layers[li];
+            if (l.pub.il != il_s) { continue; }
+            int32_t want[64]; size_t nw = 0;
+            std::lock_guard<std::mutex> lock(mc->mtx);
+            for (int64_t t = 0; t < ids->ne[1] && nw < 64; ++t) {
+                for (int64_t i = 0; i < ids->ne[0] && nw < 64; ++i) {
+                    const int32_t x = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                    if (x < 0 || x >= (int32_t) l.expert_slot.size() || l.expert_slot[x] >= 0) { continue; }
+                    bool dup = false;
+                    for (size_t k = 0; k < nw; ++k) { if (want[k] == x) { dup = true; break; } }
+                    if (!dup) { want[nw++] = x; }
+                }
+            }
+            g_store->ensure(li, want, nw);
+            break;
         }
     }
 
@@ -1025,6 +1047,45 @@ void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
 #endif
 }
 
+// ---- FLE_MOE_STORE_GB: RAM tier for the CPU-side experts (llama-expertstore.cpp) ---------------------------------------
+static std::unique_ptr<llama_expert_store> g_store;
+
+static void store_init(moe_cache * mc, const prof_file * pf) {
+    const char * e = std::getenv("FLE_MOE_STORE_GB");
+    if (!e || atof(e) <= 0.0 || mc->layers.empty()) { return; }
+    const char * th = std::getenv("FLE_MOE_STORE_THREADS");
+    std::vector<llama_expert_store_layer> in;
+    for (const auto & ls : mc->layers) { in.push_back({ ls.pub.il, { ls.pub.gate_src, ls.pub.up_src, ls.pub.down_src } }); }
+    g_store = llama_expert_store::create(in, (size_t) (atof(e) * 1e9), (th && *th) ? std::max(1, atoi(th)) : 8);
+    if (!g_store) { return; }
+    // warm start: the hottest experts after the ones the GPU cache takes (as prof_hot_mlock), across layers by count
+    if (pf && pf->ok) {
+        struct cand { uint64_t cnt; int32_t li; int32_t x; };
+        std::vector<cand> cs;
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            const auto & ls = mc->layers[li];
+            const prof_layer * pl = pf->find(ls.pub.il);
+            const int64_t n_expert = ls.pub.up_src->ne[2];
+            if (!pl || pl->cnt.size() != (size_t) n_expert) { continue; }
+            std::vector<int32_t> order((size_t) n_expert);
+            for (int32_t x = 0; x < (int32_t) n_expert; ++x) { order[(size_t) x] = x; }
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return pl->cnt[(size_t) a] > pl->cnt[(size_t) b]; });
+            for (int64_t k = ls.n_use; k < n_expert; ++k) {
+                const int32_t x = order[(size_t) k];
+                if (pl->cnt[(size_t) x] == 0) { break; }
+                cs.push_back({ pl->cnt[(size_t) x], (int32_t) li, x });
+            }
+        }
+        std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
+        std::vector<std::pair<int32_t, int32_t>> want;
+        for (const auto & c : cs) { want.push_back({ c.li, c.x }); }
+        const size_t n = g_store->preload(want);
+        std::fprintf(stderr, "[fle-store] warm start: %zu experts (%.1f GB) in %.1f s\n", n,
+            g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
+    }
+    ggml_set_moe_data_callback(llama_expert_store::data_cb, g_store.get());
+}
+
 void prof_prefill(moe_cache * mc, const prof_file & pf) {
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t n_fill = 0, n_cap = 0, n_lay = 0, n_lay_prof = 0;
@@ -1639,6 +1700,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             prof_prefill(mc, pf);
             prof_hot_mlock(mc, pf);
         }
+        store_init(mc, pf.ok ? &pf : nullptr);
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:
         // buffer -> buft -> device -> dev_init. This is not a workaround: the thread

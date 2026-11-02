@@ -361,6 +361,13 @@ extern "C" {
     GGML_API void            ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud);
     GGML_API ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud);
 
+    // FLE expert store: the CPU mul_mat_id asks where the weights of expert `expert` of `src0` are; a non-NULL answer
+    // replaces src0->data + expert*nb[2] (the same bytes, held elsewhere, e.g. in a RAM store), NULL keeps the default.
+    // Called from every compute thread after the op's setup barrier; it must be cheap and must not change during the op.
+    typedef const void * (*ggml_moe_data_cb_t)(const struct ggml_tensor * src0, int32_t expert, void * ud);
+    GGML_API void               ggml_set_moe_data_callback(ggml_moe_data_cb_t cb, void * ud);
+    GGML_API ggml_moe_data_cb_t ggml_get_moe_data_callback(void ** ud);
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 
