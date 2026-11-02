@@ -5376,6 +5376,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
+                // FLE: block-wise copy of strided quantized views (cpy_quant_rows)
+                if (src0_type == src1_type && ggml_is_quantized(src0_type) && ggml_are_same_shape(op->src[0], op->src[1]) &&
+                        op->src[0]->nb[0] == ggml_type_size(src0_type) && op->src[1]->nb[0] == ggml_type_size(src1_type)) {
+                    return true;
+                }
                 return false;
             } break;
         case GGML_OP_DUP:

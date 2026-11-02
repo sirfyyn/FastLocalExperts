@@ -386,6 +386,23 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// FLE: same-type quantized copy of a strided view (e.g. ggml_cont of a per-stream q8_0 cache view): whole blocks are moved
+// byte for byte, row by row; requires block-contiguous rows (nb[0] == block size) and matching shapes
+static __global__ void cpy_quant_rows(const char * cx, char * cdst, const int64_t row_bytes, const int64_t nrows,
+        const int64_t ne01, const int64_t ne02, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;   // one 4-byte word
+    const int64_t wpr = row_bytes/4;
+    if (i >= wpr*nrows) {
+        return;
+    }
+    const int64_t r  = i / wpr, w = i % wpr;
+    const int64_t i1 = r % ne01, i2 = (r / ne01) % ne02, i3 = r / (ne01*ne02);
+    const int32_t * s = (const int32_t *) (cx   + i1*nb01 + i2*nb02 + i3*nb03);
+    int32_t       * d = (int32_t       *) (cdst + i1*nb11 + i2*nb12 + i3*nb13);
+    d[w] = s[w];
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -476,6 +493,17 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (src0->type == src1->type && ggml_is_quantized(src0->type) && ggml_are_same_shape(src0, src1) &&
+               (size_t) nb00 == ggml_type_size(src0->type) && (size_t) nb10 == ggml_type_size(src1->type) &&
+               ggml_row_size(src0->type, ne00) % 4 == 0 && nb01 % 4 == 0 && nb02 % 4 == 0 && nb03 % 4 == 0 &&
+               nb11 % 4 == 0 && nb12 % 4 == 0 && nb13 % 4 == 0) {
+        const int64_t row_bytes = (int64_t) ggml_row_size(src0->type, ne00);
+        const int64_t nrows     = ne01*ne02*src0->ne[3];
+        const int64_t nw        = row_bytes/4*nrows;
+        const int64_t nblk      = (nw + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+        GGML_ASSERT(nblk <= INT_MAX);
+        cpy_quant_rows<<<nblk, CUDA_CPY_BLOCK_SIZE, 0, main_stream>>>(src0_ddc, src1_ddc, row_bytes, nrows,
+                ne01, ne02, nb01, nb02, nb03, nb11, nb12, nb13);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
