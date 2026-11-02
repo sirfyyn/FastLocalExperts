@@ -217,9 +217,11 @@ int parse_layer_from_name(const char * name) {
 // the GPU cache, madvise(WILLNEED) on the whole gate/up/down slices, on a worker thread: the NVMe reads them in large
 // parallel chunks while the CPU starts on gate, instead of page fault by page fault. No prediction, no upload.
 struct wn_range { void * a; size_t n; };
-static std::mutex              g_wn_mtx;
-static std::condition_variable g_wn_cv;
-static std::deque<wn_range>    g_wn_q;
+// Never destroyed: the workers are detached and still wait on the condition variable at exit; destroying it then blocks in
+// pthread_cond_destroy (the futex hang at shutdown seen on 01./02.11. with FLE_MOE_WILLNEED_NOW).
+static std::mutex &              g_wn_mtx = *new std::mutex();
+static std::condition_variable & g_wn_cv  = *new std::condition_variable();
+static std::deque<wn_range> &    g_wn_q   = *new std::deque<wn_range>();
 
 // FLE_MOE_WILLNEED_THREADS=N (default 1) workers and FLE_MOE_WILLNEED_CHUNK_KB (default 0 = whole slice): the slices
 // are cut into chunks and N workers request them at once, so the NVMe sees N requests in flight instead of ~3 page faults.
