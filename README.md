@@ -17,6 +17,7 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 [Films](#making-rhea-fast-eight-short-films) ·
 [Website](https://sirfyyn.de/en/fle/) ·
 [FLE Link](https://flelink.run) ·
+[FLE Durable](https://github.com/sirfyyn/fle-durable) ·
 [YouTube](https://www.youtube.com/@sirfyyn)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23272400.svg)](https://doi.org/10.5281/zenodo.23272400)
@@ -199,6 +200,14 @@ engine only; FLE Link and the engine can be replaced independently.
 
 Recorded on the reference machine against the running service. The speeds in the recording are single answers right
 after a restart, not measurements; the measured numbers are in [Results](#results).
+
+### FLE Durable: an agent on top
+
+[FLE Durable](https://github.com/sirfyyn/fle-durable) is a local agent that runs all the time next to the model and works
+from events: items on its agenda (planned by you or by the agent itself), webhooks from your tools, your messages. Every
+event lands in one durable queue in a SQLite file before the agent sees it, so a restart neither loses nor repeats one;
+only destructive steps wait for your approval. FLE Link starts it with the running model on its Agent page. Engine, FLE Link
+and FLE Durable are separate projects and can each be replaced.
 
 ## Model files
 
