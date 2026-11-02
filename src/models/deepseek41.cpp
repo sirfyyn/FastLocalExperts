@@ -1102,8 +1102,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             }
         }
 
-        // FLE expert deferral: the previous layer's CPU experts are placed by build_moe_ffn (see fle_defer_pending)
-        fle_defer_pending = defer_experts;
+        // FLE expert deferral: the previous layer's deferred CPU experts are already in the graph (placed right after its merge, below)
+        fle_defer_pending = nullptr;
 
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
@@ -1127,6 +1127,12 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         defer_weights = fle_defer_weights;
         fle_defer_experts = nullptr;
         fle_defer_weights = nullptr;
+        if (defer_experts && il < n_layer - 1) {
+            // place this layer's deferred CPU experts right after its merge: with FLE_SCHED_ASYNC_CPU the CPU computes them while the GPU
+            // runs the next layer's attention, router and hit chain; the next layer adds them
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, defer_experts);
+        }
         if (il == n_layer - 1) {
             cur = fle_defer_add(cur, defer_experts, defer_weights, hparams.n_expert_used(), il);
             defer_experts = nullptr;
