@@ -634,8 +634,11 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 (src0_ddc, src1_ddc, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, main_stream);
         }
     } else {
-        GGML_ABORT("%s: unsupported type combination (%s to %s)\n", __func__,
-                ggml_type_name(src0->type), ggml_type_name(src1->type));
+        GGML_ABORT("%s: unsupported type combination (%s to %s) src0 %s ne [%lld %lld %lld %lld] nb [%zu %zu %zu %zu] -> %s ne [%lld %lld %lld %lld] nb [%zu %zu %zu %zu] op %s\n", __func__,
+                ggml_type_name(src0->type), ggml_type_name(src1->type), src0->name,
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->name, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3], src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                ggml_op_name(src1->op));
     }
 }
 
