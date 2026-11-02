@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-moe-fused.h"
 
 // aux states of the target decode (defined in llama-context.cpp)
 const float * llama_get_dspark_aux(int32_t layer, int64_t * n_tokens_out);
@@ -2363,6 +2364,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the CPU chain of the routed experts for the ids `selected_experts` (FLE expert deferral builds it twice: strong and weak ranks)
     auto build_cpu_chain = [&](ggml_tensor * cur, ggml_tensor * selected_experts) -> ggml_tensor * {
+        // FLE_MOE_FUSED_CPU=1: gate, up, clamped SwiGLU and down of the CPU experts as one op (llama-moe-fused.cpp)
+        static const bool fle_fused = [] { const char * e = std::getenv("FLE_MOE_FUSED_CPU"); return e && std::atoi(e) != 0; }();
+        if (fle_fused && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
+                !up_exps_b && !gate_exps_b && !down_exps_b && type_op == LLM_FFN_SILU && !weight_before_ffn &&
+                il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && llm_arch_is_dsv4_family(arch)) {
+            ggml_tensor * pred = fle_pred_ids;
+            fle_pred_ids = nullptr;
+            ggml_tensor * fused = llama_moe_fused_cpu(ctx0, cur, selected_experts, gate_exps, up_exps, down_exps,
+                    mcache->host_table, mcache->n_slots, pred, hparams.swiglu_clamp_exp[il], il);
+            cb(fused, "ffn_moe_fused_cpu", il);
+            return fused;
+        }
         ggml_tensor * up = nullptr;
         ggml_tensor * experts = nullptr;
 
@@ -2541,8 +2554,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (mcache) {
-        experts->src[3] = mcache->host_table;
-        experts->op_params[0] = mcache->n_slots;
+        if (experts->op == GGML_OP_MUL_MAT_ID) {   // (the fused op carries the table itself)
+            experts->src[3] = mcache->host_table;
+            experts->op_params[0] = mcache->n_slots;
+        }
 
         ggml_tensor * down_g = mc_down_g ? mc_down_g : build_mc_hit_chain(false);
 
@@ -2551,7 +2566,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // (with FLE_MOE_DEFER_N only the weak ranks; the strong ranks' CPU part is added below in this layer)
             fle_defer_experts = experts;
             experts = down_g;
-            if (experts_now) {
+            if (experts_now && experts_now->op == GGML_OP_MUL_MAT_ID) {
                 experts_now->src[3] = mcache->host_table;
                 experts_now->op_params[0] = mcache->n_slots;
             }
