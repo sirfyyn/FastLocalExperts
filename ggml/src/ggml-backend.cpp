@@ -23,6 +23,11 @@
 #include <unordered_map>
 #include <vector>
 #include <chrono>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1684,6 +1689,70 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 static ggml_backend_fle_mc_hook_t g_fle_mc_hook    = NULL;
 static void *                     g_fle_mc_hook_ud = NULL;
 
+// ---- FLE asynchronous CPU subgraphs (FLE_SCHED_ASYNC_CPU=1) -------------------------------------------------------------------
+// A CPU subgraph whose inputs come from a GPU is not computed by the scheduler thread: its inputs are copied with async D2H copies
+// into the pinned host copies, a host function on the GPU stream hands it to a worker thread when the copies are done, and the
+// GPU subgraph that needs its results first enqueues a host function that blocks until the worker has finished, then async H2D
+// copies. The scheduler thread enqueues the whole graph without a host synchronization per subgraph; the GPU computes ahead while
+// the CPU computes the experts. Needs pinned host buffers (CUDA_Host) for the CPU copies; otherwise the old path is taken.
+static ggml_backend_fle_host_func_t g_fle_host_func = NULL;
+
+struct fle_async_job { ggml_backend_t backend; struct ggml_cgraph * graph; uint64_t seq; };
+static constexpr int FLE_ASYNC_JOBS = 1024;
+static fle_async_job &                  fle_async_job_at(uint64_t seq) { static fle_async_job * r = new fle_async_job[FLE_ASYNC_JOBS]; return r[seq % FLE_ASYNC_JOBS]; }
+// never destroyed: the worker and the host-function thread may still wait on them at exit
+static std::mutex &                     g_fle_as_mtx  = *new std::mutex();
+static std::condition_variable &        g_fle_as_cv   = *new std::condition_variable();
+static std::condition_variable &        g_fle_as_done_cv = *new std::condition_variable();
+static std::deque<fle_async_job *> &    g_fle_as_q    = *new std::deque<fle_async_job *>();
+static std::atomic<uint64_t> &          g_fle_as_done = *new std::atomic<uint64_t>(0);
+static uint64_t                         g_fle_as_submitted = 0;   // scheduler thread only
+
+static void fle_async_worker() {
+    for (;;) {
+        fle_async_job * j;
+        {
+            std::unique_lock<std::mutex> lk(g_fle_as_mtx);
+            g_fle_as_cv.wait(lk, [] { return !g_fle_as_q.empty(); });
+            j = g_fle_as_q.front(); g_fle_as_q.pop_front();
+        }
+        ggml_backend_graph_compute(j->backend, j->graph);
+        {
+            std::lock_guard<std::mutex> lk(g_fle_as_mtx);
+            g_fle_as_done.store(j->seq, std::memory_order_release);
+        }
+        g_fle_as_done_cv.notify_all();
+    }
+}
+
+static void fle_async_submit(void * p) {   // host function: the inputs are in host memory now
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(fle_async_worker).detach(); });
+    {
+        std::lock_guard<std::mutex> lk(g_fle_as_mtx);
+        g_fle_as_q.push_back((fle_async_job *) p);
+    }
+    g_fle_as_cv.notify_one();
+}
+
+static void fle_async_wait_seq(uint64_t seq) {
+    for (int i = 0; i < 20000; ++i) {   // short spin: the worker is usually close
+        if (g_fle_as_done.load(std::memory_order_acquire) >= seq) { return; }
+    }
+    std::unique_lock<std::mutex> lk(g_fle_as_mtx);
+    g_fle_as_done_cv.wait(lk, [seq] { return g_fle_as_done.load(std::memory_order_acquire) >= seq; });
+}
+
+static void fle_async_wait(void * p) {   // host function: block the stream until the worker is done with job seq
+    fle_async_wait_seq((uint64_t) (uintptr_t) p);
+}
+
+static bool fle_buffer_pinned(const ggml_backend_buffer_t buf) {
+    if (!buf || !ggml_backend_buffer_is_host(buf)) { return false; }
+    const char * n = ggml_backend_buft_name(ggml_backend_buffer_get_type(buf));
+    return n && strstr(n, "_Host") != nullptr;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1808,7 +1877,65 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     };
 
+    static const bool fle_async_env = [] { const char * e = std::getenv("FLE_SCHED_ASYNC_CPU"); return e && std::atoi(e) != 0; }();
+    const bool fle_async = fle_async_env && g_fle_host_func && !sched->callback_eval && sched->n_copies == 1;
+    std::vector<uint8_t> fle_async_job_split(fle_async ? sched->n_splits : 0, 0);
+    std::vector<uint64_t> fle_async_waited(sched->n_backends, 0);
+    const uint64_t fle_async_first = g_fle_as_submitted;
+
+    // FLE asynchronous CPU subgraphs: true = the inputs of split sid were handled without a host synchronization
+    auto copy_inputs_async = [&](int sid) -> bool {
+        struct ggml_backend_sched_split * split = &splits[sid];
+        const int bid = split->backend_id;
+        const bool cpu = bid == sched->n_backends - 1;
+        int gpu_id = -1;
+        for (int i = 0; i < split->n_inputs; i++) {
+            struct ggml_tensor * input = split->inputs[i];
+            struct ggml_tensor * cpy   = tensor_copy(input, bid, sched->cur_copy);
+            if (input->flags & GGML_TENSOR_FLAG_INPUT) { return false; }
+            if (input->buffer && ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) { return false; }
+            const int ib = tensor_backend_id(input);
+            if (cpu) {
+                if (ib < 0 || ib == bid || !fle_buffer_pinned(cpy->buffer)) { return false; }
+                if (gpu_id >= 0 && gpu_id != ib) { return false; }
+                gpu_id = ib;
+            } else {
+                if (ib != sched->n_backends - 1 || !fle_buffer_pinned(input->buffer)) { return false; }
+            }
+        }
+        if (split->n_inputs == 0) { return false; }
+        if (cpu) {
+            ggml_backend_t gb = sched->backends[gpu_id];
+            for (int i = 0; i < split->n_inputs; i++) {
+                struct ggml_tensor * input = split->inputs[i];
+                struct ggml_tensor * cpy   = tensor_copy(input, bid, sched->cur_copy);
+                ggml_backend_tensor_get_async(gb, input, cpy->data, 0, ggml_nbytes(input));
+            }
+            fle_async_job & j = fle_async_job_at(++g_fle_as_submitted);
+            j.backend = sched->backends[bid];
+            j.graph   = &split->graph;
+            j.seq     = g_fle_as_submitted;
+            g_fle_host_func(gb, fle_async_submit, &j);
+            fle_async_job_split[sid] = 1;
+        } else {
+            ggml_backend_t sb = sched->backends[bid];
+            if (g_fle_as_submitted > fle_async_waited[bid] && g_fle_as_submitted > fle_async_first) {
+                g_fle_host_func(sb, fle_async_wait, (void *) (uintptr_t) g_fle_as_submitted);
+                fle_async_waited[bid] = g_fle_as_submitted;
+            }
+            for (int i = 0; i < split->n_inputs; i++) {
+                struct ggml_tensor * input = split->inputs[i];
+                struct ggml_tensor * cpy   = tensor_copy(input, bid, sched->cur_copy);
+                ggml_backend_tensor_set_async(sb, cpy, input->data, 0, ggml_nbytes(input));
+            }
+        }
+        return true;
+    };
+
     auto copy_inputs = [&](int sid) {
+        if (fle_async && copy_inputs_async(sid)) {
+            return;
+        }
         struct ggml_backend_sched_split * split = &splits[sid];
         const int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2069,7 +2196,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     fle_early[split_id + 1] = 1;
                     // The ids of the CPU subgraph are on the host now and the GPU stream is idle: the cache may move part of the
                     // misses onto the GPU (weights and table enqueued here run before the hit chain on the same stream).
-                    if (g_fle_mc_hook) {
+                    if (g_fle_mc_hook && !fle_async) {
                         for (int n = 0; n < nx->graph.n_nodes; n++) {
                             struct ggml_tensor * t = nx->graph.nodes[n];
                             if (t->op == GGML_OP_MUL_MAT_ID && t->src[3] != NULL) {
@@ -2084,6 +2211,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (fle_async && fle_async_job_split[split_id]) {   // the worker computes it (fle_async_submit)
+            prev_backend_id = split_backend_id;
+            continue;
         }
 
         if (!sched->callback_eval) {
@@ -2131,6 +2263,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (fle_async && g_fle_as_submitted > fle_async_first) {
+        fle_async_wait_seq(g_fle_as_submitted);   // the CPU subgraphs of this graph are done (their GPU stream continues)
     }
 
     if (fle_tt_every && ++fle_tt_n_graph % fle_tt_every == 0) {
@@ -2393,6 +2529,10 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_set_fle_host_func(ggml_backend_fle_host_func_t f) {
+    g_fle_host_func = f;
 }
 
 void ggml_backend_set_fle_mc_hook(ggml_backend_fle_mc_hook_t hook, void * user_data) {
