@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -220,6 +221,8 @@ static std::mutex              g_wn_mtx;
 static std::condition_variable g_wn_cv;
 static std::deque<wn_range>    g_wn_q;
 
+// FLE_MOE_WILLNEED_THREADS=N (default 1) workers and FLE_MOE_WILLNEED_CHUNK_KB (default 0 = whole slice): the slices
+// are cut into chunks and N workers request them at once, so the NVMe sees N requests in flight instead of ~3 page faults.
 static void wn_worker() {
     for (;;) {
         wn_range r;
@@ -238,12 +241,22 @@ static void wn_willneed(const ggml_tensor * src, int32_t expert) {
 #ifndef _WIN32
     if (!src || !src->data) { return; }
     static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    static const int    n_thr = [] { const char * e = std::getenv("FLE_MOE_WILLNEED_THREADS"); return (e && *e) ? std::max(1, atoi(e)) : 1; }();
+    static const size_t chunk = [] { const char * e = std::getenv("FLE_MOE_WILLNEED_CHUNK_KB"); return (e && *e) ? (size_t) std::max(0, atoi(e)) * 1024 : (size_t) 0; }();
     const uintptr_t a  = (uintptr_t) src->data + (uintptr_t) expert * src->nb[2];
     const uintptr_t a0 = a & ~(pg - 1);
+    const size_t    n  = (size_t) (a + src->nb[2] - a0);
     static std::once_flag started;
-    std::call_once(started, [] { std::thread(wn_worker).detach(); });
-    { std::lock_guard<std::mutex> lk(g_wn_mtx); g_wn_q.push_back({ (void *) a0, (size_t) (a + src->nb[2] - a0) }); }
-    g_wn_cv.notify_one();
+    std::call_once(started, [] { for (int i = 0; i < n_thr; ++i) { std::thread(wn_worker).detach(); } });
+    {
+        std::lock_guard<std::mutex> lk(g_wn_mtx);
+        if (chunk == 0) {
+            g_wn_q.push_back({ (void *) a0, n });
+        } else {
+            for (size_t o = 0; o < n; o += chunk) { g_wn_q.push_back({ (void *) (a0 + o), std::min(chunk, n - o) }); }
+        }
+    }
+    if (chunk == 0) { g_wn_cv.notify_one(); } else { g_wn_cv.notify_all(); }
 #else
     (void) src; (void) expert;
 #endif
@@ -263,9 +276,9 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                 for (int64_t i = 0; i < ids->ne[0]; ++i) {
                     const int32_t e = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
                     if (e < 0 || e >= (int32_t) l0->expert_slot.size() || l0->expert_slot[e] >= 0) { continue; }
+                    wn_willneed(l0->pub.gate_src, e);
                     wn_willneed(l0->pub.up_src,   e);
                     wn_willneed(l0->pub.down_src, e);
-                    wn_willneed(l0->pub.gate_src, e);
                 }
             }
         }
@@ -691,7 +704,7 @@ void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_o
     const int32_t v = slot_or_dummy;
     if (pub.dev_bias) {
         // uploaded once per layer and step (llama_moe_cache_step), not per entry
-        pub.bias_host[expert] = slot_or_dummy == pub.n_slots ? 0.0f : pub.bias_val;
+        pub.bias_host[expert] = slot_or_dummy != pub.n_slots ? pub.bias_val : pub.hot_bias.empty() ? 0.0f : pub.hot_bias[expert];
         pub.bias_dirty = true;
     }
     if (fle_slowdown_tab_us > 0) {
@@ -951,6 +964,67 @@ void prefill_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert,
 // the init above skips layers whose `data` is null); with mmap the pages are faulted in by this read, with
 // `--load-mode none` they are plain host memory. Slots are copied one by one, synchronously (a few seconds for
 // ~20 GB); the decode path never sees a half-filled slot because no graph has run yet.
+// FLE_MOE_HOT_MLOCK_GB=<n> (default off, needs FLE_MOE_PROFILE): keep the most-routed experts that do NOT get a GPU
+// slot resident in host RAM with mlock(), up to n GB. On models larger than RAM (DeepSeek-V4.1 ISTA: 129 GiB experts +
+// 103 GB Engram on 120 GB) the page cache otherwise evicts hot expert slices and the CPU miss path reads them back from
+// the NVMe. Needs RLIMIT_MEMLOCK large enough (e.g. prlimit --memlock=unlimited); failures are counted, not fatal.
+void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
+#ifndef _WIN32
+    const char * e = std::getenv("FLE_MOE_HOT_MLOCK_GB");
+    if (!e || atof(e) <= 0.0) { return; }
+    const uint64_t budget = (uint64_t) (atof(e) * 1e9);
+    struct cand { uint64_t cnt; layer_state * ls; int32_t expert; };
+    std::vector<cand> cs;
+    for (auto & ls : mc->layers) {
+        const prof_layer * pl = pf.find(ls.pub.il);
+        if (!pl) { continue; }
+        const int64_t n_expert = ls.pub.up_src->ne[2];
+        if (pl->cnt.size() != (size_t) n_expert) { continue; }
+        std::vector<int32_t> order((size_t) n_expert);
+        for (int32_t x = 0; x < (int32_t) n_expert; ++x) { order[(size_t) x] = x; }
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return pl->cnt[(size_t) a] > pl->cnt[(size_t) b]; });
+        // the first n_use go to the GPU cache (prof_prefill); the next ones are the hottest CPU-side experts
+        for (int64_t k = ls.n_use; k < n_expert; ++k) {
+            const int32_t x = order[(size_t) k];
+            if (pl->cnt[(size_t) x] == 0) { break; }
+            cs.push_back({ pl->cnt[(size_t) x], &ls, x });
+        }
+    }
+    std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
+    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    uint64_t locked = 0, n_ok = 0, n_fail = 0; int err = 0;
+    for (const auto & c : cs) {
+        uint64_t sz = 0;
+        for (const ggml_tensor * t : { c.ls->pub.gate_src, c.ls->pub.up_src, c.ls->pub.down_src }) { if (t) { sz += t->nb[2]; } }
+        if (locked + sz > budget) { break; }
+        bool ok = true;
+        for (const ggml_tensor * t : { c.ls->pub.gate_src, c.ls->pub.up_src, c.ls->pub.down_src }) {
+            if (!t || !t->data) { continue; }
+            const uintptr_t a  = (uintptr_t) t->data + (uintptr_t) c.expert * t->nb[2];
+            const uintptr_t a0 = a & ~(pg - 1);
+            if (mlock((void *) a0, a + t->nb[2] - a0) != 0) { ok = false; err = errno; }
+        }
+        if (ok) {
+            locked += sz; n_ok++;
+            // FLE_MOE_HOT_BIAS: the router may prefer a RAM-held expert over one that would come from the SSD (below the GPU-cache bonus)
+            static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+            auto & pub = c.ls->pub;
+            if (hb > 0.0f && pub.dev_bias) {
+                if (pub.hot_bias.empty()) { pub.hot_bias.assign(pub.bias_host.size(), 0.0f); }
+                pub.hot_bias[(size_t) c.expert] = hb;
+                if (c.ls->expert_slot[(size_t) c.expert] < 0) { pub.bias_host[(size_t) c.expert] = hb; pub.bias_dirty = true; }
+            }
+        } else { n_fail++; if (n_fail > 8) { break; } }
+    }
+    LLAMA_LOG_INFO("%s: FLE_MOE_HOT_MLOCK_GB: %llu experts locked (%.1f GB of %.1f GB), %llu failed%s%s\n", __func__,
+        (unsigned long long) n_ok, locked / 1e9, budget / 1e9, (unsigned long long) n_fail,
+        n_fail ? ", errno: " : "", n_fail ? strerror(err) : "");
+    std::fprintf(stderr, "[hot-mlock] %llu experts locked (%.1f GB), %llu failed\n", (unsigned long long) n_ok, locked / 1e9, (unsigned long long) n_fail);
+#else
+    (void) mc; (void) pf;
+#endif
+}
+
 void prof_prefill(moe_cache * mc, const prof_file & pf) {
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t n_fill = 0, n_cap = 0, n_lay = 0, n_lay_prof = 0;
@@ -1563,6 +1637,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 if (!live) { mc->prof_keep.push_back(pl); }
             }
             prof_prefill(mc, pf);
+            prof_hot_mlock(mc, pf);
         }
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:
