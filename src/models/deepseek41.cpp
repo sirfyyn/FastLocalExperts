@@ -932,6 +932,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
 
+    // FLE expert deferral (FLE_MOE_DEFER): the CPU part of the previous layer's routed experts, added one layer later
+    ggml_tensor * defer_experts = nullptr;
+    ggml_tensor * defer_weights = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -1018,6 +1022,9 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             fle_early_extra = ffn_shexp;
         }
 
+        // FLE expert deferral: the previous layer's CPU experts are placed by build_moe_ffn (see fle_defer_pending)
+        fle_defer_pending = defer_experts;
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1034,6 +1041,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         fle_early_extra = nullptr;
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        // FLE expert deferral: add the previous layer's CPU experts here, hand this layer's on (the last layer adds its own)
+        cur = fle_defer_add(cur, defer_experts, defer_weights, hparams.n_expert_used(), il);
+        defer_experts = fle_defer_experts;
+        defer_weights = fle_defer_weights;
+        fle_defer_experts = nullptr;
+        fle_defer_weights = nullptr;
+        if (il == n_layer - 1) {
+            cur = fle_defer_add(cur, defer_experts, defer_weights, hparams.n_expert_used(), il);
+            defer_experts = nullptr;
+            defer_weights = nullptr;
+        }
         cb(cur, "ffn_out", il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);

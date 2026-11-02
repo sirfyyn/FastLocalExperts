@@ -2342,6 +2342,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return down_g;
     };
     ggml_tensor * mc_down_g = nullptr;
+    static const bool fle_defer_env = [] { const char * e = std::getenv("FLE_MOE_DEFER"); return e && std::atoi(e) != 0; }();
+    const bool fle_defer = mcache && fle_mc_overlap && fle_defer_env && !weight_before_ffn && !down_exps_s && !down_exps_b;
+    if (fle_defer && fle_defer_pending) {
+        // the previous layer's CPU experts: after this layer's router (mc_slot_ids pulls it in), before the marked hit chain
+        ggml_build_forward_expand(gf, mc_slot_ids);
+        ggml_build_forward_expand(gf, fle_defer_pending);
+    }
+    fle_defer_pending = nullptr;
     if (mcache && fle_mc_overlap) {
         mc_down_g = build_mc_hit_chain(true);
     }
@@ -2514,8 +2522,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_tensor * down_g = mc_down_g ? mc_down_g : build_mc_hit_chain(false);
 
-        experts = ggml_add(ctx0, experts, down_g);
-        cb(experts, "ffn_moe_cache_merged", il);
+        if (fle_defer) {
+            // the CPU part goes to the caller unexpanded; this result is the GPU part (hits) only
+            fle_defer_experts = experts;
+            experts = down_g;
+        } else {
+            experts = ggml_add(ctx0, experts, down_g);
+            cb(experts, "ffn_moe_cache_merged", il);
+        }
     }
 
     if (down_exps_s) {
@@ -2530,6 +2544,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
+    }
+    if (fle_defer) {
+        fle_defer_weights = weights;
     }
 
     ggml_build_forward_expand(gf, experts);
@@ -2566,6 +2583,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+// FLE expert deferral: weight the deferred CPU part of a layer's routed experts, sum it over the experts and add it to cur
+ggml_tensor * llm_graph_context::fle_defer_add(ggml_tensor * cur, ggml_tensor * experts, ggml_tensor * weights, int64_t n_expert_used, int il) const {
+    if (!experts) {
+        return cur;
+    }
+    ggml_tensor * ew = ggml_mul(ctx0, experts, weights);   // [n_embd, n_expert_used, n_tokens]
+    cb(ew, "ffn_moe_deferred_weighted", il);
+    ggml_tensor * sum = nullptr;
+    for (int64_t i = 0; i < n_expert_used; ++i) {
+        ggml_tensor * v = ggml_view_2d(ctx0, ew, ew->ne[0], ew->ne[2], ew->nb[2], i*ew->nb[1]);
+        sum = sum ? ggml_add(ctx0, sum, v) : v;
+    }
+    if (n_expert_used == 1) {
+        sum = ggml_cont(ctx0, sum);
+    }
+    cb(sum, "ffn_moe_deferred", il);
+    return ggml_add(ctx0, cur, sum);
 }
 
 // input embeddings with optional lora
