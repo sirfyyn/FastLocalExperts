@@ -267,6 +267,38 @@ static void wn_willneed(const ggml_tensor * src, int32_t expert) {
 #endif
 }
 
+// ---- FLE_MOE_PREFETCH: read the predicted CPU-side experts of the next layer into the store while this layer computes ----------
+// The predicted ids come best-first. How many ranks are read adapts: the share of prefetched experts that the layer really used
+// (over the last 512 prefetches) moves the depth between 1 and the predicted k; nothing is read while the store's readers are busy.
+static void moe_pred_cb(const char * name, const struct ggml_tensor * pred, void * ud) {
+    moe_cache * mc = (moe_cache *) ud;
+    if (!g_store || !pred || !pred->data) { return; }
+    const int il = parse_layer_from_name(name);
+    size_t li1 = SIZE_MAX;
+    for (size_t li = 0; li < mc->layers.size(); ++li) { if (mc->layers[li].pub.il == il + 1) { li1 = li; break; } }
+    if (li1 == SIZE_MAX) { return; }
+    layer_state & l1 = mc->layers[li1];
+    const int64_t kmax = pred->ne[0];
+    static int depth = 3;
+    static uint64_t last_issued = 0, last_used = 0;
+    const auto & st = g_store->stats();
+    if (st.pre_issued - last_issued >= 512) {
+        const double used = (double) (st.pre_used - last_used) / (double) (st.pre_issued - last_issued);
+        if (used < 0.35 && depth > 1) { depth--; }
+        else if (used > 0.65 && depth < kmax) { depth++; }
+        last_issued = st.pre_issued; last_used = st.pre_used;
+    }
+    if (g_store->queue_len() > 24) { return; }   // the SSD is busy with demand reads: no guesses now
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    for (int64_t t = 0; t < pred->ne[1] && t < 1; ++t) {   // the first token of the batch (decode)
+        for (int64_t r = 0; r < std::min<int64_t>(kmax, depth); ++r) {
+            const int32_t x = *(const int32_t *) ((const char *) pred->data + t*pred->nb[1] + r*pred->nb[0]);
+            if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[x] >= 0) { continue; }   // in the GPU cache
+            g_store->prefetch(li1, x);
+        }
+    }
+}
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
@@ -1114,6 +1146,7 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }
     ggml_set_moe_data_callback(llama_expert_store::data_cb, g_store.get());
+    ggml_set_moe_pred_callback(moe_pred_cb, mc);
 }
 
 void prof_prefill(moe_cache * mc, const prof_file & pf) {

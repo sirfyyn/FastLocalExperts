@@ -1017,6 +1017,9 @@ struct llm_graph_context {
     // back as fle_defer_pending, which the next build_moe_ffn places in the graph right after the router and before the marked GPU hit chain, so the
     // scheduler runs the CPU experts of layer L while the GPU computes layer L+1.
     mutable ggml_tensor * fle_defer_pending = nullptr;
+    // FLE expert prediction (FLE_MOE_PREFETCH): the next layer's predicted expert ids (I32 [k, n_tokens]); build_moe_ffn hangs them on
+    // the CPU gate mul_mat_id as src[4], so they reach the host with that op's inputs and the expert store can read ahead.
+    mutable ggml_tensor * fle_pred_ids = nullptr;
     mutable ggml_tensor * fle_defer_experts = nullptr;
     mutable ggml_tensor * fle_defer_weights = nullptr;
     ggml_tensor * fle_defer_add(ggml_tensor * cur, ggml_tensor * experts, ggml_tensor * weights, int64_t n_expert_used, int il) const;

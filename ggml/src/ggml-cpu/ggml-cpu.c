@@ -1797,6 +1797,11 @@ static void ggml_compute_forward_mul_mat_id(
             if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
                 moe_obs_cb(src0->name, ids, moe_obs_ud);
             }
+            void * moe_pred_ud = NULL;
+            ggml_moe_pred_cb_t moe_pred_cb = ggml_get_moe_pred_callback(&moe_pred_ud);
+            if (moe_pred_cb && dst->src[4] && dst->src[4]->type == GGML_TYPE_I32) {
+                moe_pred_cb(src0->name, dst->src[4], moe_pred_ud);
+            }
         }
 
         // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps

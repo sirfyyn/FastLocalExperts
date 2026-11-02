@@ -2405,6 +2405,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
+            if (fle_pred_ids && mcache && cur->op == GGML_OP_MUL_MAT_ID && cur->src[4] == nullptr) {
+                cur->src[4] = fle_pred_ids;
+            }
+            fle_pred_ids = nullptr;
 
             if (mcache) {
                 cur->src[3] = mcache->host_table;

@@ -4,6 +4,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -25,7 +26,7 @@ static constexpr size_t ES_ALIGN = 4096;
 
 static size_t es_round_up(size_t x) { return (x + ES_ALIGN - 1) & ~(ES_ALIGN - 1); }
 
-struct es_job { int fd; uint64_t off; size_t len; char * dst; };
+struct es_job { int fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
 
 struct llama_expert_store::impl {
     struct role_t { int fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
@@ -34,7 +35,8 @@ struct llama_expert_store::impl {
         std::vector<int32_t>      slot_of;   // expert -> slot, -1
         std::vector<const char *> ptr[3];    // expert -> weights in the arena (nullptr: not resident)
     };
-    struct slot_t { int32_t li = -1; int32_t e = -1; uint32_t cnt = 0; };
+    struct slot_t { int32_t li = -1; int32_t e = -1; uint32_t cnt = 0; uint8_t pre = 0; const char * staged[3] = { nullptr, nullptr, nullptr }; };
+    std::unique_ptr<std::atomic<int>[]> inflight;   // per slot: prefetch reads still running
 
     std::vector<layer_t> layers;
     std::unordered_map<const void *, std::pair<int32_t, int32_t>> by_data;   // tensor data -> (layer index, role)
@@ -46,6 +48,7 @@ struct llama_expert_store::impl {
     size_t  next_free = 0;     // slots below are assigned (preload and first misses fill in order)
     size_t  cursor = 0;        // eviction sampling position
     uint64_t n_ensure = 0;
+    int32_t  pin_li = -1; std::vector<int32_t> pin;   // the experts the running layer computes (not given up by a prefetch)
 
     // reader pool
     std::vector<std::thread> pool;
@@ -74,6 +77,11 @@ struct llama_expert_store::impl {
                 got += (size_t) r;
             }
 #endif
+            if (j.ctr) {
+                if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; }
+                j.ctr->fetch_sub(1, std::memory_order_release);
+                continue;
+            }
             {
                 std::lock_guard<std::mutex> lk(mtx);
                 if (!ok) { read_err++; }
@@ -86,7 +94,7 @@ struct llama_expert_store::impl {
         if (jobs.empty()) { return; }
         {
             std::lock_guard<std::mutex> lk(mtx);
-            for (auto & j : jobs) { q.push_back(j); }
+            for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) { q.push_front(*it); }   // demand before prefetch
             pending += jobs.size();
         }
         cv.notify_all();
@@ -105,7 +113,7 @@ struct llama_expert_store::impl {
             const uint64_t a   = off & ~(uint64_t) (ES_ALIGN - 1);
             const size_t   len = es_round_up((size_t) (off + R.nb2 - a));
             char * dst = base + R.region_off;
-            jobs.push_back({ R.fd, a, len, dst });
+            jobs.push_back({ R.fd, a, len, dst, nullptr });
             ptr_out[r] = dst + (off - a);
         }
     }
@@ -117,7 +125,7 @@ struct llama_expert_store::impl {
             O.slot_of[(size_t) S.e] = -1;
             for (int r = 0; r < 3; ++r) { O.ptr[r][(size_t) S.e] = nullptr; }
         }
-        S.li = (int32_t) li; S.e = e; S.cnt = 1;
+        S.li = (int32_t) li; S.e = e; S.cnt = 1; S.pre = 0;
         layer_t & L = layers[li];
         L.slot_of[(size_t) e] = (int32_t) s;
         for (int r = 0; r < 3; ++r) { L.ptr[r][(size_t) e] = p[r]; }
@@ -204,6 +212,8 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
     madvise(a, d->arena_bytes, MADV_HUGEPAGE);
     d->arena = (char *) a;
     d->slots.resize(n_slots);
+    d->inflight.reset(new std::atomic<int>[n_slots]);
+    for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); }
     for (int i = 0; i < std::max(1, threads); ++i) { d->pool.emplace_back([d] { d->reader(); }); }
     LLAMA_LOG_INFO("%s: FLE_MOE_STORE: %zu slots of %.1f MB (%.1f GB), %d unbuffered readers, %zu layers\n", __func__,
         n_slots, d->blob / 1e6, d->arena_bytes / 1e9, std::max(1, threads), d->layers.size());
@@ -213,9 +223,10 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
 
 llama_expert_store::~llama_expert_store() {
     if (!d) { return; }
-    std::fprintf(stderr, "[fle-store] hits %llu, misses %llu, evictions %llu, read %.1f GB, wait %.0f ms, preload %llu in %.0f ms, read errors %llu\n",
+    std::fprintf(stderr, "[fle-store] hits %llu, misses %llu, evictions %llu, read %.1f GB, wait %.0f ms, preload %llu in %.0f ms, prefetch %llu (used %llu, wasted %llu), read errors %llu\n",
         (unsigned long long) st.hits, (unsigned long long) st.misses, (unsigned long long) st.evictions, st.read_bytes / 1e9, st.wait_ms,
-        (unsigned long long) st.preloaded, st.preload_ms, (unsigned long long) d->read_err);
+        (unsigned long long) st.preloaded, st.preload_ms, (unsigned long long) st.pre_issued, (unsigned long long) st.pre_used,
+        (unsigned long long) st.pre_wasted, (unsigned long long) d->read_err);
     {
         std::lock_guard<std::mutex> lk(d->mtx);
         d->stop = true;
@@ -269,6 +280,8 @@ size_t llama_expert_store::preload(const std::vector<std::pair<int32_t, int32_t>
 void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, std::vector<std::pair<int32_t, int32_t>> * evicted) {
     if (li >= d->layers.size()) { return; }
     impl::layer_t & L = d->layers[li];
+    d->pin_li = (int32_t) li;
+    d->pin.assign(experts, experts + n);
     std::vector<es_job> jobs;
     struct pend { int32_t e; size_t s; const char * p[3]; };
     pend ps[64]; size_t np = 0;
@@ -277,9 +290,16 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         if (e < 0 || e >= L.n_expert) { continue; }
         const int32_t s = L.slot_of[(size_t) e];
         if (s >= 0) {
+            auto & S = d->slots[(size_t) s];
+            if (!L.ptr[0][(size_t) e]) {   // prefetched: wait for its reads, then publish
+                const auto t0 = std::chrono::steady_clock::now();
+                while (d->inflight[(size_t) s].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
+                st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                for (int r = 0; r < 3; ++r) { L.ptr[r][(size_t) e] = S.staged[r]; }
+            }
+            if (S.pre == 1) { S.pre = 2; st.pre_used++; }
             st.hits++;
-            uint32_t & c = d->slots[(size_t) s].cnt;
-            if (c < 0x7fffffff) { c++; }
+            if (S.cnt < 0x7fffffff) { S.cnt++; }
             continue;
         }
         bool dup = false;
@@ -295,6 +315,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
             for (size_t k = 0; k < 64; ++k) {
                 const size_t c = (d->cursor + k * 131) % ns;
                 const auto & S = d->slots[c];
+                if (d->inflight[c].load(std::memory_order_acquire) > 0) { continue; }
                 if (S.li == (int32_t) li) {
                     bool needed = false;
                     for (size_t j = 0; j < n; ++j) { if (experts[j] == S.e) { needed = true; break; } }
@@ -321,6 +342,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         for (size_t k = 0; k < np; ++k) {
             auto & S = d->slots[ps[k].s];
             if (S.li >= 0) {
+                if (S.pre == 1) { st.pre_wasted++; }
                 if (evicted) { evicted->push_back({ S.li, S.e }); }
                 auto & O = d->layers[(size_t) S.li];
                 O.slot_of[(size_t) S.e] = -1;
@@ -337,10 +359,63 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         for (auto & S : d->slots) { S.cnt >>= 1; }
     }
     if (d->n_ensure % 40960 == 0) {
-        std::fprintf(stderr, "[fle-store] hits %llu, misses %llu (%.1f%% hit), evictions %llu, read %.1f GB, wait %.0f ms\n",
+        std::fprintf(stderr, "[fle-store] hits %llu, misses %llu (%.1f%% hit), evictions %llu, read %.1f GB, wait %.0f ms, prefetch %llu used %llu wasted %llu\n",
             (unsigned long long) st.hits, (unsigned long long) st.misses,
-            100.0 * st.hits / std::max<uint64_t>(1, st.hits + st.misses), (unsigned long long) st.evictions, st.read_bytes / 1e9, st.wait_ms);
+            100.0 * st.hits / std::max<uint64_t>(1, st.hits + st.misses), (unsigned long long) st.evictions, st.read_bytes / 1e9, st.wait_ms,
+            (unsigned long long) st.pre_issued, (unsigned long long) st.pre_used, (unsigned long long) st.pre_wasted);
     }
+}
+
+size_t llama_expert_store::queue_len() const {
+    std::lock_guard<std::mutex> lk(d->mtx);
+    return d->q.size();
+}
+
+bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted) {
+    if (li >= d->layers.size()) { return false; }
+    impl::layer_t & L = d->layers[li];
+    if (e < 0 || e >= L.n_expert || L.slot_of[(size_t) e] >= 0) { return false; }
+    // a slot: a never-used one, else the least used of a sample that is neither being read nor needed by the running layer
+    size_t victim = SIZE_MAX;
+    if (d->next_free < d->slots.size()) {
+        victim = d->next_free++;
+    } else {
+        uint32_t best = UINT32_MAX;
+        const size_t ns = d->slots.size();
+        for (size_t k = 0; k < 64; ++k) {
+            const size_t c = (d->cursor + k * 131) % ns;
+            const auto & S = d->slots[c];
+            if (d->inflight[c].load(std::memory_order_acquire) > 0) { continue; }
+            if (S.li == d->pin_li && std::find(d->pin.begin(), d->pin.end(), S.e) != d->pin.end()) { continue; }
+            if (S.cnt < best) { best = S.cnt; victim = c; }
+        }
+        d->cursor = (d->cursor + 61) % ns;
+        if (victim == SIZE_MAX || best > 1) { return false; }   // only cold slots: a prefetch never pushes out a used expert
+        st.evictions++;
+    }
+    auto & S = d->slots[victim];
+    if (S.li >= 0) {
+        if (S.pre == 1) { st.pre_wasted++; }
+        if (evicted) { evicted->push_back({ S.li, S.e }); }
+        auto & O = d->layers[(size_t) S.li];
+        O.slot_of[(size_t) S.e] = -1;
+        for (int r = 0; r < 3; ++r) { O.ptr[r][(size_t) S.e] = nullptr; }
+    }
+    std::vector<es_job> jobs;
+    const char * p[3];
+    d->queue_reads(li, e, victim, jobs, p);
+    S.li = (int32_t) li; S.e = e; S.cnt = 0; S.pre = 1;
+    for (int r = 0; r < 3; ++r) { S.staged[r] = p[r]; }
+    L.slot_of[(size_t) e] = (int32_t) victim;   // known, not yet visible (ptr stays nullptr until ensure publishes it)
+    d->inflight[victim].store((int) jobs.size(), std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lk(d->mtx);
+        for (auto & j : jobs) { j.ctr = &d->inflight[victim]; d->q.push_back(j); }
+    }
+    d->cv.notify_all();
+    st.pre_issued++;
+    st.read_bytes += expert_bytes(li);
+    return true;
 }
 
 const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t expert, void * ud) {

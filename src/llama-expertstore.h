@@ -41,11 +41,16 @@ public:
 
     bool resident(size_t li, int32_t e) const;
 
+    // start reading expert e of layer li into a cold slot without waiting (a predicted miss); ensure() publishes it when the
+    // layer needs it and waits for the reads still running. false: no cold slot or already resident/known.
+    bool prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr);
+    size_t queue_len() const;
+
     // the CPU mul_mat_id's question (ggml_moe_data_cb_t)
     static const void * data_cb(const ggml_tensor * src0, int32_t expert, void * ud);
 
     struct stats_t {
-        uint64_t hits = 0, misses = 0, evictions = 0, read_bytes = 0, preloaded = 0;
+        uint64_t hits = 0, misses = 0, evictions = 0, read_bytes = 0, preloaded = 0, pre_issued = 0, pre_used = 0, pre_wasted = 0;
         double   wait_ms = 0.0, preload_ms = 0.0;
     };
     const stats_t & stats() const { return st; }

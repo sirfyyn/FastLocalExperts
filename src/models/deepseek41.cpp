@@ -1022,6 +1022,21 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             fle_early_extra = ffn_shexp;
         }
 
+        // FLE expert prediction (FLE_MOE_PREFETCH=k): the next layer's router on this layer's FFN input (decode only); the expert store
+        // reads the predicted CPU-side experts ahead while this layer computes
+        {
+            static const int fle_pf_k = [] { const char * e = std::getenv("FLE_MOE_PREFETCH"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+            if (fle_pf_k > 0 && il + 1 < n_layer && n_tokens <= 8 &&
+                hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS && model.layers[il + 1].ffn_gate_inp && model.layers[il + 1].ffn_exp_probs_b) {
+                const auto & nl = model.layers[il + 1];
+                ggml_tensor * pl = build_lora_mm(nl.ffn_gate_inp, cur);
+                ggml_tensor * pp = ggml_sqrt(ctx0, ggml_softplus(ctx0, pl));   // the deepseek41 scoring (sqrt-softplus), then the selection bias
+                pp = ggml_add(ctx0, pp, nl.ffn_exp_probs_b);
+                fle_pred_ids = ggml_argsort_top_k(ctx0, pp, std::min<int>(fle_pf_k, (int) n_expert));
+                cb(fle_pred_ids, "ffn_moe_pred_next", il);
+            }
+        }
+
         // FLE expert deferral: the previous layer's CPU experts are placed by build_moe_ffn (see fle_defer_pending)
         fle_defer_pending = defer_experts;
 

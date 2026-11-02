@@ -368,6 +368,12 @@ extern "C" {
     GGML_API void               ggml_set_moe_data_callback(ggml_moe_data_cb_t cb, void * ud);
     GGML_API ggml_moe_data_cb_t ggml_get_moe_data_callback(void ** ud);
 
+    // FLE expert prediction: when a CPU mul_mat_id carries predicted expert ids of the NEXT layer in src[4] (I32 [k, n_tokens],
+    // best first), this is called on compute thread 0 during the op's setup, after the observation callback.
+    typedef void (*ggml_moe_pred_cb_t)(const char * tensor_name, const struct ggml_tensor * pred_ids, void * ud);
+    GGML_API void               ggml_set_moe_pred_callback(ggml_moe_pred_cb_t cb, void * ud);
+    GGML_API ggml_moe_pred_cb_t ggml_get_moe_pred_callback(void ** ud);
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 

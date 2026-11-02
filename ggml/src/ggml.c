@@ -265,6 +265,21 @@ ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud) {
     return g_moe_obs_cb;
 }
 
+static ggml_moe_pred_cb_t g_moe_pred_cb = NULL;
+static void *             g_moe_pred_ud = NULL;
+
+void ggml_set_moe_pred_callback(ggml_moe_pred_cb_t cb, void * ud) {
+    g_moe_pred_cb = cb;
+    g_moe_pred_ud = ud;
+}
+
+ggml_moe_pred_cb_t ggml_get_moe_pred_callback(void ** ud) {
+    if (ud) {
+        *ud = g_moe_pred_ud;
+    }
+    return g_moe_pred_cb;
+}
+
 static ggml_moe_data_cb_t g_moe_data_cb = NULL;
 static void *             g_moe_data_ud = NULL;
 
