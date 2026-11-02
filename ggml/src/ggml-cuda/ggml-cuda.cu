@@ -5376,6 +5376,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == src1_type && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1])) {
                     return true;
                 }
+                // FLE: block-wise copy of strided quantized views (cpy_quant_rows)
+                if (src0_type == src1_type && ggml_is_quantized(src0_type) && ggml_are_same_shape(op->src[0], op->src[1]) &&
+                        op->src[0]->nb[0] == ggml_type_size(src0_type) && op->src[1]->nb[0] == ggml_type_size(src1_type)) {
+                    return true;
+                }
                 return false;
             } break;
         case GGML_OP_DUP:
@@ -5901,7 +5906,15 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// FLE asynchronous CPU subgraphs: the scheduler enqueues host functions on the backend's stream (ggml_backend_set_fle_host_func)
+static void ggml_backend_cuda_fle_host_func(ggml_backend_t backend, void (*fn)(void *), void * ud) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaLaunchHostFunc(ctx->stream(), fn, ud));
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
+    ggml_backend_set_fle_host_func(ggml_backend_cuda_fle_host_func);
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;

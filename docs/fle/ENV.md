@@ -36,8 +36,8 @@ enough.
 | `FLE_MOE_OBS_MAXTOK` | 4 | Batches with more tokens than this are not observed by the LRU/frequency bookkeeping (prefill must not pollute it). | 8 |
 | `FLE_MOE_CACHE_MAXTOK` | 8 | The cache graph is built for ubatches of up to this many tokens (decode and draft verification). | - |
 | `FLE_MOE_CACHE_BATCH` | unset | `off`: restore the old guard (cache only for single-token batches). | - |
-| `FLE_MOE_CACHE_BIAS` | value of `--moe-cache-bias` (0) | Additive routing bonus (probability units) for experts resident in the cache; steers selection only, the weights stay unbiased. Environment overrides the flag; the MTP context always uses 0. qwen4exp and deepseek41 (before this build the bonus had no effect on deepseek41). ISTA: 0.05 = +8 %, KL 0.014. | 0.001 (Rhea), 0.05 (ISTA) |
-| `FLE_MOE_CACHE_BIAS_LAYERS` | unset | Per-layer override of the bias, `"from-to:value,layer:value"` (for example `0-3:0.002,4-45:0.001`). | - |
+| `FLE_MOE_CACHE_BIAS` | value of `--moe-cache-bias` (0) | Additive routing bonus (probability units) for experts resident in the cache; steers selection only, the weights stay unbiased. Environment overrides the flag; the MTP context always uses 0. qwen4exp and deepseek41 (before this build the bonus had no effect on deepseek41). ISTA: 0.1 on layers 15-42 (with `FLE_MOE_CACHE_BIAS_LAYERS=0-14:0`) = +11 %, KL +0.003. | 0.001 (Rhea), 0.1 (ISTA) |
+| `FLE_MOE_CACHE_BIAS_LAYERS` | unset | Per-layer override of the bias, `"from-to:value,layer:value"` (for example `0-3:0.002,4-45:0.001`); layers without an entry keep the global value. ISTA: the early layers route flat and pay most of the distortion, so they get none. | `0-14:0` (ISTA) |
 | `FLE_MC_OVERLAP` | 0 (off) | Overlap of GPU cache hits and CPU misses. `1`: the hit chain is placed in the graph before the CPU chain and its first node is marked; the scheduler then fetches the inputs of the CPU part before queueing the hit chain, so the GPU computes the hits while the CPU computes the misses. `2` (qwen4exp, deepseek41): additionally the shared expert is moved into the early chain (deepseek41/ISTA: 5 % slower, use `1`). Read in `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` and `ggml/src/ggml-backend.cpp`. | 2 |
 | `FLE_MOE_PCIE_FRAC` | 0 (off) | Experimental (Patch 47, needs `FLE_MC_OVERLAP`). Share (0-1) of the misses of every layer call that is copied over PCIe into a small ring of extra slots and computed by the GPU hit chain instead of the CPU. The copies are enqueued on the hit chain's stream after the routed ids are known and before the hit chain starts; ring entries stay valid until their slot is reused. Evidence line `[fle-pcie]` every 512 steps. | - |
 | `FLE_MOE_PCIE_RING` | 2 | Ring slots per layer for `FLE_MOE_PCIE_FRAC` (1-16), placed after the zero slot and paid out of the cache budget like the shadow slots. | - |
@@ -67,25 +67,33 @@ For models whose CPU-side experts do not fit in RAM (DeepSeek-V4.1 ISTA: about 1
 |---|---|---|---|
 | `FLE_MOE_HOT_MLOCK_GB` | 0 (off) | With `FLE_MOE_PROFILE`: `mlock` the gate/up/down slices of the most-routed CPU-side experts (after the ones the GPU cache takes) up to this many GB, so prefill and other processes cannot evict them. Needs `RLIMIT_MEMLOCK` (for example `prlimit --memlock=unlimited:unlimited`). 30 GB: +8 %, 60 GB: +6 % over 30 GB, 75 GB: slower (the page cache for the rest gets too small). | 60 |
 | `FLE_MOE_HOT_BIAS` | 0 (off) | With `FLE_MOE_CACHE_BIAS > 0` and `FLE_MOE_HOT_MLOCK_GB`: smaller routing bonus for experts held in RAM by the hot lock, so the router prefers them over experts that would come from the SSD. Changes the output like the cache bias. | 0.02 |
+| `FLE_SCHED_ASYNC_CPU` | 0 (off) | Asynchronous CPU subgraphs: the scheduler copies the inputs of a CPU part into pinned host memory with async D2H copies, a host function on the GPU stream hands the part to a worker thread, and the next GPU part waits in the stream (host function) before its async H2D copies. No host synchronization per subgraph, the GPU runs ahead while the CPU computes the experts. Needs CUDA and pinned (`CUDA_Host`) buffers; otherwise the old path is taken. Exact (same results). Code in `ggml/src/ggml-backend.cpp` (`fle_async_*`). | 1 |
+| `FLE_ASYNC_PROF` | 0 (off) | With `FLE_SCHED_ASYNC_CPU`: every N jobs one line `[fle-async]` with the mean queue time (submit to start), compute time of the CPU part and the time the GPU stream waited for it. Diagnosis. | - |
+| `FLE_ASYNC_SPIN` | 0 (off) | With `FLE_SCHED_ASYNC_CPU`: the worker spins on its queue instead of sleeping (no wake-up per job, one busy core while a graph runs). Not measured yet. | - |
 | `FLE_MMAP_NO_RANDOM` | off | Keep the kernel read-ahead on the lazily loaded host expert ranges (no `MADV_RANDOM`). | 1 |
 | `FLE_MOE_WILLNEED_NOW` | off | When a layer's CPU experts are known, `madvise(WILLNEED)` the slices of the routed experts not in the GPU cache, on a worker thread. | 1 |
 | `FLE_MOE_WILLNEED_THREADS` | 1 | Workers for `FLE_MOE_WILLNEED_NOW`. 32 or 64 workers were slower (the request comes too late to help: an expert takes ~10 ms from NVMe, a layer ~0.6 ms). | - |
 | `FLE_MOE_WILLNEED_CHUNK_KB` | 0 (whole slice) | Cut the slices into chunks of this size for the workers. | - |
 | `FLE_ENGRAM_COLD` | off | deepseek41: `MADV_COLD` the Engram rows of the previous decode step. No gain measured (−3 %). | - |
 
-**ISTA recipe** (DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS, one 32 GB GPU, 120 GB RAM): 30.8 tok/s decode exact, 35.2 tok/s with the
-cache bias, prefill 74–83 tok/s (before: 26.8 and 52–58):
+**ISTA recipe** (DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS, one 32 GB GPU, 120 GB RAM), measured 2026-11-02 on prompts outside
+the expert profile: 26.8 tok/s decode exact, **29.7 tok/s with the standard bonus** (0.1 on layers 15-42, Max 2026-11-02), prefill
+74–83 tok/s:
 
 ```bash
 FLE_MOE_CACHE_BUDGET_FIT=1 FLE_MOE_CACHE_BUDGET_MIB=22000 FLE_MOE_PROFILE=<file> FLE_MOE_HOT_MLOCK_GB=60 \
-FLE_MMAP_NO_RANDOM=1 FLE_MOE_WILLNEED_NOW=1 FLE_MC_OVERLAP=1 FLE_MOE_CACHE_BIAS=0.05 FLE_MOE_HOT_BIAS=0.02 \
+FLE_MMAP_NO_RANDOM=1 FLE_MOE_WILLNEED_NOW=1 FLE_MC_OVERLAP=1 FLE_SCHED_ASYNC_CPU=1 \
+FLE_MOE_CACHE_BIAS=0.1 FLE_MOE_CACHE_BIAS_LAYERS=0-14:0 \
 FLE_UBATCH_LEND=1 FLE_UBATCH_PREFETCH=1 FLE_UBATCH_PREFETCH_SLOTS=3 FLE_PREFILL_LEAN=1 FLE_HC_FUSED=1 \
 prlimit --memlock=unlimited:unlimited llama-server -m <ISTA-00001-of-00006.gguf> -c 16384 --jinja -ngl 99 -cmoe -t <physical cores> \
   -ctk q8_0 -ctv q8_0 -fit on --fit-target 1115 --moe-expert-cache-inserts 1 -b 4096 -ub 4096
 ```
 
-The cache bias 0.05 changes the output slightly (KL 0.014 against 0.006 between two unbiased runs; the quantization itself is KL 0.17);
-`FLE_MOE_CACHE_BIAS=0` gives the exact 30.8. The DSpark drafter no longer pays with a 22 GB cache (its memory comes out of the cache).
+The bias changes the output only in the layers that get it. Measured KL against an unbiased run (two unbiased runs differ by
+0.004–0.005; the quantization itself is about 0.17): bias 0.1 on layers 0-14 alone 0.020, on 15-28 alone 0.0066, on 29-42 alone
+0.0057, on 15-42 0.0084 (+0.003, about 1.7 % of the quantization error, accepted as standard). Bias 0.1 on all layers gives
+35–36 tok/s at KL 0.021 and is not the standard. `FLE_MOE_CACHE_BIAS=0` gives the exact 26.8. The DSpark drafter no longer pays
+with a 22 GB cache (its memory comes out of the cache).
 
 ## MoE routing at decode time (qwen4exp)
 

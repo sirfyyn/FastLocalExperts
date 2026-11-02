@@ -360,6 +360,12 @@ extern "C" {
     typedef void (*ggml_backend_fle_mc_hook_t)(struct ggml_tensor * cpu_node, ggml_backend_t gpu_backend, void * user_data);
     GGML_API void                 ggml_backend_set_fle_mc_hook(ggml_backend_fle_mc_hook_t hook, void * user_data);
 
+    // FLE asynchronous CPU subgraphs (FLE_SCHED_ASYNC_CPU=1): enqueue a host function on the stream of a GPU backend (CUDA:
+    // cudaLaunchHostFunc). The scheduler uses it to hand a CPU subgraph to a worker thread once its inputs have arrived and to make
+    // the GPU wait for the worker before it copies the results back, without a host synchronization per subgraph.
+    typedef void (*ggml_backend_fle_host_func_t)(ggml_backend_t backend, void (*fn)(void * ud), void * ud);
+    GGML_API void                 ggml_backend_set_fle_host_func(ggml_backend_fle_host_func_t f);
+
     // FLE Patch 49: prefetch of offloaded MoE expert weights for large ubatches. bytes > 0 allocates a ring of n_slots staging
     // slots of that size on backend and a second backend on the same device (its own stream): while one weight split computes,
     // the whole weights of the next ones (MUL_MAT_ID with at least min_tokens tokens, weight in host memory) are copied into the
