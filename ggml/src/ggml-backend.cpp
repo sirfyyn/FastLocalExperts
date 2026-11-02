@@ -1708,15 +1708,45 @@ static std::deque<fle_async_job *> &    g_fle_as_q    = *new std::deque<fle_asyn
 static std::atomic<uint64_t> &          g_fle_as_done = *new std::atomic<uint64_t>(0);
 static uint64_t                         g_fle_as_submitted = 0;   // scheduler thread only
 
+// FLE_ASYNC_PROF=N: every N jobs one line with the mean times per job (queue latency from submit to start, compute, and how long
+// the GPU stream waited in fle_async_wait). FLE_ASYNC_SPIN=1: the worker spins on the queue instead of sleeping on the condition
+// variable (saves the futex wake-up per job, costs one busy core while a graph runs).
+static const long fle_as_prof_every = [] { const char * e = std::getenv("FLE_ASYNC_PROF"); return (e && *e) ? atol(e) : 0L; }();
+static const bool fle_as_spin       = [] { const char * e = std::getenv("FLE_ASYNC_SPIN"); return e && atoi(e) != 0; }();
+static std::atomic<size_t> &            g_fle_as_qlen = *new std::atomic<size_t>(0);
+static int64_t * fle_as_submit_us() { static int64_t * r = new int64_t[FLE_ASYNC_JOBS](); return r; }
+static std::atomic<int64_t> &           g_fle_as_wait_us = *new std::atomic<int64_t>(0);
+
 static void fle_async_worker() {
+    long n = 0; int64_t q_us = 0, c_us = 0, w0 = 0;
     for (;;) {
         fle_async_job * j;
+        if (fle_as_spin) {
+            while (g_fle_as_qlen.load(std::memory_order_acquire) == 0) {
+#if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause();
+#endif
+            }
+        }
         {
             std::unique_lock<std::mutex> lk(g_fle_as_mtx);
             g_fle_as_cv.wait(lk, [] { return !g_fle_as_q.empty(); });
             j = g_fle_as_q.front(); g_fle_as_q.pop_front();
+            g_fle_as_qlen.fetch_sub(1, std::memory_order_acq_rel);
         }
+        const int64_t t0 = fle_as_prof_every > 0 ? ggml_time_us() : 0;
         ggml_backend_graph_compute(j->backend, j->graph);
+        if (fle_as_prof_every > 0) {
+            const int64_t t1 = ggml_time_us();
+            q_us += t0 - fle_as_submit_us()[j->seq % FLE_ASYNC_JOBS];
+            c_us += t1 - t0;
+            if (++n % fle_as_prof_every == 0) {
+                const int64_t w = g_fle_as_wait_us.load(std::memory_order_relaxed);
+                fprintf(stderr, "[fle-async] %ld jobs: per job queue %.1f us, compute %.1f us, stream wait %.1f us\n",
+                        n, (double) q_us / fle_as_prof_every, (double) c_us / fle_as_prof_every, (double) (w - w0) / fle_as_prof_every);
+                q_us = c_us = 0; w0 = w;
+            }
+        }
         {
             std::lock_guard<std::mutex> lk(g_fle_as_mtx);
             g_fle_as_done.store(j->seq, std::memory_order_release);
@@ -1728,11 +1758,13 @@ static void fle_async_worker() {
 static void fle_async_submit(void * p) {   // host function: the inputs are in host memory now
     static std::once_flag started;
     std::call_once(started, [] { std::thread(fle_async_worker).detach(); });
+    if (fle_as_prof_every > 0) { fle_as_submit_us()[((fle_async_job *) p)->seq % FLE_ASYNC_JOBS] = ggml_time_us(); }
     {
         std::lock_guard<std::mutex> lk(g_fle_as_mtx);
         g_fle_as_q.push_back((fle_async_job *) p);
+        g_fle_as_qlen.fetch_add(1, std::memory_order_acq_rel);
     }
-    g_fle_as_cv.notify_one();
+    if (!fle_as_spin) { g_fle_as_cv.notify_one(); }
 }
 
 static void fle_async_wait_seq(uint64_t seq) {
@@ -1744,7 +1776,9 @@ static void fle_async_wait_seq(uint64_t seq) {
 }
 
 static void fle_async_wait(void * p) {   // host function: block the stream until the worker is done with job seq
+    const int64_t t0 = fle_as_prof_every > 0 ? ggml_time_us() : 0;
     fle_async_wait_seq((uint64_t) (uintptr_t) p);
+    if (fle_as_prof_every > 0) { g_fle_as_wait_us.fetch_add(ggml_time_us() - t0, std::memory_order_relaxed); }
 }
 
 static bool fle_buffer_pinned(const ggml_backend_buffer_t buf) {
