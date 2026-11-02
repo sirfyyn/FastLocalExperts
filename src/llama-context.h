@@ -218,6 +218,8 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    bool fle_engram_preview_pending = false;   // FLE_ENGRAM_PREVIEW: set by decode, used by synchronize
+
 private:
     //
     // output

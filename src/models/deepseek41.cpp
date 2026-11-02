@@ -339,6 +339,58 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
     }
 }
 
+void llama_model_deepseek41::engram_preview(const float * logits, int64_t n_vocab) const {
+    static const int k = [] { const char * e = std::getenv("FLE_ENGRAM_PREVIEW"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+    if (k <= 0 || !logits || engram_layers.empty() || g_dsv41_hist.empty() || g_dsv41_hist_pos < 0) { return; }
+    // the k largest logits (k is small: one pass)
+    std::vector<std::pair<float, llama_token>> best((size_t) k, { -INFINITY, -1 });
+    for (int64_t t = 0; t < n_vocab; ++t) {
+        if (logits[t] <= best.back().first) { continue; }
+        best.back() = { logits[t], (llama_token) t };
+        std::sort(best.begin(), best.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    }
+    const int64_t n_gram = engram_max_ngram;
+    const int64_t n_head = engram_n_head;
+    const int64_t n_cols = engram_n_cols();
+    const int64_t pos    = g_dsv41_hist_pos + 1;
+    const auto cid = [&](llama_token t) -> int64_t {
+        return t < 0 || t >= (llama_token) engram_token_map.size() ? DSV41_ENGRAM_DEAD : engram_token_map[t];
+    };
+    std::vector<std::vector<int32_t>> rows(engram_layers.size());
+    std::vector<uint64_t> toks((size_t) n_gram);
+    for (const auto & b : best) {
+        if (b.second < 0) { continue; }
+        for (size_t e = 0; e < engram_layers.size(); ++e) {
+            const uint64_t * mult   = engram_mult.data()    + e*n_gram;
+            const uint64_t * primes = engram_primes.data()  + e*n_cols;
+            const uint64_t * offs   = engram_offsets.data() + e*n_cols;
+            const int64_t    pad    = engram_token_map[engram_pad_id];
+            int64_t c = cid(b.second);
+            bool blocked = c == DSV41_ENGRAM_DEAD;
+            toks[0] = blocked ? pad : c;
+            for (int64_t s = 1; s < n_gram; ++s) {   // the same rule as engram_hash: shift s is the token s steps back
+                c = pos - s < 0 || (size_t) (s - 1) >= g_dsv41_hist.size() ? DSV41_ENGRAM_DEAD : cid(g_dsv41_hist[(size_t) (s - 1)]);
+                blocked = blocked || c == DSV41_ENGRAM_DEAD;
+                toks[s] = blocked ? pad : c;
+            }
+            uint64_t rolling = toks[0]*mult[0];
+            for (int64_t o = 1; o < n_gram; ++o) {
+                rolling ^= toks[o]*mult[o];
+                for (int64_t h = 0; h < n_head; ++h) {
+                    const int64_t col = (o - 1)*n_head + h;
+                    rows[e].push_back((int32_t) (rolling % primes[col] + offs[col]));
+                }
+            }
+        }
+    }
+    for (size_t e = 0; e < engram_layers.size(); ++e) {
+        const ggml_tensor * table = !per_layer_tok_embd_layers.empty() ? per_layer_tok_embd_layers[e] : per_layer_tok_embd;
+        if (table && can_prefetch.count(table) && !rows[e].empty()) {
+            llama_prefetch_rows(table, rows[e].data(), rows[e].size());
+        }
+    }
+}
+
 // cand_pin: +1e30 (the reference uses +inf) on the block holding each query's newest compressed row, so a partly
 // filled block always survives; a finite pin keeps fully masked blocks at -inf instead of NaN
 class llm_graph_input_dsv41 : public llm_graph_input_i {
@@ -363,11 +415,22 @@ private:
     }
 };
 
+// FLE_ENGRAM_PREVIEW: the newest tokens of the last single-token step (newest first) and its position, for the next step's hash
+static std::vector<llama_token> g_dsv41_hist;
+static int64_t                  g_dsv41_hist_pos = -1;
+
 void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
     if (!engram_ids.empty()) {
         // a token shared by several sequences has the same history in each, so its first sequence resolves it
         std::vector<llama_token> prev;
         mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
+        if (ubatch->n_tokens >= 1 && ubatch->token) {   // the last token of the ubatch and its predecessors, newest first
+            const int64_t n_prev = model.engram_max_ngram - 1;
+            const int64_t i      = ubatch->n_tokens - 1;
+            g_dsv41_hist.assign(1, ubatch->token[i]);
+            for (int64_t s = 1; s < n_prev; ++s) { g_dsv41_hist.push_back(prev[i*n_prev + (n_prev - s)]); }
+            g_dsv41_hist_pos = ubatch->pos[i];
+        }
         // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
         std::vector<std::vector<int32_t>> ids(engram_ids.size());
         std::vector<int32_t> all;

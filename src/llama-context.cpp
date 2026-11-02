@@ -1,6 +1,7 @@
 #include <vector>
 #include <algorithm>
 #include "llama-context.h"
+#include "models/models.h"
 #include <map>
 
 #include "llama-moecache.h"
@@ -1466,6 +1467,15 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // FLE_ENGRAM_PREVIEW (deepseek41): the logits of the last single-output step are on the host now, before sampling
+    if (fle_engram_preview_pending) {
+        fle_engram_preview_pending = false;
+        const auto * m41 = dynamic_cast<const llama_model_deepseek41 *>(&model);
+        if (m41 && logits.data) {
+            m41->engram_preview(logits.data, model.vocab.n_tokens());
+        }
+    }
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -2625,6 +2635,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    {
+        static const bool fle_ep = [] { const char * e = std::getenv("FLE_ENGRAM_PREVIEW"); return e && std::atoi(e) > 0; }();
+        fle_engram_preview_pending = fle_ep && model.arch == LLM_ARCH_DEEPSEEK41 && n_outputs_all == 1;
+    }
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
