@@ -1695,6 +1695,9 @@ static void *                     g_fle_mc_hook_ud = NULL;
 // GPU subgraph that needs its results first enqueues a host function that blocks until the worker has finished, then async H2D
 // copies. The scheduler thread enqueues the whole graph without a host synchronization per subgraph; the GPU computes ahead while
 // the CPU computes the experts. Needs pinned host buffers (CUDA_Host) for the CPU copies; otherwise the old path is taken.
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 static ggml_backend_fle_host_func_t g_fle_host_func = NULL;
 
 struct fle_async_job { ggml_backend_t backend; struct ggml_cgraph * graph; uint64_t seq; };
@@ -1724,7 +1727,7 @@ static void fle_async_worker() {
         if (fle_as_spin) {
             while (g_fle_as_qlen.load(std::memory_order_acquire) == 0) {
 #if defined(__x86_64__) || defined(_M_X64)
-                __builtin_ia32_pause();
+                _mm_pause();
 #endif
             }
         }
