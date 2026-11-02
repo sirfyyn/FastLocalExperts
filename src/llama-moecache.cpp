@@ -205,7 +205,9 @@ moe_cache * g_cache = nullptr;
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
-static std::unique_ptr<llama_expert_store> g_store;   // FLE_MOE_STORE_GB (store_init below)
+static llama_expert_store * g_store_raw = nullptr;   // never destroyed (crash at shutdown, 02.11.)
+struct g_store_ref { llama_expert_store * get() const { return g_store_raw; } llama_expert_store * operator->() const { return g_store_raw; } explicit operator bool() const { return g_store_raw != nullptr; } bool operator!() const { return g_store_raw == nullptr; } };
+static g_store_ref g_store;   // FLE_MOE_STORE_GB (store_init below)
 
 int parse_layer_from_name(const char * name) {
     // "blk.<il>.ffn_gate_exps.weight"
@@ -1105,7 +1107,7 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
     const char * th = std::getenv("FLE_MOE_STORE_THREADS");
     std::vector<llama_expert_store_layer> in;
     for (const auto & ls : mc->layers) { in.push_back({ ls.pub.il, { ls.pub.gate_src, ls.pub.up_src, ls.pub.down_src } }); }
-    g_store = llama_expert_store::create(in, (size_t) (atof(e) * 1e9), (th && *th) ? std::max(1, atoi(th)) : 8);
+    g_store_raw = llama_expert_store::create(in, (size_t) (atof(e) * 1e9), (th && *th) ? std::max(1, atoi(th)) : 8).release();
     if (!g_store) { return; }
     // warm start: the hottest experts after the ones the GPU cache takes (as prof_hot_mlock), across layers by count
     if (pf && pf->ok) {

@@ -214,8 +214,11 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         return nullptr;
     }
 #ifdef MADV_HUGEPAGE
-    madvise(a, d->arena_bytes, MADV_HUGEPAGE);
+    if (!std::getenv("FLE_MOE_STORE_NOHUGE")) { madvise(a, d->arena_bytes, MADV_HUGEPAGE); }
 #endif
+    if (std::getenv("FLE_MOE_STORE_POPULATE")) {   // fault the whole arena in now (first-touch on this thread), not under the readers' DMA
+        for (size_t o = 0; o < d->arena_bytes; o += 4096) { ((volatile char *) a)[o] = 0; }
+    }
     d->arena = (char *) a;
     d->slots.resize(n_slots);
     d->inflight.reset(new std::atomic<int>[n_slots]);
