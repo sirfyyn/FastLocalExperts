@@ -359,6 +359,29 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
         }
     }
 
+    // FLE_MOE_SHARE_EVERY=N: every N layer calls one line with the share of routed experts the GPU cache served (decode)
+    {
+        static const long share_every = [] { const char * e = std::getenv("FLE_MOE_SHARE_EVERY"); return (e && *e) ? atol(e) : 0L; }();
+        if (share_every > 0 && ids->ne[1] <= 4) {
+            static long calls = 0; static long long n_all = 0, n_gpu = 0;
+            const int ilx = parse_layer_from_name(name);
+            for (auto & l : mc->layers) {
+                if (l.pub.il != ilx) { continue; }
+                for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                    for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                        const int32_t x = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                        if (x < 0 || x >= (int32_t) l.expert_slot.size()) { continue; }
+                        n_all++; if (l.expert_slot[x] >= 0) { n_gpu++; }
+                    }
+                }
+                break;
+            }
+            if (++calls % share_every == 0) {
+                std::fprintf(stderr, "[fle-moe-share] %ld calls: %lld routed, %.1f%% from the GPU cache\n", calls, n_all, 100.0 * n_gpu / std::max(1LL, n_all));
+            }
+        }
+    }
+
     const int64_t n_ids    = ids->ne[0];
     const int64_t n_tokens = ids->ne[1];
     static const int obs_max = [] { const char * e = std::getenv("FLE_MOE_OBS_MAXTOK"); return (e && *e) ? std::max(1, atoi(e)) : 4; }();
