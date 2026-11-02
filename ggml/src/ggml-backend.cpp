@@ -1936,6 +1936,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (fle_async && copy_inputs_async(sid)) {
             return;
         }
+        if (fle_async && g_fle_as_submitted > fle_async_first) {
+            // the old (synchronous) path reads or writes host tensors the worker may still be using: let it finish first
+            fle_async_wait_seq(g_fle_as_submitted);
+        }
         struct ggml_backend_sched_split * split = &splits[sid];
         const int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2216,6 +2220,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (fle_async && fle_async_job_split[split_id]) {   // the worker computes it (fle_async_submit)
             prev_backend_id = split_backend_id;
             continue;
+        }
+        if (fle_async && split_backend_id == sched->n_backends - 1 && g_fle_as_submitted > fle_async_first) {
+            // a CPU subgraph computed here shares the CPU backend (work buffer, thread pool) with the worker: let it finish first
+            fle_async_wait_seq(g_fle_as_submitted);
         }
 
         if (!sched->callback_eval) {
