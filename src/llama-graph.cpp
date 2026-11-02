@@ -3154,6 +3154,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (!v_trans) {
             // note: avoid this branch
+            // FLE: a quantized cache (e.g. -ctv q8_0 without flash attention, as DeepSeek-V4.1 takes with two slots) cannot be
+            // transposed block-wise; dequantize the view first (blocks still run along dim 0 there), then transpose
+            if (ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            }
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
