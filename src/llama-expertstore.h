@@ -46,6 +46,11 @@ public:
     bool prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr);
     size_t queue_len() const;
 
+    // the GPU cache uploads from the store when it holds the expert: acquire() returns the weights of expert e of the host tensor src
+    // (nullptr: not resident) and pins its slot until release(slot); ensure()/prefetch() never give up a pinned slot
+    const char * acquire(const ggml_tensor * src, int32_t e, int32_t * slot);
+    void release(int32_t slot);
+
     // the CPU mul_mat_id's question (ggml_moe_data_cb_t)
     static const void * data_cb(const ggml_tensor * src0, int32_t expert, void * ud);
 

@@ -727,14 +727,19 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
                 std::chrono::steady_clock::now() - b0).count();
         fle_slowdown_n++;
     }
+    // FLE_MOE_STORE_GB: the bytes from the RAM store when it holds the expert (the mmap pages are usually not in the page cache then)
+    int32_t st_slot = -1;
+    const char * st_src = g_store ? g_store->acquire(src, expert, &st_slot) : nullptr;
+    struct st_rel { int32_t s; ~st_rel() { if (s >= 0 && g_store) { g_store->release(s); } } } st_guard{ st_slot };
+    const char * src_bytes = st_src ? st_src : (const char *) src->data + (size_t) expert*sz;
     if (fle_up_every) {
         const auto t0 = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+        ggml_backend_tensor_set(dst_c, src_bytes, (size_t) slot*dst_c->nb[2], sz);
         fle_up_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         fle_up_pieces++;
         fle_up_bytes += (long long) sz;
     } else {
-        ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+        ggml_backend_tensor_set(dst_c, src_bytes, (size_t) slot*dst_c->nb[2], sz);
     }
 }
 
@@ -756,8 +761,12 @@ void upload_slice_async(ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
                 std::chrono::steady_clock::now() - b0).count();
         fle_slowdown_n++;
     }
+    int32_t st_slot = -1;
+    const char * st_src = g_store ? g_store->acquire(src, expert, &st_slot) : nullptr;
+    // pageable source: the call returns once the bytes are staged, so the slot can be released right after
     ggml_backend_tensor_set_async(fle_up_backend, dst_c,
-            (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+            st_src ? st_src : (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+    if (st_slot >= 0) { g_store->release(st_slot); }
     if (fle_up_every) {
         fle_up_pieces++;
         fle_up_bytes += (long long) sz;
