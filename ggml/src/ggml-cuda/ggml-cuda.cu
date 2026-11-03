@@ -1900,6 +1900,10 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+// FLE: the slots of the MoE cache (moe_cache_up/gate/down.N). Past MMVQ batch sizes (hybrid prefill) a token can name the zero slot
+// several times; MMQ/MMF assume distinct experts per token, so these take the per-expert path (it tolerates the repeats)
+static bool fle_is_moe_cache_w(const ggml_tensor * t) { return strncmp(t->name, "moe_cache_", 10) == 0; }
+
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1916,6 +1920,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
         }
+    }
+
+    if (fle_is_moe_cache_w(src0)) {
+        return true;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -1988,12 +1996,12 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!fle_is_moe_cache_w(src0) && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!fle_is_moe_cache_w(src0) && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
