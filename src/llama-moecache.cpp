@@ -1030,6 +1030,10 @@ bool prof_validate(prof_file & pf, const Groups & groups, std::string & why) {
 // Caller holds mc->mtx. Writes live counters of the cache layers plus the layers of the loaded file that have no
 // cache in this run (e.g. after a fit that left fewer layers on the host), so a smaller run does not drop them.
 bool prof_write(moe_cache * mc, const char * reason) {
+    // FLE_MOE_PROFILE_READONLY=1: the profile is only read (warm start), never written: runs do not change each other's
+    // starting state, and a profile recorded for one quant is not overwritten by a run of another
+    static const bool ro = [] { const char * e = std::getenv("FLE_MOE_PROFILE_READONLY"); return e && atoi(e) != 0; }();
+    if (ro) { (void) mc; (void) reason; return true; }
     std::vector<prof_layer> out;
     uint64_t obs = 0;
     for (const auto & ls : mc->layers) {
