@@ -376,10 +376,33 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
                 S.li = -1; S.e = -1;
             }
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        d->run(jobs);
-        st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); }
+        static const bool async = [] { const char * e = std::getenv("FLE_MOE_STORE_ASYNC"); return e && atoi(e) != 0; }();
+        if (async) {
+            // FLE_MOE_STORE_ASYNC: the reads go to the front of the queue and ensure returns; mul_mat_id computes the resident
+            // experts first and data_cb waits for each missing one (Strata's order), the GPU-cache upload sees it once published
+            for (size_t pi = 0; pi < np; ++pi) {
+                auto & S = d->slots[ps[pi].s];
+                S.li = (int32_t) li; S.e = ps[pi].e; S.cnt = 1; S.pre = 0;
+                for (int r = 0; r < 3; ++r) { S.staged[r] = ps[pi].p[r]; }
+                L.slot_of[(size_t) ps[pi].e] = (int32_t) ps[pi].s;
+            }
+            // queue_reads appends three reads (gate, up, down) per expert, in ps order
+            GGML_ASSERT(jobs.size() == 3*np);
+            for (size_t pi = 0; pi < np; ++pi) {
+                for (int r = 0; r < 3; ++r) { jobs[3*pi + r].ctr = &d->inflight[ps[pi].s]; }
+                d->inflight[ps[pi].s].store(3, std::memory_order_release);
+            }
+            {
+                std::lock_guard<std::mutex> lk(d->mtx);
+                for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) { d->q.push_front(*it); }   // demand before prefetch
+            }
+            d->cv.notify_all();
+        } else {
+            const auto t0 = std::chrono::steady_clock::now();
+            d->run(jobs);
+            st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); }
+        }
     }
     if (++d->n_ensure % 8192 == 0) {   // age: old popularity must not hold slots forever
         for (auto & S : d->slots) { S.cnt >>= 1; }
@@ -469,5 +492,29 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     if (it == s->d->by_data.end()) { return nullptr; }
     const auto & L = s->d->layers[(size_t) it->second.first];
     if (expert < 0 || expert >= L.n_expert) { return nullptr; }
-    return L.ptr[it->second.second][(size_t) expert];
+    const char * p = L.ptr[it->second.second][(size_t) expert];
+    if (p) { return p; }
+    const int32_t sl = L.slot_of[(size_t) expert];
+    if (sl < 0) { return nullptr; }
+    // FLE_MOE_STORE_ASYNC: read still running (or a prefetch not yet published): wait for this expert only, then publish it
+    auto & S = s->d->slots[(size_t) sl];
+    if (S.li != (int32_t) it->second.first || S.e != expert) { return nullptr; }
+    const auto t0 = std::chrono::steady_clock::now();
+    while (s->d->inflight[(size_t) sl].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
+    auto & st = const_cast<llama_expert_store *>(s)->st;
+    st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    auto & LW = const_cast<impl::layer_t &>(L);
+    for (int r = 0; r < 3; ++r) { LW.ptr[r][(size_t) expert] = S.staged[r]; }
+    return S.staged[it->second.second];
+}
+
+bool llama_expert_store::ready_cb(const ggml_tensor * src0, int32_t expert, void * ud) {
+    const auto * s = (const llama_expert_store *) ud;
+    const auto it = s->d->by_data.find(src0->data);
+    if (it == s->d->by_data.end()) { return true; }
+    const auto & L = s->d->layers[(size_t) it->second.first];
+    if (expert < 0 || expert >= L.n_expert) { return true; }
+    if (L.ptr[it->second.second][(size_t) expert]) { return true; }
+    const int32_t sl = L.slot_of[(size_t) expert];
+    return sl < 0 || s->d->inflight[(size_t) sl].load(std::memory_order_acquire) == 0;
 }

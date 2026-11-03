@@ -295,6 +295,19 @@ ggml_moe_data_cb_t ggml_get_moe_data_callback(void ** ud) {
     return g_moe_data_cb;
 }
 
+static ggml_moe_ready_cb_t g_moe_ready_cb = NULL;
+static void *              g_moe_ready_ud = NULL;
+
+void ggml_set_moe_ready_callback(ggml_moe_ready_cb_t cb, void * ud) {
+    g_moe_ready_cb = cb;
+    g_moe_ready_ud = ud;
+}
+
+ggml_moe_ready_cb_t ggml_get_moe_ready_callback(void ** ud) {
+    if (ud) { *ud = g_moe_ready_ud; }
+    return g_moe_ready_cb;
+}
+
 void ggml_abort(const char * file, int line, const char * fmt, ...) {
     fflush(stdout);
 

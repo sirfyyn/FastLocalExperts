@@ -53,6 +53,8 @@ public:
 
     // the CPU mul_mat_id's question (ggml_moe_data_cb_t)
     static const void * data_cb(const ggml_tensor * src0, int32_t expert, void * ud);
+    // FLE_MOE_STORE_ASYNC=1: true when the expert's bytes can be read now (published, or not in the store); see ggml_moe_ready_cb_t
+    static bool ready_cb(const ggml_tensor * src0, int32_t expert, void * ud);
 
     struct stats_t {
         uint64_t hits = 0, misses = 0, evictions = 0, read_bytes = 0, preloaded = 0, pre_issued = 0, pre_used = 0, pre_wasted = 0;

@@ -367,6 +367,11 @@ extern "C" {
     typedef const void * (*ggml_moe_data_cb_t)(const struct ggml_tensor * src0, int32_t expert, void * ud);
     GGML_API void               ggml_set_moe_data_callback(ggml_moe_data_cb_t cb, void * ud);
     GGML_API ggml_moe_data_cb_t ggml_get_moe_data_callback(void ** ud);
+    // FLE expert store, asynchronous misses: true when the expert's bytes can be read now (resident, or not in the store at all);
+    // mul_mat_id computes the ready experts first and the others after, when data_cb has waited for their reads
+    typedef bool (*ggml_moe_ready_cb_t)(const struct ggml_tensor * src0, int32_t expert, void * ud);
+    GGML_API void                ggml_set_moe_ready_callback(ggml_moe_ready_cb_t cb, void * ud);
+    GGML_API ggml_moe_ready_cb_t ggml_get_moe_ready_callback(void ** ud);
 
     // FLE expert prediction: when a CPU mul_mat_id carries predicted expert ids of the NEXT layer in src[4] (I32 [k, n_tokens],
     // best first), this is called on compute thread 0 during the op's setup, after the observation callback.
