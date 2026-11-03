@@ -229,6 +229,23 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
             grp_beg.push_back((int32_t) grp_pair.size());
         }
         const int64_t ng = (int64_t) grp_beg.size() - 1;
+        // FLE_MOE_POOL_STATS=N: every N calls one line with the mean tokens, CPU pairs and distinct CPU experts per call (by tokens)
+        {
+            static const long every = [] { const char * e = std::getenv("FLE_MOE_POOL_STATS"); return (e && *e) ? atol(e) : 0L; }();
+            if (every > 0) {
+                static long calls = 0; static long long s_tok[9] = {0}, s_pairs[9] = {0}, s_grp[9] = {0}, s_n[9] = {0};
+                const int b = n_tok < 8 ? (int) n_tok : 8;
+                s_tok[b] += n_tok; s_pairs[b] += np; s_grp[b] += ng; s_n[b]++;
+                if (++calls % every == 0) {
+                    for (int k = 1; k <= 8; ++k) {
+                        if (!s_n[k]) { continue; }
+                        std::fprintf(stderr, "[fle-moe-pool] %d token(s): %lld calls, %.2f CPU pairs, %.2f distinct CPU experts per call\n", k,
+                                s_n[k], (double) s_pairs[k] / s_n[k], (double) s_grp[k] / s_n[k]);
+                        s_tok[k] = s_pairs[k] = s_grp[k] = s_n[k] = 0;
+                    }
+                }
+            }
+        }
         pool.run(ng * nb_ff, [&](int64_t j) {
             const int64_t g0 = j / nb_ff;
             const pair_t & p0 = u->pairs[(size_t) grp_pair[(size_t) grp_beg[(size_t) g0]]];
