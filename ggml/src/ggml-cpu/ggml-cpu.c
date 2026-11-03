@@ -1955,14 +1955,26 @@ static void ggml_compute_forward_mul_mat_id(
     }
     if (ith == 0 && fle_mp_every > 0) {
         static int64_t n_c = 0, s_obs = 0, s_p0 = 0, s_p1 = 0, s_all = 0;
+        static int64_t by_n_us[5] = {0}, by_n_bytes[5] = {0}, by_n_cnt[5] = {0};   // calls by number of CPU-side experts (0..3, 4+)
         const int64_t t_end = ggml_time_us();
         const bool two = moe_ready_cb != NULL;
         n_c++; s_obs += fle_t_pass[0] - fle_t_in; s_p0 += fle_t_pass[1] - fle_t_pass[0];
         s_p1 += two ? fle_t_pass[2] - fle_t_pass[1] : 0; s_all += t_end - fle_t_in;
+        // bytes this call read: one weight matrix per CPU-side expert (those with rows here: GPU-cached ones were zeroed above)
+        int n_cpu = 0;
+        for (int a = 0; a < n_as; ++a) { if (matrix_row_counts[a] > 0 && !(dst->src[3] && ((const int32_t *) dst->src[3]->data)[a] != ggml_get_op_params_i32(dst, 0))) { n_cpu++; } }
+        const int bi = n_cpu < 4 ? n_cpu : 4;
+        by_n_cnt[bi]++; by_n_us[bi] += t_end - fle_t_in; by_n_bytes[bi] += (int64_t) n_cpu * (int64_t) nb02;
         if (n_c % fle_mp_every == 0) {
             fprintf(stderr, "[fle-mmid] %lld calls: per call %.1f us (routing/obs/store %.1f, pass 0 %.1f, pass 1 %.1f)\n", (long long) n_c,
                     (double) s_all / fle_mp_every, (double) s_obs / fle_mp_every, (double) s_p0 / fle_mp_every, (double) s_p1 / fle_mp_every);
+            for (int k = 0; k < 5; ++k) {
+                if (!by_n_cnt[k]) { continue; }
+                fprintf(stderr, "[fle-mmid]   %d%s CPU experts: %lld calls, %.1f us each, %.2f GB/s\n", k, k == 4 ? "+" : "", (long long) by_n_cnt[k],
+                        (double) by_n_us[k] / by_n_cnt[k], by_n_us[k] ? (double) by_n_bytes[k] / (double) by_n_us[k] / 1e3 : 0.0);
+            }
             s_obs = s_p0 = s_p1 = s_all = 0;
+            for (int k = 0; k < 5; ++k) { by_n_us[k] = by_n_bytes[k] = by_n_cnt[k] = 0; }
         }
     }
     (void) fle_t_obs;
