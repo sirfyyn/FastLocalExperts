@@ -178,7 +178,9 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // FLE_MOE_POOL: ggml runs this op on one thread (n_tasks 1); the work goes to the pinned pool, jobs of 64 rows
     static const bool use_pool = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && atoi(e) != 0; }();
     if (use_pool) {
-        GGML_ASSERT(nth == 1);
+        static bool said = false;
+        if (!said) { said = true; std::fprintf(stderr, "[fle-moe-pool] fused CPU MoE op on the pool (ggml nth=%d)\n", nth); }
+        if (ith != 0) { return; }   // the pool does the work; with nth > 1 the other ggml threads only wait at the next barrier
         memset(dst->data, 0, ggml_nbytes(dst));
         const int64_t np = (int64_t) u->pairs.size();
         if (np == 0) { return; }

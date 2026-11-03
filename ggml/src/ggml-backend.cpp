@@ -1738,7 +1738,25 @@ static void fle_async_worker() {
             g_fle_as_qlen.fetch_sub(1, std::memory_order_acq_rel);
         }
         const int64_t t0 = fle_as_prof_every > 0 ? ggml_time_us() : 0;
+        // FLE_MOE_POOL: a CPU subgraph with the fused MoE op runs on one ggml thread (the op hands its work to the pinned pool,
+        // 16 ggml threads beside it would only compete for the same cores); FLE_MOE_POOL_RESTORE = threads for the other subgraphs
+        static const bool fle_pool = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && atoi(e) != 0; }();
+        static const int fle_pool_restore = [] { const char * e = std::getenv("FLE_MOE_POOL_RESTORE"); return (e && *e) ? atoi(e) : 16; }();
+        typedef void (*fle_set_nt_t)(ggml_backend_t, int);
+        static fle_set_nt_t fle_set_nt = [] {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
+            return reg ? (fle_set_nt_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads") : (fle_set_nt_t) NULL;
+        }();
+        bool fle_one = false;
+        if (fle_pool && fle_set_nt) {
+            for (int k = 0; k < j->graph->n_nodes; ++k) {
+                const ggml_tensor * nd = j->graph->nodes[k];
+                if (nd->op == GGML_OP_CUSTOM && strstr(nd->name, "ffn_moe_fused_cpu")) { fle_one = true; break; }
+            }
+            if (fle_one) { fle_set_nt(j->backend, 1); }
+        }
         ggml_backend_graph_compute(j->backend, j->graph);
+        if (fle_one) { fle_set_nt(j->backend, fle_pool_restore); }
         if (fle_as_prof_every > 0) {
             const int64_t t1 = ggml_time_us();
             q_us += t0 - fle_as_submit_us()[j->seq % FLE_ASYNC_JOBS];

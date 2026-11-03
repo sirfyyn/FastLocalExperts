@@ -2366,7 +2366,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     auto build_cpu_chain = [&](ggml_tensor * cur, ggml_tensor * selected_experts) -> ggml_tensor * {
         // FLE_MOE_FUSED_CPU=1: gate, up, clamped SwiGLU and down of the CPU experts as one op (llama-moe-fused.cpp)
         static const bool fle_fused = [] { const char * e = std::getenv("FLE_MOE_FUSED_CPU"); return e && std::atoi(e) != 0; }();
-        if (fle_fused && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        static const bool fle_pool_env = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && std::atoi(e) != 0; }();
+        if (fle_fused && (!fle_pool_env || cur->ne[2] <= 8) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
                 !up_exps_b && !gate_exps_b && !down_exps_b && type_op == LLM_FFN_SILU && !weight_before_ffn &&
                 il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && llm_arch_is_dsv4_family(arch)) {
             ggml_tensor * pred = fle_pred_ids;
