@@ -3706,6 +3706,55 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_K;
 
+#if defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__BMI2__)
+    // FLE: IQ1_S in 512-bit lanes (same scheme as the IQ1_M path, after Strata's rows_m): 64 weights (two 32-weight sub-blocks)
+    // a step, grid indices by two pdep, |g| and a negative mask, VNNI accumulation with the sub-block scales; the delta term from
+    // the activation block sums as in the AVX2 path below. FLE_IQ512=0 turns it off.
+    static int fle_iq512 = -1;
+    if (fle_iq512 < 0) { const char * e = getenv("FLE_IQ512"); fle_iq512 = (e && *e) ? atoi(e) != 0 : 1; }
+    if (fle_iq512) {
+        const __m512i zero = _mm512_setzero_si512();
+        __m256 accum = _mm256_setzero_ps();
+        float accum1 = 0;
+        for (int i = 0; i < nb; ++i) {
+            const int8_t   * q8 = y[i].qs;
+            const uint8_t  * qs = x[i].qs;
+            const uint16_t * qh = x[i].qh;
+            __m512i sumi = zero;
+            int sumi1 = 0;
+            for (int ib = 0; ib < QK_K/32; ib += 2) {
+                uint32_t q0, q1;
+                memcpy(&q0, qs, 4); memcpy(&q1, qs + 4, 4);
+                const uint64_t p1 = _pdep_u64(q0, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 0], 0x700070007000700ULL);
+                const uint64_t p2 = _pdep_u64(q1, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
+                uint16_t ix[8];
+                memcpy(ix, &p1, 8); memcpy(ix + 4, &p2, 8);
+                const __m512i g = _mm512_set_epi64((long long) iq1s_grid[ix[7]], (long long) iq1s_grid[ix[6]], (long long) iq1s_grid[ix[5]],
+                                                   (long long) iq1s_grid[ix[4]], (long long) iq1s_grid[ix[3]], (long long) iq1s_grid[ix[2]],
+                                                   (long long) iq1s_grid[ix[1]], (long long) iq1s_grid[ix[0]]);
+                qs += 8;
+                const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
+                const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
+                // 16-bit lanes 0-15 belong to the first sub-block, 16-31 to the second
+                const __m512i scv  = _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16(ls1)), _mm256_set1_epi16(ls2), 1);
+                const __m512i ag   = _mm512_abs_epi8(g);
+                const __mmask64 gneg = _mm512_movepi8_mask(g);
+                const __m512i q8v  = _mm512_loadu_si512((const void *) q8); q8 += 64;
+                const __m512i ys   = _mm512_mask_sub_epi8(q8v, gneg, zero, q8v);
+                sumi = _mm512_dpwssd_epi32(sumi, _mm512_maddubs_epi16(ag, ys), scv);
+                sumi1 += (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]) * (qh[ib+0] & 0x8000 ? -1 : 1) * ls1
+                       + (y[i].bsums[2*ib+2] + y[i].bsums[2*ib+3]) * (qh[ib+1] & 0x8000 ? -1 : 1) * ls2;
+            }
+            const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+            const __m256i f = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
+            accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(f), accum);
+            accum1 += d * sumi1;
+        }
+        *s = hsum_float_8(accum) + IQ1S_DELTA * accum1;
+        return;
+    }
+#endif
+
 #if defined __AVX2__
 
     __m256 accum = _mm256_setzero_ps();
