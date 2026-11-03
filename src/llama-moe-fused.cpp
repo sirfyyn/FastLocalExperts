@@ -184,6 +184,15 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         memset(dst->data, 0, ggml_nbytes(dst));
         const int64_t np = (int64_t) u->pairs.size();
         if (np == 0) { return; }
+        // experts whose bytes are there first (asynchronous expert store), the ones still being read last: the tickets hand out
+        // the resident work while the reads land, instead of a worker waiting on a missing expert early in the layer
+        {
+            void * rud = nullptr;
+            ggml_moe_ready_cb_t rcb = ggml_get_moe_ready_callback(&rud);
+            if (rcb && np > 1) {
+                std::stable_partition(u->pairs.begin(), u->pairs.end(), [&](const pair_t & q) { return rcb(gate, q.e, rud); });
+            }
+        }
         const auto * tg = fle_traits(gate->type);
         const auto * tu = fle_traits(up->type);
         const auto * td = fle_traits(down->type);
