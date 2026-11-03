@@ -1743,11 +1743,16 @@ static void fle_async_worker() {
             const int64_t t1 = ggml_time_us();
             q_us += t0 - fle_as_submit_us()[j->seq % FLE_ASYNC_JOBS];
             c_us += t1 - t0;
+            static std::vector<int64_t> & hc = *new std::vector<int64_t>();   // compute time of each job since the last line
+            hc.push_back(t1 - t0);
             if (++n % fle_as_prof_every == 0) {
                 const int64_t w = g_fle_as_wait_us.load(std::memory_order_relaxed);
-                fprintf(stderr, "[fle-async] %ld jobs: per job queue %.1f us, compute %.1f us, stream wait %.1f us\n",
-                        n, (double) q_us / fle_as_prof_every, (double) c_us / fle_as_prof_every, (double) (w - w0) / fle_as_prof_every);
-                q_us = c_us = 0; w0 = w;
+                std::sort(hc.begin(), hc.end());
+                const auto pct = [&](double q) { return hc.empty() ? 0.0 : (double) hc[std::min(hc.size() - 1, (size_t) (q * hc.size()))]; };
+                fprintf(stderr, "[fle-async] %ld jobs: per job queue %.1f us, compute %.1f us (p50 %.0f, p90 %.0f, p99 %.0f, max %.0f), stream wait %.1f us\n",
+                        n, (double) q_us / fle_as_prof_every, (double) c_us / fle_as_prof_every, pct(0.5), pct(0.9), pct(0.99),
+                        hc.empty() ? 0.0 : (double) hc.back(), (double) (w - w0) / fle_as_prof_every);
+                q_us = c_us = 0; w0 = w; hc.clear();
             }
         }
         {
