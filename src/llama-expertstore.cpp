@@ -127,7 +127,13 @@ struct llama_expert_store::impl {
             const uint64_t a   = off & ~(uint64_t) (ES_ALIGN - 1);
             const size_t   len = es_round_up((size_t) (off + R.nb2 - a));
             char * dst = base + R.region_off;
-            jobs.push_back({ R.fd, a, len, dst, nullptr });
+            // FLE_MOE_STORE_CHUNK_KB: split each read so several readers fetch one expert at once (NVMe queue depth)
+            static const size_t chunk = [] { const char * v = std::getenv("FLE_MOE_STORE_CHUNK_KB"); return (v && *v) ? es_round_up((size_t) std::max(0, atoi(v)) * 1024) : (size_t) 0; }();
+            if (chunk == 0 || len <= chunk) {
+                jobs.push_back({ R.fd, a, len, dst, nullptr });
+            } else {
+                for (size_t o = 0; o < len; o += chunk) { jobs.push_back({ R.fd, a + o, std::min(chunk, len - o), dst + o, nullptr }); }
+            }
             ptr_out[r] = dst + (off - a);
         }
     }
@@ -340,7 +346,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
     d->pin_li = (int32_t) li;
     d->pin.assign(experts, experts + n);
     std::vector<es_job> jobs;
-    struct pend { int32_t e; size_t s; const char * p[3]; };
+    struct pend { int32_t e; size_t s; const char * p[3]; size_t j0, j1; };
     pend ps[64]; size_t np = 0;
     for (size_t i = 0; i < n && np < 64; ++i) {
         const int32_t e = experts[i];
@@ -386,8 +392,9 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
             if (victim == SIZE_MAX) { continue; }   // no slot: this expert stays on the mmap path
             st.evictions++;
         }
-        pend p{ e, victim, { nullptr, nullptr, nullptr } };
+        pend p{ e, victim, { nullptr, nullptr, nullptr }, jobs.size(), 0 };
         d->queue_reads(li, e, victim, jobs, p.p);
+        p.j1 = jobs.size();
         ps[np++] = p;
         st.misses++;
         st.read_bytes += expert_bytes(li);
@@ -415,11 +422,10 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
                 for (int r = 0; r < 3; ++r) { S.staged[r] = ps[pi].p[r]; }
                 L.slot_of[(size_t) ps[pi].e] = (int32_t) ps[pi].s;
             }
-            // queue_reads appends three reads (gate, up, down) per expert, in ps order
-            GGML_ASSERT(jobs.size() == 3*np);
+            // queue_reads appends the reads (gate, up, down, possibly in chunks) of each expert, in ps order
             for (size_t pi = 0; pi < np; ++pi) {
-                for (int r = 0; r < 3; ++r) { jobs[3*pi + r].ctr = &d->inflight[ps[pi].s]; }
-                d->inflight[ps[pi].s].store(3, std::memory_order_release);
+                for (size_t j = ps[pi].j0; j < ps[pi].j1; ++j) { jobs[j].ctr = &d->inflight[ps[pi].s]; }
+                d->inflight[ps[pi].s].store((int) (ps[pi].j1 - ps[pi].j0), std::memory_order_release);
             }
             {
                 std::lock_guard<std::mutex> lk(d->mtx);
@@ -449,7 +455,7 @@ size_t llama_expert_store::queue_len() const {
     return d->q.size();
 }
 
-bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted) {
+bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted, bool force) {
     if (li >= d->layers.size()) { return false; }
     std::lock_guard<std::mutex> slk(d->smtx);
     impl::layer_t & L = d->layers[li];
@@ -467,7 +473,7 @@ bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<in
             if (S.cnt < best) { best = S.cnt; victim = c; }
         }
         d->cursor = (d->cursor + 61) % std::max<size_t>(1, d->slots.size());
-        if (victim == SIZE_MAX || best > 1) { return false; }   // only cold slots: a prefetch never pushes out a used expert
+        if (victim == SIZE_MAX || (!force && best > 1)) { return false; }   // cold slots only, unless the caller trusts its guess (force)
         st.evictions++;
     }
     auto & S = d->slots[victim];

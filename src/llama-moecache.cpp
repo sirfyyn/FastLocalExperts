@@ -2446,3 +2446,131 @@ void llama_moe_cache_profile_save() {
         prof_write(mc, "shutdown");
     }
 }
+
+
+// ---- FLE_MOE_CPU_PRED: the next layer's router on the CPU, reads ahead into the expert store (netcode-style prediction) ----------
+namespace {
+struct cr_q8 { float d; int8_t qs[32]; };   // Q8 block for the predictor only (float scale; not ggml's block_q8_0)
+void cr_quantize(const float * x, cr_q8 * y, int64_t n) {
+    for (int64_t b = 0; b < n / 32; ++b) {
+        float amax = 0.0f;
+        for (int q = 0; q < 32; ++q) { amax = std::max(amax, std::fabs(x[b*32 + q])); }
+        const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        y[b].d = d;
+        for (int q = 0; q < 32; ++q) { y[b].qs[q] = (int8_t) std::lrintf(x[b*32 + q] * id); }
+    }
+}
+struct cpu_router {
+    const ggml_tensor * w = nullptr; const ggml_tensor * b = nullptr; int k = 0;
+    std::vector<cr_q8> wq;   // [n_expert][n_embd/32]
+    std::vector<float> bias;
+    int64_t n_embd = 0, n_expert = 0;
+    bool loaded = false, failed = false;
+};
+std::mutex & g_cr_mtx = *new std::mutex();
+std::condition_variable & g_cr_cv = *new std::condition_variable();
+std::map<int, cpu_router> & g_cr = *new std::map<int, cpu_router>();
+struct cr_job { int il_next; std::vector<float> x; };
+std::deque<cr_job> & g_cr_q = *new std::deque<cr_job>();
+
+bool cr_load(cpu_router & r) {
+    if (r.loaded || r.failed) { return r.loaded; }
+    r.failed = true;
+    if (!r.w || r.w->ne[0] % 32 != 0) { return false; }
+    r.n_embd = r.w->ne[0]; r.n_expert = r.w->ne[1];
+    std::vector<float> wf((size_t) (r.n_embd * r.n_expert));
+    if (r.w->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(r.w, wf.data(), 0, wf.size() * sizeof(float));
+    } else if (r.w->type == GGML_TYPE_F16 || r.w->type == GGML_TYPE_BF16) {
+        std::vector<uint16_t> h(wf.size());
+        ggml_backend_tensor_get(r.w, h.data(), 0, h.size() * sizeof(uint16_t));
+        for (size_t i = 0; i < h.size(); ++i) {
+            wf[i] = r.w->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(h[i]) : ggml_bf16_to_fp32(ggml_bf16_t{ h[i] });
+        }
+    } else {
+        return false;
+    }
+    r.wq.resize((size_t) (r.n_expert * r.n_embd / 32));
+    cr_quantize(wf.data(), r.wq.data(), r.n_embd * r.n_expert);
+    if (r.b && r.b->type == GGML_TYPE_F32) {
+        r.bias.resize((size_t) r.n_expert);
+        ggml_backend_tensor_get(r.b, r.bias.data(), 0, r.bias.size() * sizeof(float));
+    }
+    r.loaded = true; r.failed = false;
+    return true;
+}
+
+void cr_worker() {
+    std::vector<cr_q8> xq;
+    std::vector<std::pair<float, int>> sc;
+    for (;;) {
+        cr_job j;
+        {
+            std::unique_lock<std::mutex> lk(g_cr_mtx);
+            g_cr_cv.wait(lk, [] { return !g_cr_q.empty(); });
+            j = std::move(g_cr_q.back());   // the newest layer only: older requests are stale
+            g_cr_q.clear();
+        }
+        cpu_router * r = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_cr_mtx);
+            auto it = g_cr.find(j.il_next);
+            if (it != g_cr.end()) { r = &it->second; }
+        }
+        if (!r || !g_cache || !g_store) { continue; }
+        if (!cr_load(*r) || (int64_t) j.x.size() != r->n_embd) { continue; }
+        xq.resize((size_t) (r->n_embd / 32));
+        cr_quantize(j.x.data(), xq.data(), r->n_embd);
+        sc.resize((size_t) r->n_expert);
+        const int64_t nbr = r->n_embd / 32;
+        for (int64_t e = 0; e < r->n_expert; ++e) {
+            const cr_q8 * we = r->wq.data() + e * nbr;
+            float d = 0.0f;
+            for (int64_t b = 0; b < nbr; ++b) {
+                int32_t si = 0;
+                for (int q = 0; q < 32; ++q) { si += (int32_t) we[b].qs[q] * (int32_t) xq[(size_t) b].qs[q]; }
+                d += (float) si * we[b].d * xq[(size_t) b].d;
+            }
+            // sqrt-softplus gating (DeepSeek-V4.x) plus the selection bias; only the order matters here
+            const float act = std::sqrt(std::log1p(std::exp(std::min(d, 30.0f))));
+            sc[(size_t) e] = { act + (r->bias.empty() ? 0.0f : r->bias[(size_t) e]), (int) e };
+        }
+        const int k = std::min<int>(r->k + 2, (int) sc.size());
+        std::partial_sort(sc.begin(), sc.begin() + k, sc.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        size_t li1 = SIZE_MAX;
+        for (size_t li = 0; li < g_cache->layers.size(); ++li) { if (g_cache->layers[li].pub.il == j.il_next) { li1 = li; break; } }
+        if (li1 == SIZE_MAX) { continue; }
+        std::lock_guard<std::mutex> lock(g_cache->mtx);
+        const auto & l1 = g_cache->layers[li1];
+        for (int q = 0; q < k; ++q) {
+            const int32_t x = sc[(size_t) q].second;
+            if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[(size_t) x] >= 0) { continue; }   // GPU cache has it
+            if (!g_store->resident(li1, x)) { g_store->prefetch(li1, x, nullptr, true); }   // the least-used slot may go
+        }
+    }
+}
+} // namespace
+
+void llama_moe_register_router(int il, const ggml_tensor * gate_inp, const ggml_tensor * exp_probs_b, int n_expert_used) {
+    static const bool on = [] { const char * e = std::getenv("FLE_MOE_CPU_PRED"); return e && atoi(e) != 0; }();
+    if (!on || !gate_inp) { return; }
+    std::lock_guard<std::mutex> lk(g_cr_mtx);
+    auto & r = g_cr[il];
+    if (!r.w) {
+        r.w = gate_inp; r.b = exp_probs_b; r.k = n_expert_used;
+        cr_load(r);   // now, while the graph is built: a first load in the predictor thread stalled the first requests
+    }
+}
+
+void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd) {
+    static const bool on = [] { const char * e = std::getenv("FLE_MOE_CPU_PRED"); return e && atoi(e) != 0; }();
+    if (!on || !x) { return; }
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(cr_worker).detach(); });
+    {
+        std::lock_guard<std::mutex> lk(g_cr_mtx);
+        if (g_cr.find(il + 1) == g_cr.end()) { return; }
+        g_cr_q.push_back({ il + 1, std::vector<float>(x, x + n_embd) });
+    }
+    g_cr_cv.notify_one();
+}

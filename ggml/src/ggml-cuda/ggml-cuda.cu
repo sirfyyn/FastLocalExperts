@@ -1900,6 +1900,10 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+// FLE: the slots of the MoE cache (moe_cache_up/gate/down.N). Past MMVQ batch sizes (hybrid prefill) a token can name the zero slot
+// several times; MMQ/MMF assume distinct experts per token, so these take the per-expert path (it tolerates the repeats)
+static bool fle_is_moe_cache_w(const ggml_tensor * t) { return strncmp(t->name, "moe_cache_", 10) == 0; }
+
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -1916,6 +1920,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
             return false;
         }
+    }
+
+    if (fle_is_moe_cache_w(src0)) {
+        return true;
     }
 
     if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
@@ -1988,12 +1996,12 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!fle_is_moe_cache_w(src0) && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!fle_is_moe_cache_w(src0) && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -2024,7 +2032,7 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
     std::vector<int32_t> tokens_per_expert(ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
-    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
+    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), (ne2 *n_expert_used + 1)* ne0*ts_dst_sorted);   // +1: FLE zero row
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
@@ -2043,6 +2051,19 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
                 }
             }
         }
+    }
+    // FLE: an id outside [0, ne02) (the MoE cache's zero slot past the view, hybrid prefill) contributes a zero row
+    const int64_t fle_n_valid = (int64_t) ids_to_sorted_host.size();
+    if (fle_n_valid != ne_get_rows) {
+        std::vector<bool> hit(ne_get_rows, false);
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                const int32_t e = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                if (e >= 0 && e < ne02) { hit[i12*n_expert_used + iex] = true; }
+            }
+        }
+        for (int64_t k = 0; k < ne_get_rows; ++k) { if (!hit[k]) { ids_from_sorted_host[k] = (int32_t) fle_n_valid; } }
+        ids_to_sorted_host.resize(ne_get_rows, 0);   // the extra gathered rows are never used
     }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
@@ -2109,6 +2130,9 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
         dst_data_cur  +=  dst_slice.nb[2];
     }
 
+    if (fle_n_valid != ne_get_rows) {
+        CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr + fle_n_valid*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
+    }
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),

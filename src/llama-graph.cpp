@@ -2069,6 +2069,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     float   fle_wscale     = 1.0f;            // fixed extra factor on the renormalised weights
     int64_t fle_layer_k = cparams.n_moe_active_experts;   // overridable per layer (--moe-active-layers)
     if (il >= 0 && (size_t) il < cparams.moe_active_layers.size() && cparams.moe_active_layers[il] > 0) {
+    if (il >= 0 && n_tokens <= 8) { llama_moe_register_router(il, gate_inp, exp_probs_b, (int) n_expert_used); }   // FLE_MOE_CPU_PRED
+
         fle_layer_k = cparams.moe_active_layers[il];
     }
     if (arch == LLM_ARCH_QWEN4EXP && norm_w && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
@@ -2251,7 +2253,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Measured: cache 24 without speculation +6.9 %, WITH speculation -2.8 %,
     // because it never engaged.
     //   FLE_MOE_CACHE_BATCH=off   restores the old guard (n_tokens==1 only); "aus" is the deprecated alias
-    //   FLE_MOE_CACHE_MAXTOK=N    sets the cap (default 8)
+    //   FLE_MOE_CACHE_MAXTOK=N    sets the cap (default 8); with FLE_MOE_POOL it is also the hybrid prefill size: a batch of up to N
+    //                             tokens computes the cached experts on the GPU and the rest on the CPU pool (only the routed
+    //                             experts are read), a larger one streams all experts to the GPU (op offload)
     static const int mc_maxtok = [] {
         const char * m = std::getenv("FLE_MOE_CACHE_BATCH");
         if (m && (std::string(m) == "off" || std::string(m) == "aus")) {
@@ -2259,7 +2263,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return 1;
         }
         const char * e = std::getenv("FLE_MOE_CACHE_MAXTOK");
-        const int n = (e && *e) ? std::max(1, atoi(e)) : 8;
+        const char * w = std::getenv("FLE_PREFILL_WINDOW");   // the prefill windows (llama-context) go through the cache too
+        const int n = std::max((e && *e) ? std::max(1, atoi(e)) : 8, (w && *w) ? atoi(w) : 0);
         LLAMA_LOG_INFO("[fle-moe-cache] guard OPEN up to n_tokens<=%d\n", n);
         return n;
     }();
@@ -2367,7 +2372,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // FLE_MOE_FUSED_CPU=1: gate, up, clamped SwiGLU and down of the CPU experts as one op (llama-moe-fused.cpp)
         static const bool fle_fused = [] { const char * e = std::getenv("FLE_MOE_FUSED_CPU"); return e && std::atoi(e) != 0; }();
         static const bool fle_pool_env = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && std::atoi(e) != 0; }();
-        if (fle_fused && (!fle_pool_env || cur->ne[2] <= 8) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        if (fle_fused && (!fle_pool_env || cur->ne[2] <= mc_maxtok) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
                 !up_exps_b && !gate_exps_b && !down_exps_b && type_op == LLM_FFN_SILU && !weight_before_ffn &&
                 il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && llm_arch_is_dsv4_family(arch)) {
             ggml_tensor * pred = fle_pred_ids;
