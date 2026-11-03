@@ -1,6 +1,6 @@
 # Adoptions from Strata
 
-Parts of FLE adopt ideas or code from Strata v0.1.39
+Parts of FLE adopt ideas or code from Strata v0.1.39 and v0.2.9 (repository state c62d5e3)
 (https://github.com/Niko1221/Strata), released under the MIT License:
 
     MIT License
@@ -21,3 +21,9 @@ Parts of FLE adopt ideas or code from Strata v0.1.39
     IN THE SOFTWARE.
 
 Every commit that adopts Strata code names the source file and lines in its commit message and in the header of the change.
+
+Adopted from Strata 0.2.9 (c62d5e3):
+- `ggml/src/ggml-cpu/arch/x86/quants.c`: the AVX-512 VNNI paths for IQ1_M (after `rows_m`), IQ2_XXS and IQ2_XS (after
+  `FmtX<16>`, `FmtX<17>` and `row_dot_x`) in `src/kernels/cpu/iq_avx512.cpp`; the IQ1_S path follows the same scheme.
+- `src/llama-expertstore.cpp`, `ggml/src/ggml-cpu/ggml-cpu.c`: the order of the asynchronous expert store (resident experts
+  first, each missing one when its read lands) after `cpu_experts` in `src/dsv41/ds4_model.cu`; own code.

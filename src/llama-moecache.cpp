@@ -1,4 +1,5 @@
 #include "llama-moecache.h"
+#include "llama-expertstore.h"
 
 #include <algorithm>
 
@@ -204,6 +205,10 @@ moe_cache * g_cache = nullptr;
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
+static llama_expert_store * g_store_raw = nullptr;   // never destroyed (crash at shutdown, 02.11.)
+struct g_store_ref { llama_expert_store * get() const { return g_store_raw; } llama_expert_store * operator->() const { return g_store_raw; } explicit operator bool() const { return g_store_raw != nullptr; } bool operator!() const { return g_store_raw == nullptr; } };
+static g_store_ref g_store;   // FLE_MOE_STORE_GB (store_init below)
+
 int parse_layer_from_name(const char * name) {
     // "blk.<il>.ffn_gate_exps.weight"
     if (strncmp(name, "blk.", 4) != 0) {
@@ -264,11 +269,43 @@ static void wn_willneed(const ggml_tensor * src, int32_t expert) {
 #endif
 }
 
+// ---- FLE_MOE_PREFETCH: read the predicted CPU-side experts of the next layer into the store while this layer computes ----------
+// The predicted ids come best-first. How many ranks are read adapts: the share of prefetched experts that the layer really used
+// (over the last 512 prefetches) moves the depth between 1 and the predicted k; nothing is read while the store's readers are busy.
+static void moe_pred_cb(const char * name, const struct ggml_tensor * pred, void * ud) {
+    moe_cache * mc = (moe_cache *) ud;
+    if (!g_store || !pred || !pred->data) { return; }
+    const int il = parse_layer_from_name(name);
+    size_t li1 = SIZE_MAX;
+    for (size_t li = 0; li < mc->layers.size(); ++li) { if (mc->layers[li].pub.il == il + 1) { li1 = li; break; } }
+    if (li1 == SIZE_MAX) { return; }
+    layer_state & l1 = mc->layers[li1];
+    const int64_t kmax = pred->ne[0];
+    static int depth = 3;
+    static uint64_t last_issued = 0, last_used = 0;
+    const auto & st = g_store->stats();
+    if (st.pre_issued - last_issued >= 512) {
+        const double used = (double) (st.pre_used - last_used) / (double) (st.pre_issued - last_issued);
+        if (used < 0.35 && depth > 1) { depth--; }
+        else if (used > 0.65 && depth < kmax) { depth++; }
+        last_issued = st.pre_issued; last_used = st.pre_used;
+    }
+    if (g_store->queue_len() > 24) { return; }   // the SSD is busy with demand reads: no guesses now
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    for (int64_t t = 0; t < pred->ne[1] && t < 1; ++t) {   // the first token of the batch (decode)
+        for (int64_t r = 0; r < std::min<int64_t>(kmax, depth); ++r) {
+            const int32_t x = *(const int32_t *) ((const char *) pred->data + t*pred->nb[1] + r*pred->nb[0]);
+            if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[x] >= 0) { continue; }   // in the GPU cache
+            g_store->prefetch(li1, x);
+        }
+    }
+}
+
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
     static const bool wn_on = std::getenv("FLE_MOE_WILLNEED_NOW") != nullptr;
-    if (wn_on && ids->ne[1] <= 4) {
+    if (wn_on && !g_store && ids->ne[1] <= 4) {
         const int il0 = parse_layer_from_name(name);
         layer_state * l0 = nullptr;
         for (auto & l : mc->layers) { if (l.pub.il == il0) { l0 = &l; break; } }
@@ -282,6 +319,65 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                     wn_willneed(l0->pub.up_src,   e);
                     wn_willneed(l0->pub.down_src, e);
                 }
+            }
+        }
+    }
+
+    if (g_store) {   // make this layer's CPU-side experts resident before they run (compute thread 0, the others wait)
+        const int il_s = parse_layer_from_name(name);
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            layer_state & l = mc->layers[li];
+            if (l.pub.il != il_s) { continue; }
+            int32_t want[64]; size_t nw = 0;
+            std::lock_guard<std::mutex> lock(mc->mtx);
+            for (int64_t t = 0; t < ids->ne[1] && nw < 64; ++t) {
+                for (int64_t i = 0; i < ids->ne[0] && nw < 64; ++i) {
+                    const int32_t x = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                    if (x < 0 || x >= (int32_t) l.expert_slot.size() || l.expert_slot[x] >= 0) { continue; }
+                    bool dup = false;
+                    for (size_t k = 0; k < nw; ++k) { if (want[k] == x) { dup = true; break; } }
+                    if (!dup) { want[nw++] = x; }
+                }
+            }
+            static std::vector<std::pair<int32_t, int32_t>> ev;
+            ev.clear();
+            g_store->ensure(li, want, nw, &ev);
+            // FLE_MOE_HOT_BIAS also for the store: resident CPU-side experts get the smaller bonus, given-up ones lose it
+            static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+            if (hb > 0.0f) {
+                auto set_hot = [&](layer_state & L, int32_t x, float v) {
+                    if (!L.pub.dev_bias || x < 0 || x >= (int32_t) L.expert_slot.size()) { return; }
+                    if (L.pub.hot_bias.empty()) { L.pub.hot_bias.assign(L.pub.bias_host.size(), 0.0f); }
+                    if (L.pub.hot_bias[(size_t) x] == v) { return; }
+                    L.pub.hot_bias[(size_t) x] = v;
+                    if (L.expert_slot[(size_t) x] < 0) { L.pub.bias_host[(size_t) x] = v; L.pub.bias_dirty = true; }
+                };
+                for (size_t k = 0; k < nw; ++k) { if (g_store->resident(li, want[k])) { set_hot(l, want[k], hb); } }
+                for (const auto & x : ev) { set_hot(mc->layers[(size_t) x.first], x.second, 0.0f); }
+            }
+            break;
+        }
+    }
+
+    // FLE_MOE_SHARE_EVERY=N: every N layer calls one line with the share of routed experts the GPU cache served (decode)
+    {
+        static const long share_every = [] { const char * e = std::getenv("FLE_MOE_SHARE_EVERY"); return (e && *e) ? atol(e) : 0L; }();
+        if (share_every > 0 && ids->ne[1] <= 4) {
+            static long calls = 0; static long long n_all = 0, n_gpu = 0;
+            const int ilx = parse_layer_from_name(name);
+            for (auto & l : mc->layers) {
+                if (l.pub.il != ilx) { continue; }
+                for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                    for (int64_t i = 0; i < ids->ne[0]; ++i) {
+                        const int32_t x = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                        if (x < 0 || x >= (int32_t) l.expert_slot.size()) { continue; }
+                        n_all++; if (l.expert_slot[x] >= 0) { n_gpu++; }
+                    }
+                }
+                break;
+            }
+            if (++calls % share_every == 0) {
+                std::fprintf(stderr, "[fle-moe-share] %ld calls: %lld routed, %.1f%% from the GPU cache\n", calls, n_all, 100.0 * n_gpu / std::max(1LL, n_all));
             }
         }
     }
@@ -631,14 +727,19 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
                 std::chrono::steady_clock::now() - b0).count();
         fle_slowdown_n++;
     }
+    // FLE_MOE_STORE_GB: the bytes from the RAM store when it holds the expert (the mmap pages are usually not in the page cache then)
+    int32_t st_slot = -1;
+    const char * st_src = g_store ? g_store->acquire(src, expert, &st_slot) : nullptr;
+    struct st_rel { int32_t s; ~st_rel() { if (s >= 0 && g_store) { g_store->release(s); } } } st_guard{ st_slot };
+    const char * src_bytes = st_src ? st_src : (const char *) src->data + (size_t) expert*sz;
     if (fle_up_every) {
         const auto t0 = std::chrono::steady_clock::now();
-        ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+        ggml_backend_tensor_set(dst_c, src_bytes, (size_t) slot*dst_c->nb[2], sz);
         fle_up_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         fle_up_pieces++;
         fle_up_bytes += (long long) sz;
     } else {
-        ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+        ggml_backend_tensor_set(dst_c, src_bytes, (size_t) slot*dst_c->nb[2], sz);
     }
 }
 
@@ -660,8 +761,12 @@ void upload_slice_async(ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
                 std::chrono::steady_clock::now() - b0).count();
         fle_slowdown_n++;
     }
+    int32_t st_slot = -1;
+    const char * st_src = g_store ? g_store->acquire(src, expert, &st_slot) : nullptr;
+    // pageable source: the call returns once the bytes are staged, so the slot can be released right after
     ggml_backend_tensor_set_async(fle_up_backend, dst_c,
-            (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+            st_src ? st_src : (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
+    if (st_slot >= 0) { g_store->release(st_slot); }
     if (fle_up_every) {
         fle_up_pieces++;
         fle_up_bytes += (long long) sz;
@@ -1025,6 +1130,60 @@ void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
 #else
     (void) mc; (void) pf;
 #endif
+}
+
+// ---- FLE_MOE_STORE_GB: RAM tier for the CPU-side experts (llama-expertstore.cpp) ---------------------------------------
+static void store_init(moe_cache * mc, const prof_file * pf) {
+    const char * e = std::getenv("FLE_MOE_STORE_GB");
+    if (!e || atof(e) <= 0.0 || mc->layers.empty()) { return; }
+    const char * th = std::getenv("FLE_MOE_STORE_THREADS");
+    std::vector<llama_expert_store_layer> in;
+    for (const auto & ls : mc->layers) { in.push_back({ ls.pub.il, { ls.pub.gate_src, ls.pub.up_src, ls.pub.down_src } }); }
+    g_store_raw = llama_expert_store::create(in, (size_t) (atof(e) * 1e9), (th && *th) ? std::max(1, atoi(th)) : 8).release();
+    if (!g_store) { return; }
+    // warm start: the hottest experts after the ones the GPU cache takes (as prof_hot_mlock), across layers by count
+    if (pf && pf->ok) {
+        struct cand { uint64_t cnt; int32_t li; int32_t x; };
+        std::vector<cand> cs;
+        for (size_t li = 0; li < mc->layers.size(); ++li) {
+            const auto & ls = mc->layers[li];
+            const prof_layer * pl = pf->find(ls.pub.il);
+            const int64_t n_expert = ls.pub.up_src->ne[2];
+            if (!pl || pl->cnt.size() != (size_t) n_expert) { continue; }
+            std::vector<int32_t> order((size_t) n_expert);
+            for (int32_t x = 0; x < (int32_t) n_expert; ++x) { order[(size_t) x] = x; }
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return pl->cnt[(size_t) a] > pl->cnt[(size_t) b]; });
+            for (int64_t k = ls.n_use; k < n_expert; ++k) {
+                const int32_t x = order[(size_t) k];
+                if (pl->cnt[(size_t) x] == 0) { break; }
+                cs.push_back({ pl->cnt[(size_t) x], (int32_t) li, x });
+            }
+        }
+        std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
+        std::vector<std::pair<int32_t, int32_t>> want;
+        for (const auto & c : cs) { want.push_back({ c.li, c.x }); }
+        const size_t n = g_store->preload(want);
+        static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
+        if (hb > 0.0f) {
+            for (size_t li = 0; li < mc->layers.size(); ++li) {
+                auto & L = mc->layers[li];
+                if (!L.pub.dev_bias) { continue; }
+                for (int32_t x = 0; x < (int32_t) L.expert_slot.size(); ++x) {
+                    if (!g_store->resident(li, x)) { continue; }
+                    if (L.pub.hot_bias.empty()) { L.pub.hot_bias.assign(L.pub.bias_host.size(), 0.0f); }
+                    L.pub.hot_bias[(size_t) x] = hb;
+                    if (L.expert_slot[(size_t) x] < 0) { L.pub.bias_host[(size_t) x] = hb; L.pub.bias_dirty = true; }
+                }
+            }
+        }
+        std::fprintf(stderr, "[fle-store] warm start: %zu experts (%.1f GB) in %.1f s\n", n,
+            g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
+    }
+    ggml_set_moe_data_callback(llama_expert_store::data_cb, g_store.get());
+    if (const char * e = std::getenv("FLE_MOE_STORE_ASYNC"); e && atoi(e) != 0) {
+        ggml_set_moe_ready_callback(llama_expert_store::ready_cb, g_store.get());   // resident experts first, misses as they land
+    }
+    ggml_set_moe_pred_callback(moe_pred_cb, mc);
 }
 
 void prof_prefill(moe_cache * mc, const prof_file & pf) {
@@ -1641,6 +1800,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             prof_prefill(mc, pf);
             prof_hot_mlock(mc, pf);
         }
+        store_init(mc, pf.ok ? &pf : nullptr);
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:
         // buffer -> buft -> device -> dev_init. This is not a workaround: the thread
@@ -2285,4 +2445,132 @@ void llama_moe_cache_profile_save() {
     if (mc->prof_dirty) {   // nothing new since the last save (or since start): leave the file alone
         prof_write(mc, "shutdown");
     }
+}
+
+
+// ---- FLE_MOE_CPU_PRED: the next layer's router on the CPU, reads ahead into the expert store (netcode-style prediction) ----------
+namespace {
+struct cr_q8 { float d; int8_t qs[32]; };   // Q8 block for the predictor only (float scale; not ggml's block_q8_0)
+void cr_quantize(const float * x, cr_q8 * y, int64_t n) {
+    for (int64_t b = 0; b < n / 32; ++b) {
+        float amax = 0.0f;
+        for (int q = 0; q < 32; ++q) { amax = std::max(amax, std::fabs(x[b*32 + q])); }
+        const float d = amax / 127.0f, id = d > 0.0f ? 1.0f / d : 0.0f;
+        y[b].d = d;
+        for (int q = 0; q < 32; ++q) { y[b].qs[q] = (int8_t) std::lrintf(x[b*32 + q] * id); }
+    }
+}
+struct cpu_router {
+    const ggml_tensor * w = nullptr; const ggml_tensor * b = nullptr; int k = 0;
+    std::vector<cr_q8> wq;   // [n_expert][n_embd/32]
+    std::vector<float> bias;
+    int64_t n_embd = 0, n_expert = 0;
+    bool loaded = false, failed = false;
+};
+std::mutex & g_cr_mtx = *new std::mutex();
+std::condition_variable & g_cr_cv = *new std::condition_variable();
+std::map<int, cpu_router> & g_cr = *new std::map<int, cpu_router>();
+struct cr_job { int il_next; std::vector<float> x; };
+std::deque<cr_job> & g_cr_q = *new std::deque<cr_job>();
+
+bool cr_load(cpu_router & r) {
+    if (r.loaded || r.failed) { return r.loaded; }
+    r.failed = true;
+    if (!r.w || r.w->ne[0] % 32 != 0) { return false; }
+    r.n_embd = r.w->ne[0]; r.n_expert = r.w->ne[1];
+    std::vector<float> wf((size_t) (r.n_embd * r.n_expert));
+    if (r.w->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(r.w, wf.data(), 0, wf.size() * sizeof(float));
+    } else if (r.w->type == GGML_TYPE_F16 || r.w->type == GGML_TYPE_BF16) {
+        std::vector<uint16_t> h(wf.size());
+        ggml_backend_tensor_get(r.w, h.data(), 0, h.size() * sizeof(uint16_t));
+        for (size_t i = 0; i < h.size(); ++i) {
+            wf[i] = r.w->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(h[i]) : ggml_bf16_to_fp32(ggml_bf16_t{ h[i] });
+        }
+    } else {
+        return false;
+    }
+    r.wq.resize((size_t) (r.n_expert * r.n_embd / 32));
+    cr_quantize(wf.data(), r.wq.data(), r.n_embd * r.n_expert);
+    if (r.b && r.b->type == GGML_TYPE_F32) {
+        r.bias.resize((size_t) r.n_expert);
+        ggml_backend_tensor_get(r.b, r.bias.data(), 0, r.bias.size() * sizeof(float));
+    }
+    r.loaded = true; r.failed = false;
+    return true;
+}
+
+void cr_worker() {
+    std::vector<cr_q8> xq;
+    std::vector<std::pair<float, int>> sc;
+    for (;;) {
+        cr_job j;
+        {
+            std::unique_lock<std::mutex> lk(g_cr_mtx);
+            g_cr_cv.wait(lk, [] { return !g_cr_q.empty(); });
+            j = std::move(g_cr_q.back());   // the newest layer only: older requests are stale
+            g_cr_q.clear();
+        }
+        cpu_router * r = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_cr_mtx);
+            auto it = g_cr.find(j.il_next);
+            if (it != g_cr.end()) { r = &it->second; }
+        }
+        if (!r || !g_cache || !g_store) { continue; }
+        if (!cr_load(*r) || (int64_t) j.x.size() != r->n_embd) { continue; }
+        xq.resize((size_t) (r->n_embd / 32));
+        cr_quantize(j.x.data(), xq.data(), r->n_embd);
+        sc.resize((size_t) r->n_expert);
+        const int64_t nbr = r->n_embd / 32;
+        for (int64_t e = 0; e < r->n_expert; ++e) {
+            const cr_q8 * we = r->wq.data() + e * nbr;
+            float d = 0.0f;
+            for (int64_t b = 0; b < nbr; ++b) {
+                int32_t si = 0;
+                for (int q = 0; q < 32; ++q) { si += (int32_t) we[b].qs[q] * (int32_t) xq[(size_t) b].qs[q]; }
+                d += (float) si * we[b].d * xq[(size_t) b].d;
+            }
+            // sqrt-softplus gating (DeepSeek-V4.x) plus the selection bias; only the order matters here
+            const float act = std::sqrt(std::log1p(std::exp(std::min(d, 30.0f))));
+            sc[(size_t) e] = { act + (r->bias.empty() ? 0.0f : r->bias[(size_t) e]), (int) e };
+        }
+        const int k = std::min<int>(r->k + 2, (int) sc.size());
+        std::partial_sort(sc.begin(), sc.begin() + k, sc.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        size_t li1 = SIZE_MAX;
+        for (size_t li = 0; li < g_cache->layers.size(); ++li) { if (g_cache->layers[li].pub.il == j.il_next) { li1 = li; break; } }
+        if (li1 == SIZE_MAX) { continue; }
+        std::lock_guard<std::mutex> lock(g_cache->mtx);
+        const auto & l1 = g_cache->layers[li1];
+        for (int q = 0; q < k; ++q) {
+            const int32_t x = sc[(size_t) q].second;
+            if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[(size_t) x] >= 0) { continue; }   // GPU cache has it
+            if (!g_store->resident(li1, x)) { g_store->prefetch(li1, x, nullptr, true); }   // the least-used slot may go
+        }
+    }
+}
+} // namespace
+
+void llama_moe_register_router(int il, const ggml_tensor * gate_inp, const ggml_tensor * exp_probs_b, int n_expert_used) {
+    static const bool on = [] { const char * e = std::getenv("FLE_MOE_CPU_PRED"); return e && atoi(e) != 0; }();
+    if (!on || !gate_inp) { return; }
+    std::lock_guard<std::mutex> lk(g_cr_mtx);
+    auto & r = g_cr[il];
+    if (!r.w) {
+        r.w = gate_inp; r.b = exp_probs_b; r.k = n_expert_used;
+        cr_load(r);   // now, while the graph is built: a first load in the predictor thread stalled the first requests
+    }
+}
+
+void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd) {
+    static const bool on = [] { const char * e = std::getenv("FLE_MOE_CPU_PRED"); return e && atoi(e) != 0; }();
+    if (!on || !x) { return; }
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(cr_worker).detach(); });
+    {
+        std::lock_guard<std::mutex> lk(g_cr_mtx);
+        if (g_cr.find(il + 1) == g_cr.end()) { return; }
+        g_cr_q.push_back({ il + 1, std::vector<float>(x, x + n_embd) });
+    }
+    g_cr_cv.notify_one();
 }

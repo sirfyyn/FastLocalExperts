@@ -293,6 +293,10 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(cons
     return std::make_unique<graph>(*this, params);
 }
 
+// FLE_ENGRAM_PREVIEW: the newest tokens of the last single-token step (newest first) and its position, for the next step's hash
+static std::vector<llama_token> g_dsv41_hist;
+static int64_t                  g_dsv41_hist_pos = -1;
+
 // Engram n-gram hash (engram.py NgramHashState.forward)
 int llama_model_deepseek41::engram_index(int il) const {
     const auto it = std::find(engram_layers.begin(), engram_layers.end(), il);
@@ -339,6 +343,58 @@ void llama_model_deepseek41::engram_hash(int e, const llama_ubatch & ubatch, con
     }
 }
 
+void llama_model_deepseek41::engram_preview(const float * logits, int64_t n_vocab) const {
+    static const int k = [] { const char * e = std::getenv("FLE_ENGRAM_PREVIEW"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+    if (k <= 0 || !logits || engram_layers.empty() || g_dsv41_hist.empty() || g_dsv41_hist_pos < 0) { return; }
+    // the k largest logits (k is small: one pass)
+    std::vector<std::pair<float, llama_token>> best((size_t) k, { -INFINITY, -1 });
+    for (int64_t t = 0; t < n_vocab; ++t) {
+        if (logits[t] <= best.back().first) { continue; }
+        best.back() = { logits[t], (llama_token) t };
+        std::sort(best.begin(), best.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    }
+    const int64_t n_gram = engram_max_ngram;
+    const int64_t n_head = engram_n_head;
+    const int64_t n_cols = engram_n_cols();
+    const int64_t pos    = g_dsv41_hist_pos + 1;
+    const auto cid = [&](llama_token t) -> int64_t {
+        return t < 0 || t >= (llama_token) engram_token_map.size() ? DSV41_ENGRAM_DEAD : engram_token_map[t];
+    };
+    std::vector<std::vector<int32_t>> rows(engram_layers.size());
+    std::vector<uint64_t> toks((size_t) n_gram);
+    for (const auto & b : best) {
+        if (b.second < 0) { continue; }
+        for (size_t e = 0; e < engram_layers.size(); ++e) {
+            const uint64_t * mult   = engram_mult.data()    + e*n_gram;
+            const uint64_t * primes = engram_primes.data()  + e*n_cols;
+            const uint64_t * offs   = engram_offsets.data() + e*n_cols;
+            const int64_t    pad    = engram_token_map[engram_pad_id];
+            int64_t c = cid(b.second);
+            bool blocked = c == DSV41_ENGRAM_DEAD;
+            toks[0] = blocked ? pad : c;
+            for (int64_t s = 1; s < n_gram; ++s) {   // the same rule as engram_hash: shift s is the token s steps back
+                c = pos - s < 0 || (size_t) (s - 1) >= g_dsv41_hist.size() ? DSV41_ENGRAM_DEAD : cid(g_dsv41_hist[(size_t) (s - 1)]);
+                blocked = blocked || c == DSV41_ENGRAM_DEAD;
+                toks[s] = blocked ? pad : c;
+            }
+            uint64_t rolling = toks[0]*mult[0];
+            for (int64_t o = 1; o < n_gram; ++o) {
+                rolling ^= toks[o]*mult[o];
+                for (int64_t h = 0; h < n_head; ++h) {
+                    const int64_t col = (o - 1)*n_head + h;
+                    rows[e].push_back((int32_t) (rolling % primes[col] + offs[col]));
+                }
+            }
+        }
+    }
+    for (size_t e = 0; e < engram_layers.size(); ++e) {
+        const ggml_tensor * table = !per_layer_tok_embd_layers.empty() ? per_layer_tok_embd_layers[e] : per_layer_tok_embd;
+        if (table && can_prefetch.count(table) && !rows[e].empty()) {
+            llama_prefetch_rows(table, rows[e].data(), rows[e].size());
+        }
+    }
+}
+
 // cand_pin: +1e30 (the reference uses +inf) on the block holding each query's newest compressed row, so a partly
 // filled block always survives; a finite pin keeps fully masked blocks at -inf instead of NaN
 class llm_graph_input_dsv41 : public llm_graph_input_i {
@@ -368,6 +424,13 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         // a token shared by several sequences has the same history in each, so its first sequence resolves it
         std::vector<llama_token> prev;
         mctx->get_raw()->get_prev_tokens(*ubatch, model.engram_max_ngram - 1, prev);
+        if (ubatch->n_tokens >= 1 && ubatch->token) {   // the last token of the ubatch and its predecessors, newest first
+            const int64_t n_prev = model.engram_max_ngram - 1;
+            const int64_t i      = ubatch->n_tokens - 1;
+            g_dsv41_hist.assign(1, ubatch->token[i]);
+            for (int64_t s = 1; s < n_prev; ++s) { g_dsv41_hist.push_back(prev[i*n_prev + (n_prev - s)]); }
+            g_dsv41_hist_pos = ubatch->pos[i];
+        }
         // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
         std::vector<std::vector<int32_t>> ids(engram_ids.size());
         std::vector<int32_t> all;
@@ -398,7 +461,9 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         if (fle_engram_cold && ubatch->n_tokens <= 8) {
             static std::vector<std::pair<uintptr_t, size_t>> prev;
             static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+#ifdef MADV_COLD
             for (const auto & r : prev) { madvise((void *) r.first, r.second, MADV_COLD); }
+#endif
             prev.clear();
             for (size_t e = 0; e < engram_ids.size(); ++e) {
                 const ggml_tensor * table = !model.per_layer_tok_embd_layers.empty() ? model.per_layer_tok_embd_layers[e] : model.per_layer_tok_embd;
@@ -932,6 +997,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     // single-pass mHC: the pre-mix used to collapse the stream lags one sublayer
     ggml_tensor * pre_prev = nullptr;
 
+    // FLE expert deferral (FLE_MOE_DEFER): the CPU part of the previous layer's routed experts, added one layer later
+    ggml_tensor * defer_experts = nullptr;
+    ggml_tensor * defer_weights = nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -1018,6 +1087,24 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
             fle_early_extra = ffn_shexp;
         }
 
+        // FLE expert prediction (FLE_MOE_PREFETCH=k): the next layer's router on this layer's FFN input (decode only); the expert store
+        // reads the predicted CPU-side experts ahead while this layer computes
+        {
+            static const int fle_pf_k = [] { const char * e = std::getenv("FLE_MOE_PREFETCH"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+            if (fle_pf_k > 0 && il + 1 < n_layer && n_tokens <= 8 &&
+                hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS && model.layers[il + 1].ffn_gate_inp && model.layers[il + 1].ffn_exp_probs_b) {
+                const auto & nl = model.layers[il + 1];
+                ggml_tensor * pl = build_lora_mm(nl.ffn_gate_inp, cur);
+                ggml_tensor * pp = ggml_sqrt(ctx0, ggml_softplus(ctx0, pl));   // the deepseek41 scoring (sqrt-softplus), then the selection bias
+                pp = ggml_add(ctx0, pp, nl.ffn_exp_probs_b);
+                fle_pred_ids = ggml_argsort_top_k(ctx0, pp, std::min<int>(fle_pf_k, (int) n_expert));
+                cb(fle_pred_ids, "ffn_moe_pred_next", il);
+            }
+        }
+
+        // FLE expert deferral: the previous layer's deferred CPU experts are already in the graph (placed right after its merge, below)
+        fle_defer_pending = nullptr;
+
         // the reference normalizes only when it routes to more than one expert
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
@@ -1034,6 +1121,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         fle_early_extra = nullptr;
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
+        // FLE expert deferral: add the previous layer's CPU experts here, hand this layer's on (the last layer adds its own)
+        cur = fle_defer_add(cur, defer_experts, defer_weights, hparams.n_expert_used(), il);
+        defer_experts = fle_defer_experts;
+        defer_weights = fle_defer_weights;
+        fle_defer_experts = nullptr;
+        fle_defer_weights = nullptr;
+        if (defer_experts && il < n_layer - 1) {
+            // place this layer's deferred CPU experts right after its merge: with FLE_SCHED_ASYNC_CPU the CPU computes them while the GPU
+            // runs the next layer's attention, router and hit chain; the next layer adds them
+            ggml_build_forward_expand(gf, cur);
+            ggml_build_forward_expand(gf, defer_experts);
+        }
+        if (il == n_layer - 1) {
+            cur = fle_defer_add(cur, defer_experts, defer_weights, hparams.n_expert_used(), il);
+            defer_experts = nullptr;
+            defer_weights = nullptr;
+        }
         cb(cur, "ffn_out", il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);

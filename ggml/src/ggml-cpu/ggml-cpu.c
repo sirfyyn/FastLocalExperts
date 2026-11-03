@@ -1655,6 +1655,10 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// FLE: pass of each expert in mul_mat_id with an asynchronous expert store (0 = bytes there, 1 = still being read)
+static uint8_t fle_moe_late_arr[1024];
+static inline void fle_moe_late_set(int a, bool late) { fle_moe_late_arr[a] = late ? 1 : 0; }
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1666,6 +1670,7 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
+    const int64_t fle_t_in = ggml_time_us();   // FLE_MMID_PROF (see below)
     const int nth = params->nth;
 
     const enum ggml_type type = src0->type;
@@ -1797,6 +1802,11 @@ static void ggml_compute_forward_mul_mat_id(
             if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
                 moe_obs_cb(src0->name, ids, moe_obs_ud);
             }
+            void * moe_pred_ud = NULL;
+            ggml_moe_pred_cb_t moe_pred_cb = ggml_get_moe_pred_callback(&moe_pred_ud);
+            if (moe_pred_cb && dst->src[4] && dst->src[4]->type == GGML_TYPE_I32) {
+                moe_pred_cb(src0->name, dst->src[4], moe_pred_ud);
+            }
         }
 
         // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
@@ -1835,6 +1845,20 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    // FLE_MMID_PROF=N: every N calls of mul_mat_id (thread 0) one line with the mean times of its phases: routing/obs
+    // (grouping, expert cache, store requests), pass 0 (experts in RAM), pass 1 (experts whose reads were still running)
+    static int fle_mp_every = -1;
+    if (fle_mp_every < 0) { const char * e = getenv("FLE_MMID_PROF"); fle_mp_every = (e && *e) ? atoi(e) : 0; }
+    const int64_t fle_t_obs = (ith == 0 && fle_mp_every > 0) ? ggml_time_us() : 0;
+
+    if (ith == 0) {
+        void * rud = NULL;
+        const ggml_moe_ready_cb_t rcb = ggml_get_moe_data_callback(NULL) && n_as <= 1024 ? ggml_get_moe_ready_callback(&rud) : NULL;
+        if (rcb) {
+            for (int a = 0; a < n_as; ++a) { fle_moe_late_set(a, matrix_row_counts[a] > 0 && !rcb(src0, a, rud)); }
+        }
+    }
+
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
@@ -1843,10 +1867,25 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    void * moe_data_ud = NULL;
+    const ggml_moe_data_cb_t moe_data_cb = ggml_get_moe_data_callback(&moe_data_ud);
+    void * moe_ready_ud = NULL;
+    const ggml_moe_ready_cb_t moe_ready_cb = moe_data_cb && n_as <= 1024 ? ggml_get_moe_ready_callback(&moe_ready_ud) : NULL;
+    // the pass of each expert is decided once (thread 0, before the barrier above), so every thread walks the same experts
+    const uint8_t * fle_moe_late = fle_moe_late_arr;
+
+    // FLE: with an asynchronous expert store, pass 0 computes the experts whose bytes are there, pass 1 the ones still being read
+    // (data_cb waits for each of them), so the reads overlap the compute instead of blocking the whole layer
+    int64_t fle_t_pass[3] = { 0, 0, 0 };
+    if (ith == 0 && fle_mp_every > 0) { fle_t_pass[0] = ggml_time_us(); }
+    for (int pass = 0; pass < (moe_ready_cb ? 2 : 1); ++pass, (ith == 0 && fle_mp_every > 0) ? (void) (fle_t_pass[pass] = ggml_time_us()) : (void) 0)
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+        if (moe_ready_cb && fle_moe_late[cur_a] != pass) {
             continue;
         }
 
@@ -1858,6 +1897,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (moe_data_cb) {   // FLE expert store: the same bytes from the RAM store instead of the mmap
+            const void * p = moe_data_cb(src0, cur_a, moe_data_ud);
+            if (p) { src0_cur = (const char *) p; }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1910,6 +1953,31 @@ static void ggml_compute_forward_mul_mat_id(
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
     }
+    if (ith == 0 && fle_mp_every > 0) {
+        static int64_t n_c = 0, s_obs = 0, s_p0 = 0, s_p1 = 0, s_all = 0;
+        static int64_t by_n_us[5] = {0}, by_n_bytes[5] = {0}, by_n_cnt[5] = {0};   // calls by number of CPU-side experts (0..3, 4+)
+        const int64_t t_end = ggml_time_us();
+        const bool two = moe_ready_cb != NULL;
+        n_c++; s_obs += fle_t_pass[0] - fle_t_in; s_p0 += fle_t_pass[1] - fle_t_pass[0];
+        s_p1 += two ? fle_t_pass[2] - fle_t_pass[1] : 0; s_all += t_end - fle_t_in;
+        // bytes this call read: one weight matrix per CPU-side expert (those with rows here: GPU-cached ones were zeroed above)
+        int n_cpu = 0;
+        for (int a = 0; a < n_as; ++a) { if (matrix_row_counts[a] > 0 && !(dst->src[3] && ((const int32_t *) dst->src[3]->data)[a] != ggml_get_op_params_i32(dst, 0))) { n_cpu++; } }
+        const int bi = n_cpu < 4 ? n_cpu : 4;
+        by_n_cnt[bi]++; by_n_us[bi] += t_end - fle_t_in; by_n_bytes[bi] += (int64_t) n_cpu * (int64_t) nb02;
+        if (n_c % fle_mp_every == 0) {
+            fprintf(stderr, "[fle-mmid] %lld calls: per call %.1f us (routing/obs/store %.1f, pass 0 %.1f, pass 1 %.1f)\n", (long long) n_c,
+                    (double) s_all / fle_mp_every, (double) s_obs / fle_mp_every, (double) s_p0 / fle_mp_every, (double) s_p1 / fle_mp_every);
+            for (int k = 0; k < 5; ++k) {
+                if (!by_n_cnt[k]) { continue; }
+                fprintf(stderr, "[fle-mmid]   %d%s CPU experts: %lld calls, %.1f us each, %.2f GB/s\n", k, k == 4 ? "+" : "", (long long) by_n_cnt[k],
+                        (double) by_n_us[k] / by_n_cnt[k], by_n_us[k] ? (double) by_n_bytes[k] / (double) by_n_us[k] / 1e3 : 0.0);
+            }
+            s_obs = s_p0 = s_p1 = s_all = 0;
+            for (int k = 0; k < 5; ++k) { by_n_us[k] = by_n_bytes[k] = by_n_cnt[k] = 0; }
+        }
+    }
+    (void) fle_t_obs;
 }
 
 /////////////////////////////////

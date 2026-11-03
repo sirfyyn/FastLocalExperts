@@ -218,6 +218,8 @@ struct llama_context {
             int64_t                          ndata_in_loop,
             int64_t                          t_loop_start);
 
+    bool fle_engram_preview_pending = false;   // FLE_ENGRAM_PREVIEW: set by decode, used by synchronize
+
 private:
     //
     // output
@@ -353,6 +355,8 @@ private:
     uint32_t            fle_lend_min  = 0;       // calls with at least this many tokens use the large ubatch
     size_t              fle_lend_rsv  = 0;       // extra bytes asked on top of the measured need
     bool                fle_big       = false;   // compute buffers currently sized for cparams.n_ubatch
+    uint32_t            fle_win       = 0;       // FLE_PREFILL_WINDOW: a short prompt goes through in windows of this many tokens
+    uint32_t            fle_win_max   = 0;       // ... when the call has at most this many tokens (FLE_PREFILL_WINDOW_MAX)
     bool                fle_measured  = false;
     std::vector<size_t> fle_big_size;            // per backend: compute buffer of the large ubatch (measured once)
     size_t              fle_need      = 0;       // device bytes the large ubatch needs beyond the small one

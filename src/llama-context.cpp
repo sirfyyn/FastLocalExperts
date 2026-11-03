@@ -1,6 +1,7 @@
 #include <vector>
 #include <algorithm>
 #include "llama-context.h"
+#include "models/models.h"
 #include <map>
 
 #include "llama-moecache.h"
@@ -861,6 +862,16 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // FLE_PREFILL_WINDOW=W: a call of 2..FLE_PREFILL_WINDOW_MAX tokens (default 768) runs in ubatches of W tokens, the decode path
+    // (GPU expert cache + CPU pool, MMVQ, CUDA graphs) reads only the routed experts; above it the large ubatch streams all of them.
+    // Measured 03.11. (ISTA IQ2_XXS, 59 tokens): W=16 1.45 s, W=8 1.56 s, one ubatch 17.2 s. The cache guard follows W (llama-graph).
+    if (const char * e = std::getenv("FLE_PREFILL_WINDOW"); e && atoi(e) > 1) {
+        fle_win     = (uint32_t) atoi(e);
+        const char * m = std::getenv("FLE_PREFILL_WINDOW_MAX");
+        fle_win_max = (m && atoi(m) > 0) ? (uint32_t) atoi(m) : 768;
+        LLAMA_LOG_INFO("%s: [fle-window] calls of up to %u tokens in ubatches of %u\n", __func__, fle_win_max, fle_win);
+    }
+
     // Patch 48: -ub is the large prefill ubatch; outside a lend the compute buffers are sized for FLE_UBATCH_SMALL
     if (llama_moe_cache_lend_enabled()) {
         auto env_u = [](const char * name, long dflt) { const char * e = std::getenv(name); return e && *e ? std::max(1L, atol(e)) : dflt; };
@@ -1465,6 +1476,15 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    // FLE_ENGRAM_PREVIEW (deepseek41): the logits of the last single-output step are on the host now, before sampling
+    if (fle_engram_preview_pending) {
+        fle_engram_preview_pending = false;
+        const auto * m41 = dynamic_cast<const llama_model_deepseek41 *>(&model);
+        if (m41 && logits.data) {
+            m41->engram_preview(logits.data, model.vocab.n_tokens());
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -2582,7 +2602,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, fle_ub_eff(), output_all);
+        const uint32_t fle_ub = fle_win > 0 && n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
+        mctx = memory->init_batch(*balloc, fle_ub, output_all);
         if (!mctx) {
             return -2;
         }
@@ -2625,6 +2646,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
+    {
+        static const bool fle_ep = [] { const char * e = std::getenv("FLE_ENGRAM_PREVIEW"); return e && std::atoi(e) > 0; }();
+        fle_engram_preview_pending = fle_ep && model.arch == LLM_ARCH_DEEPSEEK41 && n_outputs_all == 1;
+    }
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
