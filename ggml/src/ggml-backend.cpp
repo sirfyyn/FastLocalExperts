@@ -1744,10 +1744,15 @@ static void fle_async_worker() {
         static const bool fle_pool = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && atoi(e) != 0; }();
         static const int fle_pool_restore = [] { const char * e = std::getenv("FLE_MOE_POOL_RESTORE"); return (e && *e) ? atoi(e) : 16; }();
         typedef void (*fle_set_nt_t)(ggml_backend_t, int);
-        static fle_set_nt_t fle_set_nt = [] {
-            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU");
-            return reg ? (fle_set_nt_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads") : (fle_set_nt_t) NULL;
-        }();
+        // looked up through the job's own backend: ggml_backend_reg_by_name lives in ggml.dll, not in ggml-base (Windows link)
+        static fle_set_nt_t fle_set_nt = NULL;
+        static bool fle_set_nt_done = false;   // the worker is one thread
+        if (fle_pool && !fle_set_nt_done) {
+            fle_set_nt_done = true;
+            ggml_backend_dev_t dv = ggml_backend_get_device(j->backend);
+            ggml_backend_reg_t reg = dv ? ggml_backend_dev_backend_reg(dv) : NULL;
+            fle_set_nt = reg ? (fle_set_nt_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads") : (fle_set_nt_t) NULL;
+        }
         bool fle_one = false;
         if (fle_pool && fle_set_nt) {
             for (int k = 0; k < j->graph->n_nodes; ++k) {
