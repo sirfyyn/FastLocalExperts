@@ -724,8 +724,6 @@ struct fle_up_timer {
     }
 };
 
-static void gpu_pageout(const ggml_tensor * src, int32_t expert);
-
 void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
     const size_t sz = src->nb[2];
     if ((size_t) slot*dst_c->nb[2] + sz > ggml_nbytes(dst_c) || (size_t) expert*sz + sz > ggml_nbytes(src)) {
@@ -758,7 +756,6 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
     } else {
         ggml_backend_tensor_set(dst_c, src_bytes, (size_t) slot*dst_c->nb[2], sz);
     }
-    if (!st_src) { gpu_pageout(src, expert); }
 }
 
 void upload_slice_async(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
@@ -784,7 +781,7 @@ void upload_slice_async(ggml_tensor * dst_c, const ggml_tensor * src, int32_t ex
     // pageable source: the call returns once the bytes are staged, so the slot can be released right after
     ggml_backend_tensor_set_async(fle_up_backend, dst_c,
             st_src ? st_src : (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
-    if (st_slot >= 0) { g_store->release(st_slot); } else { gpu_pageout(src, expert); }
+    if (st_slot >= 0) { g_store->release(st_slot); }
     if (fle_up_every) {
         fle_up_pieces++;
         fle_up_bytes += (long long) sz;
@@ -1074,26 +1071,6 @@ bool prof_write(moe_cache * mc, const char * reason) {
     return true;
 }
 
-// FLE_MOE_GPU_PAGEOUT=1: once an expert slice sits in a GPU slot, its host pages are pushed out of the page cache
-// (madvise MADV_PAGEOUT on the whole pages inside the slice), so the RAM holds more of the CPU-side experts instead of
-// copies of what the GPU already has. If the expert later leaves the GPU, the next read comes from the NVMe again.
-static void gpu_pageout(const ggml_tensor * src, int32_t expert) {
-#if defined(__linux__)
-#ifndef MADV_PAGEOUT
-#define MADV_PAGEOUT 21
-#endif
-    static const bool on = [] { const char * e = std::getenv("FLE_MOE_GPU_PAGEOUT"); return e && atoi(e) != 0; }();
-    if (!on || !src || !src->data) { return; }
-    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
-    const uintptr_t a  = (uintptr_t) src->data + (uintptr_t) expert * src->nb[2];
-    const uintptr_t a0 = (a + pg - 1) & ~(pg - 1);                 // whole pages only: neighbours keep theirs
-    const uintptr_t a1 = (a + src->nb[2]) & ~(pg - 1);
-    if (a1 > a0) { madvise((void *) a0, a1 - a0, MADV_PAGEOUT); }
-#else
-    (void) src; (void) expert;
-#endif
-}
-
 // One slot copy at start-up: same bounds check as upload_slice, but no brake and no counters.
 void prefill_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
     const size_t sz = src->nb[2];
@@ -1102,7 +1079,6 @@ void prefill_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert,
         return;
     }
     ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
-    gpu_pageout(src, expert);
 }
 
 // Start-up fill, runs inside llama_moe_cache_init after the tables exist and before the worker thread and the
