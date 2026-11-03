@@ -2253,7 +2253,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // Measured: cache 24 without speculation +6.9 %, WITH speculation -2.8 %,
     // because it never engaged.
     //   FLE_MOE_CACHE_BATCH=off   restores the old guard (n_tokens==1 only); "aus" is the deprecated alias
-    //   FLE_MOE_CACHE_MAXTOK=N    sets the cap (default 8)
+    //   FLE_MOE_CACHE_MAXTOK=N    sets the cap (default 8); with FLE_MOE_POOL it is also the hybrid prefill size: a batch of up to N
+    //                             tokens computes the cached experts on the GPU and the rest on the CPU pool (only the routed
+    //                             experts are read), a larger one streams all experts to the GPU (op offload)
     static const int mc_maxtok = [] {
         const char * m = std::getenv("FLE_MOE_CACHE_BATCH");
         if (m && (std::string(m) == "off" || std::string(m) == "aus")) {
@@ -2369,7 +2371,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // FLE_MOE_FUSED_CPU=1: gate, up, clamped SwiGLU and down of the CPU experts as one op (llama-moe-fused.cpp)
         static const bool fle_fused = [] { const char * e = std::getenv("FLE_MOE_FUSED_CPU"); return e && std::atoi(e) != 0; }();
         static const bool fle_pool_env = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && std::atoi(e) != 0; }();
-        if (fle_fused && (!fle_pool_env || cur->ne[2] <= 8) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        if (fle_fused && (!fle_pool_env || cur->ne[2] <= mc_maxtok) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
                 !up_exps_b && !gate_exps_b && !down_exps_b && type_op == LLM_FFN_SILU && !weight_before_ffn &&
                 il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && llm_arch_is_dsv4_family(arch)) {
             ggml_tensor * pred = fle_pred_ids;
