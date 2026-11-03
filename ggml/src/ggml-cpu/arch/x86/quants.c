@@ -2759,6 +2759,32 @@ static const int8_t keven_signs_q2xs[1024] = {
 };
 #endif
 
+
+#if defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__AVX512VPOPCNTDQ__) && defined(__AVX512VL__)
+// FLE: IQ2_XXS / IQ2_XS rows in 512-bit lanes (after Strata, src/kernels/cpu/iq_avx512.cpp FmtX<16>/<17> + row_dot_x, MIT): 64 values
+// a step, the sign mask from the 7-bit index plus its popcount parity, VNNI accumulation; the integer sums fold to ggml's eight AVX2
+// lanes and accumulate in the same float order, so the result is ggml's vec_dot bit for bit. FLE_IQ512=0 turns it off.
+static int fle_iq512_on(void) {
+    static int on = -1;
+    if (on < 0) { const char * e = getenv("FLE_IQ512"); on = (e && *e) ? atoi(e) != 0 : 1; }
+    return on;
+}
+static inline __m512i fle_scales4(int s0, int s1, int s2, int s3) {
+    const __m512i idx = _mm512_set_epi16(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    const uint64_t packed = (uint64_t) (uint16_t) s0 | ((uint64_t) (uint16_t) s1 << 16) | ((uint64_t) (uint16_t) s2 << 32) | ((uint64_t) (uint16_t) s3 << 48);
+    return _mm512_permutexvar_epi16(idx, _mm512_set1_epi64((long long) packed));
+}
+static inline __mmask64 fle_sign_mask_from_idx(__m256i si) {
+    const __m256i par = _mm256_slli_epi32(_mm256_and_si256(_mm256_popcnt_epi32(si), _mm256_set1_epi32(1)), 7);
+    return _cvtu64_mask64((uint64_t) _mm_cvtsi128_si64(_mm256_cvtepi32_epi8(_mm256_or_si256(si, par))));
+}
+static inline __m256i fle_sign_idx_xxs(uint32_t lo4, uint32_t hi4) {
+    const __m256i w = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi32((int) lo4)), _mm_set1_epi32((int) hi4), 1);
+    return _mm256_and_si256(_mm256_srlv_epi32(w, _mm256_setr_epi32(0, 7, 14, 21, 0, 7, 14, 21)), _mm256_set1_epi32(127));
+}
+#define FLE_IQ2_512 1
+#endif
+
 void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(n % QK_K == 0);
     assert(nrc == 1);
@@ -2771,6 +2797,36 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const 
     const block_q8_K    * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(FLE_IQ2_512)
+    if (fle_iq512_on()) {
+        const __m512i zero = _mm512_setzero_si512();
+        __m256 accf = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t * blk = (const uint8_t *) &x[i];
+            __m512i acci = zero;
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t * q = blk + 2 + 16*j;
+                uint32_t a0, a1, b0, b1;
+                memcpy(&a0, q, 4); memcpy(&a1, q + 4, 4); memcpy(&b0, q + 8, 4); memcpy(&b1, q + 12, 4);
+                const __m512i g = _mm512_set_epi64((long long) iq2xxs_grid[b0 >> 24], (long long) iq2xxs_grid[(b0 >> 16) & 255],
+                                                   (long long) iq2xxs_grid[(b0 >> 8) & 255], (long long) iq2xxs_grid[b0 & 255],
+                                                   (long long) iq2xxs_grid[a0 >> 24], (long long) iq2xxs_grid[(a0 >> 16) & 255],
+                                                   (long long) iq2xxs_grid[(a0 >> 8) & 255], (long long) iq2xxs_grid[a0 & 255]);
+                const __mmask64 m = fle_sign_mask_from_idx(fle_sign_idx_xxs(a1, b1));
+                const int sa = 2*(int) (a1 >> 28) + 1, sb = 2*(int) (b1 >> 28) + 1;
+                const __m512i sc = fle_scales4(sa, sa, sb, sb);
+                const __m512i yv = _mm512_loadu_si512((const void *) (y[i].qs + 64*j));
+                const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
+                acci = _mm512_dpwssd_epi32(acci, _mm512_maddubs_epi16(g, ys), sc);
+            }
+            const __m256i f = _mm256_add_epi32(_mm512_castsi512_si256(acci), _mm512_extracti64x4_epi64(acci, 1));
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d), _mm256_cvtepi32_ps(f), accf);
+        }
+        *s = 0.125f * hsum_float_8(accf);
+        return;
+    }
+#endif
 
 #if defined(__AVX2__)
 
@@ -2889,6 +2945,36 @@ void ggml_vec_dot_iq2_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     const block_q8_K   * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(FLE_IQ2_512)
+    if (fle_iq512_on()) {
+        const __m512i zero = _mm512_setzero_si512();
+        __m256 accf = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t * blk = (const uint8_t *) &x[i];
+            __m512i acci = zero;
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t * q = blk + 2 + 16*j;
+                uint16_t v[8];
+                memcpy(v, q, 16);
+                const __m512i g = _mm512_set_epi64((long long) iq2xs_grid[v[7] & 511], (long long) iq2xs_grid[v[6] & 511],
+                                                   (long long) iq2xs_grid[v[5] & 511], (long long) iq2xs_grid[v[4] & 511],
+                                                   (long long) iq2xs_grid[v[3] & 511], (long long) iq2xs_grid[v[2] & 511],
+                                                   (long long) iq2xs_grid[v[1] & 511], (long long) iq2xs_grid[v[0] & 511]);
+                const __mmask64 m = fle_sign_mask_from_idx(_mm256_srli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) q)), 9));
+                const uint8_t s0 = blk[66 + 2*j], s1 = blk[66 + 2*j + 1];
+                const __m512i sc = fle_scales4(2*(s0 & 15) + 1, 2*(s0 >> 4) + 1, 2*(s1 & 15) + 1, 2*(s1 >> 4) + 1);
+                const __m512i yv = _mm512_loadu_si512((const void *) (y[i].qs + 64*j));
+                const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
+                acci = _mm512_dpwssd_epi32(acci, _mm512_maddubs_epi16(g, ys), sc);
+            }
+            const __m256i f = _mm256_add_epi32(_mm512_castsi512_si256(acci), _mm512_extracti64x4_epi64(acci, 1));
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d), _mm256_cvtepi32_ps(f), accf);
+        }
+        *s = 0.125f * hsum_float_8(accf);
+        return;
+    }
+#endif
 
 #if defined(__AVX2__)
 
