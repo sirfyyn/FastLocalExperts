@@ -209,31 +209,60 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         const int64_t nb_ff = (n_ff + RB - 1) / RB, nb_e = (n_embd + RB - 1) / RB;
         const float lim = u->limit;
         fle_pool & pool = fle_pool_get();
-        pool.run(np * nb_ff, [&](int64_t j) {
-            const pair_t & pp = u->pairs[(size_t) (j / nb_ff)];
+        // jobs per (expert, 64-row block): several tokens routed to the same expert (DSpark verification, prefill-sized batches)
+        // read its rows once and apply them to every such token; the per-row arithmetic is the same as one pair at a time
+        std::vector<int32_t> grp_beg, grp_pair;   // groups of pair indices with the same expert (pairs are kept in their order)
+        {
+            std::vector<int32_t> order((size_t) np);
+            for (int64_t q = 0; q < np; ++q) { order[(size_t) q] = (int32_t) q; }
+            std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return u->pairs[(size_t) a].e < u->pairs[(size_t) b].e; });
+            // keep the resident-first order of the groups: a group starts where its first pair stood
+            std::vector<std::pair<int32_t, int32_t>> starts;   // (first position in pairs, expert)
+            for (size_t k = 0; k < order.size(); ++k) {
+                if (k == 0 || u->pairs[(size_t) order[k]].e != u->pairs[(size_t) order[k-1]].e) { starts.push_back({ order[k], u->pairs[(size_t) order[k]].e }); }
+            }
+            std::sort(starts.begin(), starts.end());
+            for (const auto & st : starts) {
+                grp_beg.push_back((int32_t) grp_pair.size());
+                for (int64_t q = 0; q < np; ++q) { if (u->pairs[(size_t) q].e == st.second) { grp_pair.push_back((int32_t) q); } }
+            }
+            grp_beg.push_back((int32_t) grp_pair.size());
+        }
+        const int64_t ng = (int64_t) grp_beg.size() - 1;
+        pool.run(ng * nb_ff, [&](int64_t j) {
+            const int64_t g0 = j / nb_ff;
+            const pair_t & p0 = u->pairs[(size_t) grp_pair[(size_t) grp_beg[(size_t) g0]]];
             const int64_t r0 = (j % nb_ff) * RB, r1 = std::min(r0 + RB, n_ff);
-            const char * wg = expert_data(gate, pp.e), * wu = expert_data(up, pp.e);
+            const char * wg = expert_data(gate, p0.e), * wu = expert_data(up, p0.e);
             for (int64_t row = r0; row < r1; ++row) {
-                float g = 0.0f, v = 0.0f;
-                tg->vec_dot((int) n_embd, &g, 0, wg + row*gate->nb[1], 0, xq.data() + pp.t*xrs, 0, 1);
-                tu->vec_dot((int) n_embd, &v, 0, wu + row*up->nb[1],   0, xq.data() + pp.t*xrs, 0, 1);
-                const float gc = std::min(g, lim);
-                const float uc = std::clamp(v, -lim, lim);
-                u->act[(size_t) (j / nb_ff) * n_ff + row] = gc / (1.f + expf(-gc)) * uc;
+                for (int32_t k = grp_beg[(size_t) g0]; k < grp_beg[(size_t) g0 + 1]; ++k) {
+                    const int32_t q = grp_pair[(size_t) k];
+                    const pair_t & pp = u->pairs[(size_t) q];
+                    float g = 0.0f, v = 0.0f;
+                    tg->vec_dot((int) n_embd, &g, 0, wg + row*gate->nb[1], 0, xq.data() + pp.t*xrs, 0, 1);
+                    tu->vec_dot((int) n_embd, &v, 0, wu + row*up->nb[1],   0, xq.data() + pp.t*xrs, 0, 1);
+                    const float gc = std::min(g, lim);
+                    const float uc = std::clamp(v, -lim, lim);
+                    u->act[(size_t) q * n_ff + row] = gc / (1.f + expf(-gc)) * uc;
+                }
             }
         });
         const auto * tqd = fle_traits(td->vec_dot_type);
         const size_t ars = ggml_row_size(td->vec_dot_type, n_ff);
         aq.resize((size_t) np * ars);
         for (int64_t q = 0; q < np; ++q) { tqd->from_float(u->act.data() + q*n_ff, aq.data() + q*ars, n_ff); }
-        pool.run(np * nb_e, [&](int64_t j) {
-            const int64_t q = j / nb_e;
-            const pair_t & pp = u->pairs[(size_t) q];
+        pool.run(ng * nb_e, [&](int64_t j) {
+            const int64_t g0 = j / nb_e;
+            const pair_t & p0 = u->pairs[(size_t) grp_pair[(size_t) grp_beg[(size_t) g0]]];
             const int64_t r0 = (j % nb_e) * RB, r1 = std::min(r0 + RB, n_embd);
-            const char * wd = expert_data(down, pp.e);
-            float * o = (float *) ((char *) dst->data + pp.slot*dst->nb[1] + pp.t*dst->nb[2]);
+            const char * wd = expert_data(down, p0.e);
             for (int64_t row = r0; row < r1; ++row) {
-                td->vec_dot((int) n_ff, o + row, 0, wd + row*down->nb[1], 0, aq.data() + q*ars, 0, 1);
+                for (int32_t k = grp_beg[(size_t) g0]; k < grp_beg[(size_t) g0 + 1]; ++k) {
+                    const int32_t q = grp_pair[(size_t) k];
+                    const pair_t & pp = u->pairs[(size_t) q];
+                    float * o = (float *) ((char *) dst->data + pp.slot*dst->nb[1] + pp.t*dst->nb[2]);
+                    td->vec_dot((int) n_ff, o + row, 0, wd + row*down->nb[1], 0, aq.data() + (size_t) q*ars, 0, 1);
+                }
             }
         });
         if (n_tok == 1) { llama_moe_cpu_predict_after(u->il, (const float *) cur->data, n_embd); }   // FLE_MOE_CPU_PRED
