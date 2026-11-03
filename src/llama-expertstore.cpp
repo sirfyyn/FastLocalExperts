@@ -33,7 +33,7 @@ struct es_job { int fd; uint64_t off; size_t len; char * dst; std::atomic<int> *
 struct llama_expert_store::impl {
     struct role_t { int fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
     struct layer_t {
-        int il = -1; int64_t n_expert = 0; role_t r[3];
+        int il = -1; int64_t n_expert = 0; role_t r[3]; int cls = 0; size_t blob = 0;
         std::vector<int32_t>      slot_of;   // expert -> slot, -1
         std::vector<const char *> ptr[3];    // expert -> weights in the arena (nullptr: not resident)
     };
@@ -49,8 +49,18 @@ struct llama_expert_store::impl {
     size_t  arena_bytes = 0;
     size_t  blob = 0;
     std::vector<slot_t> slots;
-    size_t  next_free = 0;     // slots below are assigned (preload and first misses fill in order)
+    size_t  next_free = 0;     // (unused with size classes, kept for the stats)
     size_t  cursor = 0;        // eviction sampling position
+    // size classes: layers whose experts have the same slot size share a contiguous slot range [lo, hi); every slot of a class
+    // is exactly that class's size, so a 9 MB IQ1_M expert no longer takes a slot sized for a 14 MB IQ2_XS one
+    std::vector<size_t> cls_blob, cls_lo, cls_hi, cls_next;
+    std::vector<size_t> slot_off;   // byte offset of each slot in the arena
+    // a free slot of class c, or a victim sampled from class c (the caller's filter decides); SIZE_MAX if the class is empty
+    size_t cls_free(int c) { return cls_next[(size_t) c] < cls_hi[(size_t) c] ? cls_next[(size_t) c]++ : SIZE_MAX; }
+    size_t cls_sample(int c, size_t k) const {
+        const size_t lo = cls_lo[(size_t) c], n = cls_hi[(size_t) c] - lo;
+        return n ? lo + (cursor + k * 131) % n : SIZE_MAX;
+    }
     uint64_t n_ensure = 0;
     int32_t  pin_li = -1; std::vector<int32_t> pin;   // the experts the running layer computes (not given up by a prefetch)
 
@@ -110,7 +120,7 @@ struct llama_expert_store::impl {
     // queue the three reads of expert e of layer li into slot s; returns the weight pointers via ptr_out
     void queue_reads(size_t li, int32_t e, size_t s, std::vector<es_job> & jobs, const char * ptr_out[3]) {
         layer_t & L = layers[li];
-        char * base = arena + s * blob;
+        char * base = arena + slot_off[s];
         for (int r = 0; r < 3; ++r) {
             const role_t & R = L.r[r];
             const uint64_t off = R.off0 + (uint64_t) e * R.nb2;
@@ -204,12 +214,29 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         L.slot_of.assign((size_t) L.n_expert, -1);
         for (int r = 0; r < 3; ++r) { L.ptr[r].assign((size_t) L.n_expert, nullptr); }
         d->blob = std::max(d->blob, region_off);
+        L.blob = region_off;
+        int c = -1;
+        for (size_t k = 0; k < d->cls_blob.size(); ++k) { if (d->cls_blob[k] == region_off) { c = (int) k; break; } }
+        if (c < 0) { c = (int) d->cls_blob.size(); d->cls_blob.push_back(region_off); }
+        L.cls = c;
         d->layers.push_back(std::move(L));
     }
     if (d->layers.empty() || d->blob == 0) { delete d; return nullptr; }
-    const size_t n_slots = budget_bytes / d->blob;
+    // the same number of slots for every layer: class c gets budget * n_layers(c) / sum_j(n_layers(j) * blob(j)) slots
+    std::vector<size_t> n_lay(d->cls_blob.size(), 0);
+    for (const auto & L : d->layers) { n_lay[(size_t) L.cls]++; }
+    double denom = 0.0;
+    for (size_t c = 0; c < n_lay.size(); ++c) { denom += (double) n_lay[c] * (double) d->cls_blob[c]; }
+    size_t n_slots = 0;
+    d->arena_bytes = 0;
+    for (size_t c = 0; c < n_lay.size(); ++c) {
+        const size_t nc = (size_t) ((double) budget_bytes * (double) n_lay[c] / denom);
+        d->cls_lo.push_back(n_slots); d->cls_next.push_back(n_slots);
+        for (size_t k = 0; k < nc; ++k) { d->slot_off.push_back(d->arena_bytes); d->arena_bytes += d->cls_blob[c]; }
+        n_slots += nc;
+        d->cls_hi.push_back(n_slots);
+    }
     if (n_slots == 0) { delete d; return nullptr; }
-    d->arena_bytes = n_slots * d->blob;
     void * a = mmap(nullptr, d->arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (a == MAP_FAILED) {
         LLAMA_LOG_WARN("%s: arena of %.1f GB failed, store off\n", __func__, d->arena_bytes / 1e9);
@@ -240,8 +267,11 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         }
     }
 #endif
-    LLAMA_LOG_INFO("%s: FLE_MOE_STORE: %zu slots of %.1f MB (%.1f GB), %d unbuffered readers, %zu layers\n", __func__,
-        n_slots, d->blob / 1e6, d->arena_bytes / 1e9, std::max(1, threads), d->layers.size());
+    LLAMA_LOG_INFO("%s: FLE_MOE_STORE: %zu slots in %zu size classes (%.1f GB, largest %.1f MB), %d unbuffered readers, %zu layers\n", __func__,
+        n_slots, d->cls_blob.size(), d->arena_bytes / 1e9, d->blob / 1e6, std::max(1, threads), d->layers.size());
+    for (size_t c = 0; c < d->cls_blob.size(); ++c) {
+        LLAMA_LOG_INFO("%s: FLE_MOE_STORE: class %zu: %zu slots of %.2f MB\n", __func__, c, d->cls_hi[c] - d->cls_lo[c], d->cls_blob[c] / 1e6);
+    }
     return std::unique_ptr<llama_expert_store>(new llama_expert_store(d));
 #endif
 }
@@ -281,10 +311,11 @@ size_t llama_expert_store::preload(const std::vector<std::pair<int32_t, int32_t>
     std::vector<pend> ps;
     size_t n = 0;
     for (const auto & x : li_expert) {
-        if (d->next_free >= d->slots.size()) { break; }
         const size_t li = (size_t) x.first;
         if (li >= d->layers.size() || x.second < 0 || x.second >= d->layers[li].n_expert || resident(li, x.second)) { continue; }
-        pend p{ li, x.second, d->next_free++, { nullptr, nullptr, nullptr } };
+        const size_t fs = d->cls_free(d->layers[li].cls);
+        if (fs == SIZE_MAX) { continue; }   // this class is full; others may still take their hot experts
+        pend p{ li, x.second, fs, { nullptr, nullptr, nullptr } };
         d->queue_reads(li, x.second, p.s, jobs, p.p);
         ps.push_back(p);
         st.read_bytes += expert_bytes(li);
@@ -332,14 +363,12 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         for (size_t k = 0; k < np; ++k) { if (ps[k].e == e) { dup = true; break; } }
         if (dup) { continue; }
         // a slot: a never-used one first, then the least used of a sample, never one this call needs
-        size_t victim = SIZE_MAX;
-        if (d->next_free < d->slots.size()) {
-            victim = d->next_free++;
-        } else {
+        size_t victim = d->cls_free(L.cls);
+        if (victim == SIZE_MAX) {
             uint32_t best = UINT32_MAX;
-            const size_t ns = d->slots.size();
-            for (size_t k = 0; k < 64; ++k) {
-                const size_t c = (d->cursor + k * 131) % ns;
+            const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
+            for (size_t k = 0; k < 64 && ns; ++k) {
+                const size_t c = d->cls_sample(L.cls, k);
                 const auto & S = d->slots[c];
                 if (d->inflight[c].load(std::memory_order_acquire) > 0 || d->pins[c].load(std::memory_order_acquire) > 0) { continue; }
                 if (S.li == (int32_t) li) {
@@ -353,7 +382,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
                 if (taken) { continue; }
                 if (S.cnt < best) { best = S.cnt; victim = c; }
             }
-            d->cursor = (d->cursor + 61) % ns;
+            d->cursor = (d->cursor + 61) % std::max<size_t>(1, d->slots.size());
             if (victim == SIZE_MAX) { continue; }   // no slot: this expert stays on the mmap path
             st.evictions++;
         }
@@ -426,20 +455,18 @@ bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<in
     impl::layer_t & L = d->layers[li];
     if (e < 0 || e >= L.n_expert || L.slot_of[(size_t) e] >= 0) { return false; }
     // a slot: a never-used one, else the least used of a sample that is neither being read nor needed by the running layer
-    size_t victim = SIZE_MAX;
-    if (d->next_free < d->slots.size()) {
-        victim = d->next_free++;
-    } else {
+    size_t victim = d->cls_free(L.cls);
+    if (victim == SIZE_MAX) {
         uint32_t best = UINT32_MAX;
-        const size_t ns = d->slots.size();
-        for (size_t k = 0; k < 64; ++k) {
-            const size_t c = (d->cursor + k * 131) % ns;
+        const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
+        for (size_t k = 0; k < 64 && ns; ++k) {
+            const size_t c = d->cls_sample(L.cls, k);
             const auto & S = d->slots[c];
             if (d->inflight[c].load(std::memory_order_acquire) > 0 || d->pins[c].load(std::memory_order_acquire) > 0) { continue; }
             if (S.li == d->pin_li && std::find(d->pin.begin(), d->pin.end(), S.e) != d->pin.end()) { continue; }
             if (S.cnt < best) { best = S.cnt; victim = c; }
         }
-        d->cursor = (d->cursor + 61) % ns;
+        d->cursor = (d->cursor + 61) % std::max<size_t>(1, d->slots.size());
         if (victim == SIZE_MAX || best > 1) { return false; }   // only cold slots: a prefetch never pushes out a used expert
         st.evictions++;
     }

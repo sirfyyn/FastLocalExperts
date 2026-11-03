@@ -10,6 +10,14 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+#include <cstdlib>
+#include <cstdio>
+#include <thread>
+#include <functional>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -29,6 +37,75 @@ static const struct ggml_type_traits_cpu * fle_traits(ggml_type t) {
 }
 
 namespace {
+
+// ---- FLE_MOE_POOL=1: own pinned worker pool for the fused CPU MoE op (after Strata's lane pool, ds4_pool.hpp, MIT) ----------------
+// ggml runs the op on ONE thread; that thread hands the work to N workers pinned to their own physical cores (FLE_MOE_POOL_CPUS,
+// default 2-15: two cores stay free for the threads that feed the GPU), spinning between layers instead of sleeping. Jobs are
+// (expert pair, 64-row block), claimed with one atomic ticket, so a layer with several CPU experts spreads evenly over all cores.
+struct fle_pool {
+    std::vector<std::thread> th;
+    std::atomic<uint64_t> gen{0};      // bumped for every parallel section
+    std::atomic<int64_t>  next{0};     // next job index of the running section
+    std::atomic<int>      done{0};     // workers finished with the running section
+    int64_t n_jobs = 0;
+    std::function<void(int64_t)> fn;
+    int n = 0;
+    std::atomic<bool> stop{false};
+
+    static std::vector<int> cpus_from_env() {
+        std::vector<int> c;
+        const char * e = std::getenv("FLE_MOE_POOL_CPUS");
+        int lo = 2, hi = 15;
+        if (e && *e) { if (std::sscanf(e, "%d-%d", &lo, &hi) != 2) { lo = 2; hi = 15; } }
+        for (int i = lo; i <= hi; ++i) { c.push_back(i); }
+        return c;
+    }
+    void work() {
+        for (;;) {
+            const int64_t j = next.fetch_add(1, std::memory_order_acq_rel);
+            if (j >= n_jobs) { break; }
+            fn(j);
+        }
+    }
+    void start() {
+        const auto cpus = cpus_from_env();
+        n = (int) cpus.size();
+        for (int w = 0; w < n; ++w) {
+            th.emplace_back([this, w, cpu = cpus[(size_t) w]] {
+#if defined(__linux__)
+                cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+                pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+                (void) cpu;
+#endif
+                uint64_t seen = 0;
+                for (;;) {
+                    // spin on the generation (a layer is ~0.5 ms away), yield after a while
+                    int spins = 0;
+                    while (gen.load(std::memory_order_acquire) == seen) {
+                        if (stop.load(std::memory_order_relaxed)) { return; }
+                        if (++spins < 200000) { FLE_PAUSE(); } else { std::this_thread::yield(); }
+                    }
+                    seen = gen.load(std::memory_order_acquire);
+                    work();
+                    done.fetch_add(1, std::memory_order_acq_rel);
+                }
+                (void) w;
+            });
+        }
+    }
+    // run fn(0..n_jobs-1) on the workers and the caller; returns when every job is done
+    void run(int64_t jobs, std::function<void(int64_t)> f) {
+        if (th.empty()) { start(); }
+        fn = std::move(f); n_jobs = jobs;
+        next.store(0, std::memory_order_release);
+        done.store(0, std::memory_order_release);
+        gen.fetch_add(1, std::memory_order_acq_rel);
+        work();
+        while (done.load(std::memory_order_acquire) < n) { FLE_PAUSE(); }
+    }
+};
+static fle_pool & fle_pool_get() { static fle_pool * p = new fle_pool(); return *p; }
 
 struct pair_t { int32_t t, slot, e; };
 
@@ -98,6 +175,60 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         }
         u->act.resize(u->pairs.size() * (size_t) n_ff);
     }
+    // FLE_MOE_POOL: ggml runs this op on one thread (n_tasks 1); the work goes to the pinned pool, jobs of 64 rows
+    static const bool use_pool = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && atoi(e) != 0; }();
+    if (use_pool) {
+        static bool said = false;
+        if (!said) { said = true; std::fprintf(stderr, "[fle-moe-pool] fused CPU MoE op on the pool (ggml nth=%d)\n", nth); }
+        if (ith != 0) { return; }   // the pool does the work; with nth > 1 the other ggml threads only wait at the next barrier
+        memset(dst->data, 0, ggml_nbytes(dst));
+        const int64_t np = (int64_t) u->pairs.size();
+        if (np == 0) { return; }
+        const auto * tg = fle_traits(gate->type);
+        const auto * tu = fle_traits(up->type);
+        const auto * td = fle_traits(down->type);
+        GGML_ASSERT(tg && tu && td && tg->vec_dot_type == tu->vec_dot_type);
+        const auto * tq  = fle_traits(tg->vec_dot_type);
+        const size_t xrs = ggml_row_size(tg->vec_dot_type, n_embd);
+        static std::vector<uint8_t> xq, aq;
+        xq.resize((size_t) n_tok * xrs);
+        for (int64_t t = 0; t < n_tok; ++t) {
+            tq->from_float((const float *) ((const char *) cur->data + t*cur->nb[2]), xq.data() + t*xrs, n_embd);
+        }
+        constexpr int64_t RB = 64;
+        const int64_t nb_ff = (n_ff + RB - 1) / RB, nb_e = (n_embd + RB - 1) / RB;
+        const float lim = u->limit;
+        fle_pool & pool = fle_pool_get();
+        pool.run(np * nb_ff, [&](int64_t j) {
+            const pair_t & pp = u->pairs[(size_t) (j / nb_ff)];
+            const int64_t r0 = (j % nb_ff) * RB, r1 = std::min(r0 + RB, n_ff);
+            const char * wg = expert_data(gate, pp.e), * wu = expert_data(up, pp.e);
+            for (int64_t row = r0; row < r1; ++row) {
+                float g = 0.0f, v = 0.0f;
+                tg->vec_dot((int) n_embd, &g, 0, wg + row*gate->nb[1], 0, xq.data() + pp.t*xrs, 0, 1);
+                tu->vec_dot((int) n_embd, &v, 0, wu + row*up->nb[1],   0, xq.data() + pp.t*xrs, 0, 1);
+                const float gc = std::min(g, lim);
+                const float uc = std::clamp(v, -lim, lim);
+                u->act[(size_t) (j / nb_ff) * n_ff + row] = gc / (1.f + expf(-gc)) * uc;
+            }
+        });
+        const auto * tqd = fle_traits(td->vec_dot_type);
+        const size_t ars = ggml_row_size(td->vec_dot_type, n_ff);
+        aq.resize((size_t) np * ars);
+        for (int64_t q = 0; q < np; ++q) { tqd->from_float(u->act.data() + q*n_ff, aq.data() + q*ars, n_ff); }
+        pool.run(np * nb_e, [&](int64_t j) {
+            const int64_t q = j / nb_e;
+            const pair_t & pp = u->pairs[(size_t) q];
+            const int64_t r0 = (j % nb_e) * RB, r1 = std::min(r0 + RB, n_embd);
+            const char * wd = expert_data(down, pp.e);
+            float * o = (float *) ((char *) dst->data + pp.slot*dst->nb[1] + pp.t*dst->nb[2]);
+            for (int64_t row = r0; row < r1; ++row) {
+                td->vec_dot((int) n_ff, o + row, 0, wd + row*down->nb[1], 0, aq.data() + q*ars, 0, 1);
+            }
+        });
+        return;
+    }
+
     // zero this thread's share of the output (the GPU-cached slots stay 0, the CPU ones are written in phase 2)
     {
         const int64_t n_rows = n_used * n_tok;
@@ -179,5 +310,7 @@ ggml_tensor * llama_moe_fused_cpu(ggml_context * ctx, ggml_tensor * cur, ggml_te
     }
     u->il = il; u->dummy = dummy; u->limit = clamp_limit;
     ggml_tensor * args[7] = { cur, ids, gate_exps, up_exps, down_exps, table, pred };
-    return ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], ids->ne[0], ids->ne[1], 1, args, pred ? 7 : 6, fused_fn, GGML_N_TASKS_MAX, u);
+    static const bool use_pool = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && atoi(e) != 0; }();
+    return ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], ids->ne[0], ids->ne[1], 1, args, pred ? 7 : 6, fused_fn,
+            use_pool ? 1 : GGML_N_TASKS_MAX, u);
 }
