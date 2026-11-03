@@ -357,6 +357,24 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
             static std::vector<std::pair<int32_t, int32_t>> ev;
             ev.clear();
             g_store->ensure(li, want, nw, &ev);
+            // FLE_MOE_STORE_HIST=1: free lookahead for the reads (netcode-style prediction): the next layer will probably want again
+            // some of the CPU-side experts it wanted for the previous tokens; read those into the store now (cold slots only, the
+            // demand reads of this layer stay in front). Costs nothing on the GPU; the output is unchanged.
+            static const bool hist_on = [] { const char * e = std::getenv("FLE_MOE_STORE_HIST"); return e && atoi(e) != 0; }();
+            if (hist_on && ids->ne[1] == 1) {
+                static std::vector<std::vector<int32_t>> & hist = *new std::vector<std::vector<int32_t>>();   // per layer index: last two tokens' CPU experts
+                if (hist.size() < mc->layers.size()) { hist.resize(mc->layers.size()); }
+                auto & h = hist[li];
+                h.insert(h.begin(), want, want + nw);
+                if (h.size() > 16) { h.resize(16); }
+                if (li + 1 < mc->layers.size() && g_store->queue_len() < 24) {
+                    const layer_state & l1 = mc->layers[li + 1];
+                    for (const int32_t x : hist[li + 1]) {
+                        if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[x] >= 0) { continue; }   // GPU cache has it
+                        if (!g_store->resident(li + 1, x)) { g_store->prefetch(li + 1, x); }
+                    }
+                }
+            }
             // FLE_MOE_HOT_BIAS also for the store: resident CPU-side experts get the smaller bonus, given-up ones lose it
             static const float hb = [] { const char * v = std::getenv("FLE_MOE_HOT_BIAS"); return (v && *v) ? (float) atof(v) : 0.0f; }();
             if (hb > 0.0f) {
