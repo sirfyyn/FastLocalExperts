@@ -2069,6 +2069,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     float   fle_wscale     = 1.0f;            // fixed extra factor on the renormalised weights
     int64_t fle_layer_k = cparams.n_moe_active_experts;   // overridable per layer (--moe-active-layers)
     if (il >= 0 && (size_t) il < cparams.moe_active_layers.size() && cparams.moe_active_layers[il] > 0) {
+    if (il >= 0 && n_tokens <= 8) { llama_moe_register_router(il, gate_inp, exp_probs_b, (int) n_expert_used); }   // FLE_MOE_CPU_PRED
+
         fle_layer_k = cparams.moe_active_layers[il];
     }
     if (arch == LLM_ARCH_QWEN4EXP && norm_w && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&

@@ -1,4 +1,5 @@
 #include "llama-moe-fused.h"
+#include "llama-moecache.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -235,6 +236,7 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
                 td->vec_dot((int) n_ff, o + row, 0, wd + row*down->nb[1], 0, aq.data() + q*ars, 0, 1);
             }
         });
+        if (n_tok == 1) { llama_moe_cpu_predict_after(u->il, (const float *) cur->data, n_embd); }   // FLE_MOE_CPU_PRED
         return;
     }
 

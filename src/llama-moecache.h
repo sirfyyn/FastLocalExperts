@@ -95,3 +95,8 @@ uint64_t llama_moe_cache_epoch();
 // Patch 44a: write the expert-usage profile (FLE_MOE_PROFILE) if it changed since the last save. Cheap no-op
 // without the switch. Called from the context destructor; safe to call more than once.
 void llama_moe_cache_profile_save();
+
+// FLE_MOE_CPU_PRED=1 (with the expert store): routers registered per layer by the graph builder; after a decode layer's CPU part
+// the next layer's router runs on the CPU (Q8_0 host copy) on its own thread and the predicted missing experts are read ahead.
+void llama_moe_register_router(int il, const ggml_tensor * gate_inp, const ggml_tensor * exp_probs_b, int n_expert_used);
+void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd);
