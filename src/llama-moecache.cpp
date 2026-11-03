@@ -2605,7 +2605,7 @@ void cr_worker() {
         for (int q = 0; q < k; ++q) {
             const int32_t x = sc[(size_t) q].second;
             if (x < 0 || x >= (int32_t) l1.expert_slot.size() || l1.expert_slot[(size_t) x] >= 0) { continue; }   // GPU cache has it
-            if (!g_store->resident(li1, x)) { g_store->prefetch(li1, x); }
+            if (!g_store->resident(li1, x)) { g_store->prefetch(li1, x, nullptr, true); }   // the least-used slot may go
         }
     }
 }
@@ -2616,7 +2616,10 @@ void llama_moe_register_router(int il, const ggml_tensor * gate_inp, const ggml_
     if (!on || !gate_inp) { return; }
     std::lock_guard<std::mutex> lk(g_cr_mtx);
     auto & r = g_cr[il];
-    if (!r.w) { r.w = gate_inp; r.b = exp_probs_b; r.k = n_expert_used; }
+    if (!r.w) {
+        r.w = gate_inp; r.b = exp_probs_b; r.k = n_expert_used;
+        cr_load(r);   // now, while the graph is built: a first load in the predictor thread stalled the first requests
+    }
 }
 
 void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd) {

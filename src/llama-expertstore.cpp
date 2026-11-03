@@ -449,7 +449,7 @@ size_t llama_expert_store::queue_len() const {
     return d->q.size();
 }
 
-bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted) {
+bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted, bool force) {
     if (li >= d->layers.size()) { return false; }
     std::lock_guard<std::mutex> slk(d->smtx);
     impl::layer_t & L = d->layers[li];
@@ -467,7 +467,7 @@ bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<in
             if (S.cnt < best) { best = S.cnt; victim = c; }
         }
         d->cursor = (d->cursor + 61) % std::max<size_t>(1, d->slots.size());
-        if (victim == SIZE_MAX || best > 1) { return false; }   // only cold slots: a prefetch never pushes out a used expert
+        if (victim == SIZE_MAX || (!force && best > 1)) { return false; }   // cold slots only, unless the caller trusts its guess (force)
         st.evictions++;
     }
     auto & S = d->slots[victim];

@@ -43,7 +43,7 @@ public:
 
     // start reading expert e of layer li into a cold slot without waiting (a predicted miss); ensure() publishes it when the
     // layer needs it and waits for the reads still running. false: no cold slot or already resident/known.
-    bool prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr);
+    bool prefetch(size_t li, int32_t e, std::vector<std::pair<int32_t, int32_t>> * evicted = nullptr, bool force = false);
     size_t queue_len() const;
 
     // the GPU cache uploads from the store when it holds the expert: acquire() returns the weights of expert e of the host tensor src
