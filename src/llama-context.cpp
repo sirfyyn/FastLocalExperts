@@ -862,6 +862,16 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // FLE_PREFILL_WINDOW=W: a call of 2..FLE_PREFILL_WINDOW_MAX tokens (default 768) runs in ubatches of W tokens, the decode path
+    // (GPU expert cache + CPU pool, MMVQ, CUDA graphs) reads only the routed experts; above it the large ubatch streams all of them.
+    // Measured 03.11. (ISTA IQ2_XXS, 59 tokens): W=16 1.45 s, W=8 1.56 s, one ubatch 17.2 s. The cache guard follows W (llama-graph).
+    if (const char * e = std::getenv("FLE_PREFILL_WINDOW"); e && atoi(e) > 1) {
+        fle_win     = (uint32_t) atoi(e);
+        const char * m = std::getenv("FLE_PREFILL_WINDOW_MAX");
+        fle_win_max = (m && atoi(m) > 0) ? (uint32_t) atoi(m) : 768;
+        LLAMA_LOG_INFO("%s: [fle-window] calls of up to %u tokens in ubatches of %u\n", __func__, fle_win_max, fle_win);
+    }
+
     // Patch 48: -ub is the large prefill ubatch; outside a lend the compute buffers are sized for FLE_UBATCH_SMALL
     if (llama_moe_cache_lend_enabled()) {
         auto env_u = [](const char * name, long dflt) { const char * e = std::getenv(name); return e && *e ? std::max(1L, atol(e)) : dflt; };
@@ -2592,7 +2602,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, fle_ub_eff(), output_all);
+        const uint32_t fle_ub = fle_win > 0 && n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
+        mctx = memory->init_batch(*balloc, fle_ub, output_all);
         if (!mctx) {
             return -2;
         }

@@ -2263,7 +2263,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             return 1;
         }
         const char * e = std::getenv("FLE_MOE_CACHE_MAXTOK");
-        const int n = (e && *e) ? std::max(1, atoi(e)) : 8;
+        const char * w = std::getenv("FLE_PREFILL_WINDOW");   // the prefill windows (llama-context) go through the cache too
+        const int n = std::max((e && *e) ? std::max(1, atoi(e)) : 8, (w && *w) ? atoi(w) : 0);
         LLAMA_LOG_INFO("[fle-moe-cache] guard OPEN up to n_tokens<=%d\n", n);
         return n;
     }();
