@@ -1376,6 +1376,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
 
     void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
 
+    // FLE_ENGRAM_PREVIEW=k: when the logits of a decode step are on the host (before sampling), hash the next step's Engram rows for
+    // the k most likely next tokens and start reading them, so layer 1 does not wait for the SSD
+    void engram_preview(const float * logits, int64_t n_vocab) const;
+
     struct graph : public llama_model_deepseek4::graph {
         graph(const llama_model & model, const llm_graph_params & params);
         // helpers only (no graph built): base of graph_dsv41

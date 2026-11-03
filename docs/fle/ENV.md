@@ -75,6 +75,9 @@ For models whose CPU-side experts do not fit in RAM (DeepSeek-V4.1 ISTA: about 1
 | `FLE_MOE_WILLNEED_THREADS` | 1 | Workers for `FLE_MOE_WILLNEED_NOW`. 32 or 64 workers were slower (the request comes too late to help: an expert takes ~10 ms from NVMe, a layer ~0.6 ms). | - |
 | `FLE_MOE_WILLNEED_CHUNK_KB` | 0 (whole slice) | Cut the slices into chunks of this size for the workers. | - |
 | `FLE_ENGRAM_COLD` | off | deepseek41: `MADV_COLD` the Engram rows of the previous decode step. No gain measured (−3 %). | - |
+| `FLE_MOE_STORE_GB` | 0 (off) | Expert store (`src/llama-expertstore.cpp`, after Strata's ds4_store): a RAM arena of this size with one slot per expert (gate, up and down in one block). Experts are read whole with unbuffered reads (O_DIRECT, past the page cache), the hottest from `FLE_MOE_PROFILE` at load, the others when a layer routes to them (least-frequently-used slot given up, counts halved every 8192 layer calls). The CPU `mul_mat_id` reads them through `ggml_set_moe_data_callback`; the file and offset of each tensor come from `/proc/self/maps`. Use instead of `FLE_MOE_HOT_MLOCK_GB`, not together. Evidence lines `[fle-store]`. Not measured yet. | - |
+| `FLE_MOE_STORE_THREADS` | 8 | Unbuffered readers of the expert store. | - |
+| `FLE_MOE_DEFER` | 0 (off) | Expert deferral (deepseek41, needs the expert cache and `FLE_MC_OVERLAP`): the CPU part of a layer's routed experts is added one layer later, and the graph places it after the next layer's router, so the CPU computes layer L while the GPU computes layer L+1. Changes the output; not measured yet. Graph code in `src/llama-graph.cpp` (`fle_defer_*`) and `src/models/deepseek41.cpp`. | - |
 
 **ISTA recipe** (DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS, one 32 GB GPU, 120 GB RAM), measured 2026-11-02 on prompts outside
 the expert profile: 26.8 tok/s decode exact, **29.7 tok/s with the standard bonus** (0.1 on layers 15-42, Max 2026-11-02), prefill

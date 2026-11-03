@@ -1655,6 +1655,10 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// FLE: pass of each expert in mul_mat_id with an asynchronous expert store (0 = bytes there, 1 = still being read)
+static uint8_t fle_moe_late_arr[1024];
+static inline void fle_moe_late_set(int a, bool late) { fle_moe_late_arr[a] = late ? 1 : 0; }
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1797,6 +1801,11 @@ static void ggml_compute_forward_mul_mat_id(
             if (moe_obs_cb && strstr(src0->name, "ffn_gate_exps")) {
                 moe_obs_cb(src0->name, ids, moe_obs_ud);
             }
+            void * moe_pred_ud = NULL;
+            ggml_moe_pred_cb_t moe_pred_cb = ggml_get_moe_pred_callback(&moe_pred_ud);
+            if (moe_pred_cb && dst->src[4] && dst->src[4]->type == GGML_TYPE_I32) {
+                moe_pred_cb(src0->name, dst->src[4], moe_pred_ud);
+            }
         }
 
         // GGML_MOE_LOG: append the routed expert ids of every ffn_gate_exps
@@ -1835,6 +1844,14 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    if (ith == 0) {
+        void * rud = NULL;
+        const ggml_moe_ready_cb_t rcb = ggml_get_moe_data_callback(NULL) && n_as <= 1024 ? ggml_get_moe_ready_callback(&rud) : NULL;
+        if (rcb) {
+            for (int a = 0; a < n_as; ++a) { fle_moe_late_set(a, matrix_row_counts[a] > 0 && !rcb(src0, a, rud)); }
+        }
+    }
+
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
@@ -1843,10 +1860,23 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    void * moe_data_ud = NULL;
+    const ggml_moe_data_cb_t moe_data_cb = ggml_get_moe_data_callback(&moe_data_ud);
+    void * moe_ready_ud = NULL;
+    const ggml_moe_ready_cb_t moe_ready_cb = moe_data_cb && n_as <= 1024 ? ggml_get_moe_ready_callback(&moe_ready_ud) : NULL;
+    // the pass of each expert is decided once (thread 0, before the barrier above), so every thread walks the same experts
+    const uint8_t * fle_moe_late = fle_moe_late_arr;
+
+    // FLE: with an asynchronous expert store, pass 0 computes the experts whose bytes are there, pass 1 the ones still being read
+    // (data_cb waits for each of them), so the reads overlap the compute instead of blocking the whole layer
+    for (int pass = 0; pass < (moe_ready_cb ? 2 : 1); ++pass)
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+        if (moe_ready_cb && fle_moe_late[cur_a] != pass) {
             continue;
         }
 
@@ -1858,6 +1888,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        if (moe_data_cb) {   // FLE expert store: the same bytes from the RAM store instead of the mmap
+            const void * p = moe_data_cb(src0, cur_a, moe_data_ud);
+            if (p) { src0_cur = (const char *) p; }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
