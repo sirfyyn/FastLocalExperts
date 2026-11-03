@@ -3827,6 +3827,65 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     iq1m_scale_t scale;
 
+#if defined(__AVX512BW__) && defined(__AVX512VNNI__) && defined(__BMI2__)
+    // FLE: IQ1_M in 512-bit lanes (after Strata's rows_m, src/kernels/cpu/iq_avx512.cpp, MIT): 64 weights a step, grid indices by
+    // two pdep, the delta signs by one pext, the grid bytes split into |g| and a negative mask, VNNI accumulation. Same integer
+    // sums as the AVX2 path below and the same float order per block (d_x * d_y on the 8-lane fold); FLE_IQ512=0 turns it off.
+    static int fle_iq512 = -1;
+    if (fle_iq512 < 0) { const char * e = getenv("FLE_IQ512"); fle_iq512 = (e && *e) ? atoi(e) != 0 : 1; }
+    if (fle_iq512) {
+        const __m256i mask = _mm256_set1_epi16(0x7), mone = _mm256_set1_epi16(1);
+        const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
+        const __m512i zero = _mm512_setzero_si512();
+        const __m512i ones8 = _mm512_set1_epi8(1);
+        __m512i sidx[4];
+        for (int it = 0; it < 4; ++it) {
+            sidx[it] = _mm512_set_epi16(12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 12 + it, 4 + it, 4 + it, 4 + it, 4 + it, 4 + it, 4 + it,
+                                        4 + it, 4 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, 8 + it, it, it, it, it, it, it, it, it);
+        }
+        __m256 a1 = _mm256_setzero_ps(), a2 = _mm256_setzero_ps();
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t  * qs = x[i].qs;
+            const uint8_t  * qh = x[i].qh;
+            const uint16_t * sc = (const uint16_t *) x[i].scales;
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            uint64_t sc64; memcpy(&sc64, x[i].scales, 8);
+            __m256i scales = _mm256_set1_epi64x((long long) sc64);
+            scales = _mm256_srlv_epi64(scales, scales_shift);
+            scales = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(scales, mask), 1), mone);
+            const __m512i sctab = _mm512_castsi256_si512(scales);
+            __m512i s1 = zero, s2 = zero;
+            for (int it = 0; it < 4; ++it) {
+                uint32_t qh32, q0, q1;
+                memcpy(&qh32, qh + 4*it, 4); memcpy(&q0, qs + 8*it, 4); memcpy(&q1, qs + 8*it + 4, 4);
+                const uint64_t p1 = _pdep_u64(q0, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh32 & 0x7777, 0x0f000f000f000f00ULL);
+                const uint64_t p2 = _pdep_u64(q1, 0x00ff00ff00ff00ffULL) | _pdep_u64((qh32 >> 16) & 0x7777, 0x0f000f000f000f00ULL);
+                uint16_t ix[8];
+                memcpy(ix, &p1, 8); memcpy(ix + 4, &p2, 8);
+                const __m512i g = _mm512_set_epi64((long long) iq1s_grid[ix[7]], (long long) iq1s_grid[ix[6]], (long long) iq1s_grid[ix[5]],
+                                                   (long long) iq1s_grid[ix[4]], (long long) iq1s_grid[ix[3]], (long long) iq1s_grid[ix[2]],
+                                                   (long long) iq1s_grid[ix[1]], (long long) iq1s_grid[ix[0]]);
+                const __m512i scv  = _mm512_permutexvar_epi16(sidx[it], sctab);
+                const __mmask32 dneg = (__mmask32) (_pdep_u32(_pext_u32(qh32, 0x88888888u), 0x11111111u) * 15u);
+                const __m512i ssc  = _mm512_mask_sub_epi16(scv, dneg, zero, scv);
+                const __m512i ag   = _mm512_abs_epi8(g);
+                const __mmask64 gneg = _mm512_movepi8_mask(g);
+                const __m512i q8   = _mm512_loadu_si512((const void *) (y[i].qs + 64*it));
+                const __m512i ys   = _mm512_mask_sub_epi8(q8, gneg, zero, q8);
+                s1 = _mm512_dpwssd_epi32(s1, _mm512_maddubs_epi16(ag, ys), scv);
+                s2 = _mm512_dpwssd_epi32(s2, _mm512_maddubs_epi16(ones8, q8), ssc);
+            }
+            const __m256 d = _mm256_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(scale.f16));
+            const __m256i f1 = _mm256_add_epi32(_mm512_castsi512_si256(s1), _mm512_extracti64x4_epi64(s1, 1));
+            const __m256i f2 = _mm256_add_epi32(_mm512_castsi512_si256(s2), _mm512_extracti64x4_epi64(s2, 1));
+            a1 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(f1), a1);
+            a2 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(f2), a2);
+        }
+        *s = hsum_float_8(a1) + 0.125f * hsum_float_8(a2);
+        return;
+    }
+#endif
+
 #if defined __AVX2__
 
     const __m256i mask = _mm256_set1_epi16(0x7);
