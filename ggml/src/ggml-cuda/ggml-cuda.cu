@@ -2042,12 +2042,13 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    // FLE: no break - a token may name the same slot more than once (the MoE cache's zero slot); every
+                    // occurrence gets its own row (upstream stopped at the first, the others then read row 0)
                 }
             }
         }
