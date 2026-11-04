@@ -1140,7 +1140,8 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 // FFN offload utils
 //
 
-const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+// (?!_hot): the hot half of FLE split experts (ffn_*_exps_hot) stays on the GPU; the cold half (_exps_cold) matches
+const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps(?!_hot)";
 
 const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
 

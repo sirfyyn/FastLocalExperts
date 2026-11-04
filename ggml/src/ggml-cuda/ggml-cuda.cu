@@ -1902,7 +1902,11 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 // FLE: the slots of the MoE cache (moe_cache_up/gate/down.N). Past MMVQ batch sizes (hybrid prefill) a token can name the zero slot
 // several times; MMQ/MMF assume distinct experts per token, so these take the per-expert path (it tolerates the repeats)
-static bool fle_is_moe_cache_w(const ggml_tensor * t) { return strncmp(t->name, "moe_cache_", 10) == 0; }
+// FLE split experts: the hot half and the cold half (op offload; its device copy is named "CUDA0#blk.N.ffn_up_exps_cold...") name
+// their zero row once per expert the other half holds, the same repeats; only reached past the MMVQ batch sizes
+static bool fle_is_moe_cache_w(const ggml_tensor * t) {
+    return strncmp(t->name, "moe_cache_", 10) == 0 || strstr(t->name, "_exps_hot") != nullptr || strstr(t->name, "_exps_cold") != nullptr;
+}
 
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];

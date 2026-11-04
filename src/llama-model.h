@@ -345,6 +345,17 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_b     = nullptr;
     struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
 
+    // FLE split experts (docs/fle/EXPERT-SPLIT.md): hot half on the GPU, cold half on the CPU, each with a trailing zero row;
+    // set instead of ffn_*_exps on a split layer
+    struct ggml_tensor * ffn_gate_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_down_exps_hot  = nullptr;
+    struct ggml_tensor * ffn_up_exps_hot    = nullptr;
+    struct ggml_tensor * ffn_gate_exps_cold = nullptr;
+    struct ggml_tensor * ffn_down_exps_cold = nullptr;
+    struct ggml_tensor * ffn_up_exps_cold   = nullptr;
+    struct ggml_tensor * ffn_exps_slot      = nullptr; // I32 [n_expert]: original id -> slot (slot >= n_hot: cold row slot - n_hot)
+    struct ggml_tensor * ffn_exps_id        = nullptr; // I32 [n_expert]: slot -> original id
+
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
     struct ggml_tensor * ffn_down_exps_s   = nullptr;

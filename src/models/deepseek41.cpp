@@ -1,6 +1,7 @@
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-moecache.h"
+#include "llama-expertsplit.h"
 
 #include "llama-kv-cache-dsv4.h"
 
@@ -231,6 +232,22 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         }
     }
 
+    // FLE split experts, format v1 (written by the Forge tool); without the key every layer needs the normal experts
+    uint32_t split_version = 0;
+    ml.get_key(std::string("fle.expert_split.version"), split_version, false);
+    if (split_version > 1) {
+        throw std::runtime_error(format("fle.expert_split.version %u is newer than this engine (1)", split_version));
+    }
+    const bool expert_split = split_version == 1;
+    if (expert_split) {
+        uint32_t split_hot = 0;
+        std::string split_src;
+        ml.get_key(std::string("fle.expert_split.hot"), split_hot, false);
+        ml.get_key(std::string("fle.expert_split.source"), split_src, false);
+        LLAMA_LOG_INFO("%s: FLE split experts v1: up to %u hot experts per layer on the GPU (source %s)\n", __func__,
+                split_hot, split_src.empty() ? "?" : split_src.c_str());
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -275,9 +292,33 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+        // FLE split experts (docs/fle/EXPERT-SPLIT.md): a split file carries a hot and a cold half per role (each with one
+        // trailing zero row) and the slot tables instead of ffn_*_exps; n_hot may differ per layer, so it comes from the file
+        const std::string hot_name = tn(LLM_TENSOR_FFN_UP_EXPS_HOT, "weight", i).str();
+        const ggml_tensor * hot_meta = expert_split ? ml.get_tensor_meta(hot_name.c_str()) : nullptr;
+        if (hot_meta) {
+            const int64_t n_hot  = hot_meta->ne[2] - 1;
+            const int64_t n_cold = n_expert - n_hot;
+            if (n_hot < 0 || n_cold < 0) {
+                throw std::runtime_error(format("%s: %" PRId64 " hot rows for %" PRId64 " experts", hot_name.c_str(), hot_meta->ne[2], n_expert));
+            }
+            layer.ffn_gate_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_HOT,  "weight", i), {n_embd,   n_ff_exp, n_hot + 1},  0);
+            layer.ffn_down_exps_hot  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_HOT,  "weight", i), {n_ff_exp, n_embd,   n_hot + 1},  0);
+            layer.ffn_up_exps_hot    = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_HOT,    "weight", i), {n_embd,   n_ff_exp, n_hot + 1},  0);
+            layer.ffn_gate_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS_COLD, "weight", i), {n_embd,   n_ff_exp, n_cold + 1}, 0);
+            layer.ffn_down_exps_cold = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS_COLD, "weight", i), {n_ff_exp, n_embd,   n_cold + 1}, 0);
+            layer.ffn_up_exps_cold   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS_COLD,   "weight", i), {n_embd,   n_ff_exp, n_cold + 1}, 0);
+            layer.ffn_exps_slot      = create_tensor(tn(LLM_TENSOR_FFN_EXPS_SLOT,      "weight", i), {n_expert}, 0);
+            layer.ffn_exps_id        = create_tensor(tn(LLM_TENSOR_FFN_EXPS_ID,        "weight", i), {n_expert}, 0);
+            if (ml.get_tensor_meta(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i).str().c_str())) {
+                throw std::runtime_error(format("layer %d has both split and normal experts", i));
+            }
+        } else {
+            // an unsplit layer (also inside a split file) keeps the normal experts, required as before
+            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+        }
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd}, 0);
@@ -1091,7 +1132,8 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         // reads the predicted CPU-side experts ahead while this layer computes
         {
             static const int fle_pf_k = [] { const char * e = std::getenv("FLE_MOE_PREFETCH"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
-            if (fle_pf_k > 0 && il + 1 < n_layer && n_tokens <= 8 &&
+            // (not into a split layer: the expert store sees its cold half in cold-local numbering, the prediction is in original ids)
+            if (fle_pf_k > 0 && il + 1 < n_layer && n_tokens <= 8 && !model.layers[il + 1].ffn_up_exps_hot &&
                 hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS && model.layers[il + 1].ffn_gate_inp && model.layers[il + 1].ffn_exp_probs_b) {
                 const auto & nl = model.layers[il + 1];
                 ggml_tensor * pl = build_lora_mm(nl.ffn_gate_inp, cur);
@@ -1105,12 +1147,15 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         // FLE expert deferral: the previous layer's deferred CPU experts are already in the graph (placed right after its merge, below)
         fle_defer_pending = nullptr;
 
-        // the reference normalizes only when it routes to more than one expert
+        // the reference normalizes only when it routes to more than one expert. A split layer hands its cold halves in; build_moe_ffn
+        // finds the hot half and the id tables through them (llama-expertsplit.h)
+        const bool split_layer = layer.ffn_up_exps_hot != nullptr;
+        GGML_ASSERT((!split_layer || llama_expert_split_lookup(layer.ffn_up_exps_cold)) && "split layer without tables (llama_expert_split_init)");
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
+                split_layer ? layer.ffn_up_exps_cold   : layer.ffn_up_exps,
+                split_layer ? layer.ffn_gate_exps_cold : layer.ffn_gate_exps,
+                split_layer ? layer.ffn_down_exps_cold : layer.ffn_down_exps,
                 exp_probs_b,
                 n_expert, hparams.n_expert_used(),
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
