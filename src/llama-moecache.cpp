@@ -1,4 +1,5 @@
 #include "llama-moecache.h"
+#include "llama.h"
 #include "llama-expertstore.h"
 #include "llama-expertsplit.h"
 
@@ -208,6 +209,22 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+
+// FLE status (/fle/status in the server): what the start decided, filled once by llama_moe_cache_init / store_init,
+// read by llama_fle_status_json(); the live counters are read from the cache and the store when asked
+struct fle_status_t {
+    std::string prof_path;
+    int         prof_state = -1;      // -1 no profile set, 0 not found (cold start), 1 loaded, 2 rejected
+    std::string prof_reason;
+    uint64_t    prof_steps = 0;
+    int64_t     budget_mib = 0;
+    int64_t     fitted_bytes = -1;    // -1: no cache
+    int64_t     experts = -1;
+    int32_t     inserts = -1;
+    int64_t     warm_experts = -1;
+    double      warm_gb = -1.0;
+};
+static fle_status_t & g_fle_st = *new fle_status_t();
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -1280,6 +1297,7 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
                 }
             }
         }
+        g_fle_st.warm_experts = (int64_t) n; g_fle_st.warm_gb = g_store->stats().read_bytes / 1e9;
         std::fprintf(stderr, "[fle-store] warm start: %zu experts (%.1f GB) in %.1f s\n", n,
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }
@@ -1651,12 +1669,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
 
         // Patch 44a: read the usage profile before anything is allocated (44b plans slot counts from it)
         prof_file pf;
+        g_fle_st.prof_path = mc->prof_path;
         if (!mc->prof_path.empty()) {
             std::string why;
             if (prof_read(mc->prof_path, *mc, pf, why) && prof_validate(pf, groups, why)) {
                 LLAMA_LOG_INFO("[fle-moe-profile] loaded %s: %zu layers, %" PRIu64 " steps recorded by earlier runs\n",
                         mc->prof_path.c_str(), pf.layers.size(), pf.steps);
+                g_fle_st.prof_state = 1; g_fle_st.prof_steps = pf.steps;
             } else {
+                g_fle_st.prof_state = why == "not found" ? 0 : 2; g_fle_st.prof_reason = why;
                 pf = prof_file();
                 if (why == "not found") {
                     LLAMA_LOG_INFO("[fle-moe-profile] %s not found - cold start, the file is created at the first save\n",
@@ -2033,6 +2054,11 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
         g_cache = mc;
         g_init_done = true;
+        {
+            int64_t ne = 0;
+            for (auto & L : mc->layers) { ne += L.pub.n_slots; }
+            g_fle_st.experts = ne; g_fle_st.fitted_bytes = (int64_t) vram; g_fle_st.inserts = mc->max_inserts; g_fle_st.budget_mib = mc->budget_mib;
+        }
 
         LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %.1f MiB device memory\n",
                 __func__, mc->layers.size(), mc->n_slots, mc->max_inserts, vram/1024.0/1024.0);
@@ -2714,4 +2740,54 @@ void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd) {
         g_cr_q.push_back({ il + 1, std::vector<float>(x, x + n_embd) });
     }
     g_cr_cv.notify_one();
+}
+
+// ---- FLE status as JSON (for /fle/status): start decisions + live counters, unknown values as null -------------------
+static void fle_json_str(std::string & o, const std::string & v) {
+    o += '"';
+    for (char c : v) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char) c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+        else { o += c; }
+    }
+    o += '"';
+}
+
+const char * llama_fle_status_json(void) {
+    static thread_local std::string o;
+    o.clear();
+    char b[256];
+    const fle_status_t & st = g_fle_st;
+    const char * ro = std::getenv("FLE_MOE_PROFILE_READONLY");
+    o += "{\"profile\":{\"loaded\":"; o += st.prof_state == 1 ? "true" : "false";
+    o += ",\"path\":"; if (st.prof_path.empty()) { o += "null"; } else { fle_json_str(o, st.prof_path); }
+    o += ",\"checksum_ok\":"; o += st.prof_state == 1 ? "true" : (st.prof_state == 2 ? "false" : "null");
+    o += ",\"readonly\":"; o += (ro && atoi(ro) != 0) ? "true" : "false";
+    o += ",\"steps\":"; if (st.prof_state == 1) { snprintf(b, sizeof(b), "%" PRIu64, st.prof_steps); o += b; } else { o += "null"; }
+    o += ",\"rejected_reason\":"; if (st.prof_state == 2) { fle_json_str(o, st.prof_reason); } else { o += "null"; }
+    o += ",\"state\":\""; o += st.prof_state == 1 ? "loaded" : st.prof_state == 0 ? "not_found" : st.prof_state == 2 ? "rejected" : "none"; o += "\"}";
+    o += ",\"gpu_cache\":{";
+    if (st.fitted_bytes >= 0) {
+        snprintf(b, sizeof(b), "\"requested_mib\":%lld,\"fitted_mib\":%lld,\"inserts\":%d,\"experts\":%lld",
+                (long long) st.budget_mib, (long long) (st.fitted_bytes >> 20), st.inserts, (long long) st.experts);
+        o += b;
+        uint64_t h = 0, m = 0;
+        if (g_cache) { for (auto & ls : g_cache->layers) { h += ls.n_hit; m += ls.n_miss; } }
+        if (h + m > 0) { snprintf(b, sizeof(b), ",\"hit\":%.4f", (double) h / (double) (h + m)); o += b; } else { o += ",\"hit\":null"; }
+    } else {
+        o += "\"requested_mib\":null,\"fitted_mib\":null,\"inserts\":null,\"experts\":null,\"hit\":null";
+    }
+    o += "},\"store\":{";
+    const char * sg = std::getenv("FLE_MOE_STORE_GB");
+    if (g_store) {
+        const auto & ss = g_store->stats();
+        snprintf(b, sizeof(b), "\"gb\":%s,\"warm_experts\":%lld,\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"read_gb\":%.2f",
+                sg ? sg : "null", (long long) st.warm_experts, (unsigned long long) ss.hits, (unsigned long long) ss.misses,
+                (unsigned long long) ss.evictions, ss.read_bytes / 1e9);
+        o += b;
+    } else {
+        o += "\"gb\":null,\"warm_experts\":null,\"hits\":null,\"misses\":null,\"evictions\":null,\"read_gb\":null";
+    }
+    o += "}}";
+    return o.c_str();
 }

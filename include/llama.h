@@ -1584,6 +1584,10 @@ extern "C" {
     // Print system information
     LLAMA_API const char * llama_print_system_info(void);
 
+    // FLE: start decisions and live counters of the MoE cache and the RAM expert store as one JSON object
+    // ({"profile":…, "gpu_cache":…, "store":…}, unknown values null). The pointer stays valid until the next call on this thread.
+    LLAMA_API const char * llama_fle_status_json(void);
+
     // Set callback for all future logging events.
     // If this is not called, or NULL is supplied, everything is output on stderr.
     // The logger state is global so these functions are NOT thread safe.
