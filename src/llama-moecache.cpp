@@ -1242,6 +1242,9 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }
     ggml_set_moe_data_callback(llama_expert_store::data_cb, g_store.get());
+    ggml_set_moe_pin_callback(
+        [](const ggml_tensor * src, int32_t e, int32_t * slot, void * ud) -> const void * { return ((llama_expert_store *) ud)->acquire(src, e, slot); },
+        [](int32_t slot, void * ud) { ((llama_expert_store *) ud)->release(slot); }, g_store.get());
     if (const char * e = std::getenv("FLE_MOE_STORE_ASYNC"); e && atoi(e) != 0) {
         ggml_set_moe_ready_callback(llama_expert_store::ready_cb, g_store.get());   // resident experts first, misses as they land
     }
