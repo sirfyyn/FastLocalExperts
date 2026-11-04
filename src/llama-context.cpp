@@ -2585,7 +2585,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // Patch 48: a long batch borrows the larger compute buffer from the expert cache, the next short call gives it back
     if (fle_ub_small > 0) {
-        if ((uint32_t) n_tokens_all >= fle_lend_min) {
+        const bool fle_in_win = fle_win > 0 && (uint32_t) n_tokens_all <= fle_win_max;   // windows run small ubatches
+        if ((uint32_t) n_tokens_all >= fle_lend_min && !fle_in_win) {
             if (!fle_big) { fle_lend_begin(); }
         } else if (fle_big) {
             fle_lend_end();
@@ -2602,7 +2603,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        const uint32_t fle_ub = fle_win > 0 && n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
+        // windows only for causal text generation: a non-causal or embedding call must stay one ubatch (attention, pooling)
+        const bool fle_win_ok = fle_win > 0 && cparams.causal_attn && !cparams.embeddings &&
+                                n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max;
+        const uint32_t fle_ub = fle_win_ok ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
         mctx = memory->init_batch(*balloc, fle_ub, output_all);
         if (!mctx) {
             return -2;
