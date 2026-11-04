@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+static int64_t g_fle_fit_max_mib = -1;
+int64_t common_fle_fit_max_mib() { return g_fle_fit_max_mib; }
+
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
@@ -349,6 +352,14 @@ static void common_params_fit_impl(
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
+            if (projected_free_per_device[0] < margins[0]) {
+                const char * e_fit = std::getenv("FLE_MOE_CACHE_BUDGET_FIT");
+                const char * e_mib = std::getenv("FLE_MOE_CACHE_BUDGET_MIB");
+                if (e_fit && atoi(e_fit) != 0 && e_mib && atoll(e_mib) > 0) {
+                    const int64_t target = (int64_t) margins[0] - atoll(e_mib) * MiB;   // the margin without the cache
+                    g_fle_fit_max_mib = std::max<int64_t>(0, (projected_free_per_device[0] - target) / MiB);
+                }
+            }
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);

@@ -480,6 +480,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
             if (ctx_http.thread.joinable()) {
                 ctx_http.thread.join();
             }
+            // FLE /fle/status: the start error for FLE Link, once, as one JSON line (the HTTP server does not answer any more)
+            if (common_fle_fit_max_mib() >= 0) {
+                fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"fit_budget_too_large\",\"max_mib\":%lld,\"text\":"
+                        "\"FLE_MOE_CACHE_BUDGET_MIB does not fit next to the model and context; at most %lld MiB with these settings.\"}}\n",
+                        (long long) common_fle_fit_max_mib(), (long long) common_fle_fit_max_mib());
+            } else {
+                fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"model_load_failed\",\"text\":\"The model or its context could not be loaded; see the log above.\"}}\n");
+            }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
         }

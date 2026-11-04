@@ -1,7 +1,7 @@
 # `/fle/status`
 
 `GET /fle/status` returns one JSON object (schema 1) for FLE Link: what the engine decided at start and live counters.
-Unknown or unavailable values are `null`, never left out. The endpoint only reads process state and counters; it does not
+Unknown or unavailable values are `null`, never left out: every field of the schema is always present. The endpoint only reads process state and counters; it does not
 touch the compute path.
 
 ```json
@@ -32,9 +32,19 @@ touch the compute path.
 - Warnings (`code` stays fixed, `text` is English): `inserts0_no_profile`, `cuda_lt_13_4`, `prefill_window_gt_8`.
 - `live`: decode and prefill tok/s and DSpark acceptance from finished requests; `draft_mean_len` = 1 + accepted per verify step.
 
-Not yet filled (null): `draft.block`, `cpu_experts_per_round`, and the error object for start failures
-(`{"error": {"code": "fit_budget_too_large", "max_mib": …}}`): a failed start ends the process before the HTTP server
-answers, so that case still needs a separate channel.
+Not yet filled (null): `draft.block`, `cpu_experts_per_round`.
+
+## Start errors
+
+A failed start ends the process before the HTTP server answers. The server then writes, once, one line to stderr:
+
+```
+[fle-status-error] {"error":{"code":"fit_budget_too_large","max_mib":14200,"text":"..."}}
+```
+
+- `fit_budget_too_large`: with `FLE_MOE_CACHE_BUDGET_FIT=1` the requested `FLE_MOE_CACHE_BUDGET_MIB` did not fit next to
+  model and context; `max_mib` is the largest budget that would have left the `-fit-target` margin on device 0.
+- `model_load_failed`: any other load or context failure (no `max_mib`); the log above has the cause.
 
 Library side: `llama_fle_status_json()` (include/llama.h, implemented in src/llama-moecache.cpp) returns the profile,
 GPU cache and store parts; the server (tools/server/server-context.cpp, `get_fle_status`) adds the rest.
