@@ -130,6 +130,7 @@ struct moe_cache {
     uint64_t                prof_max_obs    = 1ULL << 27; // FLE_MOE_PROFILE_MAX_OBS: per-layer total at which counts are halved
     bool                    prof_dirty      = false;      // observations since the last save
     bool                    prof_loaded     = false;
+    bool                    prof_no_save    = false;      // the file belongs to another model: read nothing, write nothing
     uint64_t                prof_base_steps = 0;          // steps recorded by earlier runs
     uint64_t                prof_saves      = 0;
     std::chrono::steady_clock::time_point prof_last_save{};
@@ -1033,7 +1034,7 @@ bool prof_write(moe_cache * mc, const char * reason) {
     // FLE_MOE_PROFILE_READONLY=1: the profile is only read (warm start), never written: runs do not change each other's
     // starting state, and a profile recorded for one quant is not overwritten by a run of another
     static const bool ro = [] { const char * e = std::getenv("FLE_MOE_PROFILE_READONLY"); return e && atoi(e) != 0; }();
-    if (ro) { (void) mc; (void) reason; return true; }
+    if (ro || mc->prof_no_save) { (void) reason; return true; }
     std::vector<prof_layer> out;
     uint64_t obs = 0;
     for (const auto & ls : mc->layers) {
@@ -1588,8 +1589,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     LLAMA_LOG_INFO("[fle-moe-profile] %s not found - cold start, the file is created at the first save\n",
                             mc->prof_path.c_str());
                 } else {
-                    LLAMA_LOG_WARN("[fle-moe-profile] %s rejected: %s - cold start, the file is replaced at the next save\n",
+                    // never overwrite a profile written for another model (an IQ1_M run replaced the IQ2_XXS profile, 03.11.)
+                    LLAMA_LOG_WARN("[fle-moe-profile] %s rejected: %s - cold start, the file is left untouched (not saved)\n",
                             mc->prof_path.c_str(), why.c_str());
+                    mc->prof_no_save = true;
                 }
             }
         }
