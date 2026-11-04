@@ -2321,12 +2321,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         {
             const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
             constexpr float eps = 1e-6f;
-            if (limit > eps) {
+            if (limit > eps && (llm_arch_is_dsv4_family(arch) || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0))) {
+                // the same op as the CPU experts and the shared expert (silu(min(g,L)) * clamp(u,-L,L)); as one GLU node the CUDA
+                // backend fuses gate, up and the activation into one MMVQ pass with one quantized input (FLE 04.11.: V4.1 took the
+                // three-node branch below, which clamps after the silu)
+                act_g = ggml_swiglu_clamp(ctx0, gate_g, up_g, limit);
+            } else if (limit > eps) {
                 up_g = ggml_clamp(ctx0, up_g, -limit, limit);
-                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                    gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
-                    act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
-                } else {
+                {
                     ggml_tensor * ga = ggml_silu(ctx0, gate_g);
                     ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
                     act_g = ggml_mul(ctx0, ga, up_g);
