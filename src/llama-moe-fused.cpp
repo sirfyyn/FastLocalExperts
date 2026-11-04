@@ -16,6 +16,11 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include <cstdlib>
 #include <cstdio>
@@ -82,6 +87,8 @@ struct fle_pool {
 #if defined(__linux__)
                 cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
                 pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+                if (cpu >= 0 && cpu < 64) { SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu); }
 #else
                 (void) cpu;
 #endif

@@ -17,7 +17,13 @@
 #include <thread>
 #include <unordered_map>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -25,14 +31,58 @@
 #include <unistd.h>
 #endif
 
+// a file of the store: an fd on Linux, a HANDLE on Windows (both opened for unbuffered positional reads)
+typedef intptr_t es_file;
+
+#ifdef _WIN32
+static es_file es_open(const std::string & path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring w((size_t) std::max(n, 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &w[0], n);
+    // FILE_FLAG_NO_BUFFERING = O_DIRECT: buffer, offset and length must be sector aligned (the store uses 4096)
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return h == INVALID_HANDLE_VALUE ? (es_file) -1 : (es_file) h;
+}
+static void es_close(es_file f) { if (f != (es_file) -1) { CloseHandle((HANDLE) f); } }
+// positional read; returns bytes read, 0 at end of file, -1 on error
+static int64_t es_pread(es_file f, char * dst, size_t len, uint64_t off) {
+    OVERLAPPED ov = {};
+    ov.Offset     = (DWORD) (off & 0xffffffffu);
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    const DWORD want = (DWORD) std::min<size_t>(len, (size_t) 1 << 30);
+    if (!ReadFile((HANDLE) f, dst, want, &got, &ov)) {
+        return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    }
+    return (int64_t) got;
+}
+#else
+static es_file es_open(const std::string & path) {
+#ifdef O_DIRECT
+    return (es_file) ::open(path.c_str(), O_RDONLY | O_DIRECT);
+#else
+    return (es_file) ::open(path.c_str(), O_RDONLY);   // (no O_DIRECT here: buffered reads)
+#endif
+}
+static void es_close(es_file f) { if (f >= 0) { ::close((int) f); } }
+static int64_t es_pread(es_file f, char * dst, size_t len, uint64_t off) {
+    for (;;) {
+        const ssize_t r = pread((int) f, dst, len, (off_t) off);
+        if (r < 0 && errno == EINTR) { continue; }
+        return (int64_t) r;
+    }
+}
+#endif
+
 static constexpr size_t ES_ALIGN = 4096;
 
 static size_t es_round_up(size_t x) { return (x + ES_ALIGN - 1) & ~(ES_ALIGN - 1); }
 
-struct es_job { int fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
+struct es_job { es_file fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
 
 struct llama_expert_store::impl {
-    struct role_t { int fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
+    struct role_t { es_file fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
     struct layer_t {
         int il = -1; int64_t n_expert = 0; role_t r[3]; int cls = 0; size_t blob = 0;
         std::vector<int32_t>      slot_of;   // expert -> slot, -1
@@ -46,7 +96,7 @@ struct llama_expert_store::impl {
 
     std::vector<layer_t> layers;
     std::unordered_map<const void *, std::pair<int32_t, int32_t>> by_data;   // tensor data -> (layer index, role)
-    std::vector<int> fds;
+    std::vector<es_file> fds;
     char *  arena = nullptr;
     size_t  arena_bytes = 0;
     size_t  blob = 0;
@@ -85,15 +135,12 @@ struct llama_expert_store::impl {
                 j = q.front(); q.pop_front();
             }
             bool ok = true;
-#ifndef _WIN32
             size_t got = 0;
             while (got < j.len) {
-                const ssize_t r = pread(j.fd, j.dst + got, j.len - got, (off_t) (j.off + got));
-                if (r < 0 && errno == EINTR) { continue; }
+                const int64_t r = es_pread(j.fd, j.dst + got, j.len - got, j.off + got);
                 if (r <= 0) { ok = r == 0 && got > 0; break; }   // EOF after data: the tail past the file end is not needed
                 got += (size_t) r;
             }
-#endif
             if (j.ctr) {
                 if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; bad[(size_t) (j.ctr - inflight.get())].store(1, std::memory_order_relaxed); }
                 j.ctr->fetch_sub(1, std::memory_order_release);
@@ -157,7 +204,35 @@ struct llama_expert_store::impl {
     }
 };
 
-#ifndef _WIN32
+#ifdef _WIN32
+// file and offset behind a mapped address: the view llama.cpp maps covers the whole file from offset 0
+static bool es_file_of(const void * addr, std::string & path, uint64_t & file_off) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.Type != MEM_MAPPED) { return false; }
+    wchar_t dev[MAX_PATH * 2] = {0};
+    if (!GetMappedFileNameW(GetCurrentProcess(), (LPVOID) addr, dev, MAX_PATH * 2)) { return false; }
+    // \Device\HarddiskVolumeN\... -> X:\...
+    std::wstring d(dev), dos;
+    wchar_t drives[512] = {0};
+    if (GetLogicalDriveStringsW(511, drives)) {
+        for (wchar_t * p = drives; *p; p += wcslen(p) + 1) {
+            wchar_t letter[3] = { p[0], L':', 0 }, target[MAX_PATH] = {0};
+            if (QueryDosDeviceW(letter, target, MAX_PATH)) {
+                const size_t n = wcslen(target);
+                if (d.compare(0, n, target) == 0 && (d.size() == n || d[n] == L'\\')) { dos = std::wstring(letter) + d.substr(n); break; }
+            }
+        }
+    }
+    if (dos.empty()) { return false; }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, dos.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string u((size_t) std::max(n, 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, dos.c_str(), -1, &u[0], n, nullptr, nullptr);
+    u.resize(strlen(u.c_str()));
+    path = u;
+    file_off = (uint64_t) ((const char *) addr - (const char *) mbi.AllocationBase);
+    return true;
+}
+#else
 // file and offset behind a mapped address, from /proc/self/maps
 static bool es_file_of(const void * addr, std::string & path, uint64_t & file_off) {
     FILE * f = std::fopen("/proc/self/maps", "r");
@@ -180,10 +255,6 @@ static bool es_file_of(const void * addr, std::string & path, uint64_t & file_of
 #endif
 
 std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector<llama_expert_store_layer> & in, size_t budget_bytes, int threads) {
-#ifdef _WIN32
-    (void) in; (void) budget_bytes; (void) threads;
-    return nullptr;
-#else
     auto * d = new impl();
     std::map<std::string, int> fd_of;
     for (const auto & il : in) {
@@ -198,12 +269,8 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
             if (!es_file_of(t->data, path, foff)) { ok = false; break; }
             auto it = fd_of.find(path);
             if (it == fd_of.end()) {
-                #ifdef O_DIRECT
-                const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-#else
-                const int fd = ::open(path.c_str(), O_RDONLY);   // (no O_DIRECT here: buffered reads)
-#endif
-                if (fd < 0) { ok = false; break; }
+                const es_file fd = es_open(path);
+                if (fd == (es_file) -1) { ok = false; break; }
                 it = fd_of.emplace(path, fd).first;
                 d->fds.push_back(fd);
             }
@@ -218,7 +285,7 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         }
         if (!ok) {
             LLAMA_LOG_WARN("%s: layer %d: expert tensors not mapped from a file, store off\n", __func__, il.il);
-            for (int fd : d->fds) { ::close(fd); }
+            for (es_file fd : d->fds) { es_close(fd); }
             delete d;
             return nullptr;
         }
@@ -248,10 +315,15 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         d->cls_hi.push_back(n_slots);
     }
     if (n_slots == 0) { delete d; return nullptr; }
+#ifdef _WIN32
+    void * a = VirtualAlloc(nullptr, d->arena_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // 64 KiB aligned
+    if (!a) {
+#else
     void * a = mmap(nullptr, d->arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (a == MAP_FAILED) {
+#endif
         LLAMA_LOG_WARN("%s: arena of %.1f GB failed, store off\n", __func__, d->arena_bytes / 1e9);
-        for (int fd : d->fds) { ::close(fd); }
+        for (es_file fd : d->fds) { es_close(fd); }
         delete d;
         return nullptr;
     }
@@ -285,7 +357,6 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         LLAMA_LOG_INFO("%s: FLE_MOE_STORE: class %zu: %zu slots of %.2f MB\n", __func__, c, d->cls_hi[c] - d->cls_lo[c], d->cls_blob[c] / 1e6);
     }
     return std::unique_ptr<llama_expert_store>(new llama_expert_store(d));
-#endif
 }
 
 llama_expert_store::~llama_expert_store() {
@@ -300,10 +371,12 @@ llama_expert_store::~llama_expert_store() {
     }
     d->cv.notify_all();
     for (auto & t : d->pool) { t.join(); }
-#ifndef _WIN32
+#ifdef _WIN32
+    if (d->arena) { VirtualFree(d->arena, 0, MEM_RELEASE); }
+#else
     if (d->arena) { munmap(d->arena, d->arena_bytes); }
-    for (int fd : d->fds) { ::close(fd); }
 #endif
+    for (es_file fd : d->fds) { es_close(fd); }
     delete d;
 }
 
