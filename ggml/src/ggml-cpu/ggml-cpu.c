@@ -1670,7 +1670,9 @@ static void ggml_compute_forward_mul_mat_id(
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
-    const int64_t fle_t_in = ggml_time_us();   // FLE_MMID_PROF (see below)
+    static int fle_mp_every = -1;   // FLE_MMID_PROF (see below); no clock read when it is off
+    if (fle_mp_every < 0) { const char * e = getenv("FLE_MMID_PROF"); fle_mp_every = (e && *e) ? atoi(e) : 0; }
+    const int64_t fle_t_in = fle_mp_every > 0 ? ggml_time_us() : 0;
     const int nth = params->nth;
 
     const enum ggml_type type = src0->type;
@@ -1847,9 +1849,6 @@ static void ggml_compute_forward_mul_mat_id(
 
     // FLE_MMID_PROF=N: every N calls of mul_mat_id (thread 0) one line with the mean times of its phases: routing/obs
     // (grouping, expert cache, store requests), pass 0 (experts in RAM), pass 1 (experts whose reads were still running)
-    static int fle_mp_every = -1;
-    if (fle_mp_every < 0) { const char * e = getenv("FLE_MMID_PROF"); fle_mp_every = (e && *e) ? atoi(e) : 0; }
-    const int64_t fle_t_obs = (ith == 0 && fle_mp_every > 0) ? ggml_time_us() : 0;
 
     if (ith == 0) {
         void * rud = NULL;
@@ -1977,7 +1976,6 @@ static void ggml_compute_forward_mul_mat_id(
             for (int k = 0; k < 5; ++k) { by_n_us[k] = by_n_bytes[k] = by_n_cnt[k] = 0; }
         }
     }
-    (void) fle_t_obs;
 }
 
 /////////////////////////////////

@@ -68,6 +68,7 @@ struct layer_state {
 
     // Patch 44a (FLE_MOE_PROFILE): lifetime routing counts of this layer, saved to / seeded from the profile file
     std::vector<uint64_t> prof_cnt;
+    std::vector<uint8_t>  prof_seen;   // FLE_MOE_PROFILE_UNION scratch: experts already counted in this call
     uint64_t              prof_total  = 0;   // sum of prof_cnt (aged: halved when it reaches prof_max_obs)
     int32_t               n_prefilled = 0;   // slots filled from the profile at start
 
@@ -130,6 +131,7 @@ struct moe_cache {
     uint64_t                prof_max_obs    = 1ULL << 27; // FLE_MOE_PROFILE_MAX_OBS: per-layer total at which counts are halved
     bool                    prof_dirty      = false;      // observations since the last save
     bool                    prof_loaded     = false;
+    bool                    prof_no_save    = false;      // the file belongs to another model: read nothing, write nothing
     uint64_t                prof_base_steps = 0;          // steps recorded by earlier runs
     uint64_t                prof_saves      = 0;
     std::chrono::steady_clock::time_point prof_last_save{};
@@ -403,13 +405,19 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     }
 
     std::lock_guard<std::mutex> lock(mc->mtx);
+    // FLE_MOE_PROFILE_UNION=1: the profile counts an expert once per call (per verify round), not once per token: a speculative
+    // round pays a CPU expert once however many of its tokens route to it, so the static cache should hold the experts most
+    // often in a round's union. Record with FLE_MOE_OBS_MAXTOK >= the verify batch (6 for n-max 5).
+    static const bool prof_union = [] { const char * e = std::getenv("FLE_MOE_PROFILE_UNION"); return e && atoi(e) != 0; }();
+    std::vector<uint8_t> & seen = ls->prof_seen;
+    if (prof_union && !ls->prof_cnt.empty()) { seen.assign(ls->prof_cnt.size(), 0); }
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t i = 0; i < n_ids; ++i) {
             const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
             if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
                 continue;
             }
-            if (!ls->prof_cnt.empty()) {
+            if (!ls->prof_cnt.empty() && !(prof_union && seen[(size_t) id]++)) {
                 ls->prof_cnt[id]++;
                 mc->prof_dirty = true;
                 if (++ls->prof_total >= mc->prof_max_obs) {   // age: old runs must not dominate forever
@@ -994,6 +1002,10 @@ bool prof_validate(prof_file & pf, const Groups & groups, std::string & why) {
 // Caller holds mc->mtx. Writes live counters of the cache layers plus the layers of the loaded file that have no
 // cache in this run (e.g. after a fit that left fewer layers on the host), so a smaller run does not drop them.
 bool prof_write(moe_cache * mc, const char * reason) {
+    // FLE_MOE_PROFILE_READONLY=1: the profile is only read (warm start), never written: runs do not change each other's
+    // starting state, and a profile recorded for one quant is not overwritten by a run of another
+    static const bool ro = [] { const char * e = std::getenv("FLE_MOE_PROFILE_READONLY"); return e && atoi(e) != 0; }();
+    if (ro || mc->prof_no_save) { (void) reason; return true; }
     std::vector<prof_layer> out;
     uint64_t obs = 0;
     for (const auto & ls : mc->layers) {
@@ -1180,6 +1192,9 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }
     ggml_set_moe_data_callback(llama_expert_store::data_cb, g_store.get());
+    ggml_set_moe_pin_callback(
+        [](const ggml_tensor * src, int32_t e, int32_t * slot, void * ud) -> const void * { return ((llama_expert_store *) ud)->acquire(src, e, slot); },
+        [](int32_t slot, void * ud) { ((llama_expert_store *) ud)->release(slot); }, g_store.get());
     if (const char * e = std::getenv("FLE_MOE_STORE_ASYNC"); e && atoi(e) != 0) {
         ggml_set_moe_ready_callback(llama_expert_store::ready_cb, g_store.get());   // resident experts first, misses as they land
     }
@@ -1476,8 +1491,8 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         // as long as EVERY transfer takes exactly one step. If one takes longer, a shadow
         // slot is missing and the `if (slot < 0) break;` path is hit, which triggered the
         // collapse at a cap of 16. Cost: one slot per layer, 44 x 2.655 = 117 MiB.
-        mc->n_slots_total  = n_slots + (mc->fle_shadow ? (2 * (max_inserts > 0 ? max_inserts : 2)) : 0);
-        if (max_inserts > 0) {
+        mc->n_slots_total  = n_slots + (mc->fle_shadow && max_inserts != 0 ? (2 * (max_inserts > 0 ? max_inserts : 2)) : 0);   // no shadow slots without uploads
+        if (max_inserts >= 0) {   // 0 = no uploads while decoding: the cache stays as the profile filled it (same output for the same input)
             mc->max_inserts = max_inserts;
         }
         mc->shadow_n   = mc->n_slots_total - mc->n_slots;   // = 2 * inserts with shadow slots, else 0 (before 44b plans anything)
@@ -1527,8 +1542,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                     LLAMA_LOG_INFO("[fle-moe-profile] %s not found - cold start, the file is created at the first save\n",
                             mc->prof_path.c_str());
                 } else {
-                    LLAMA_LOG_WARN("[fle-moe-profile] %s rejected: %s - cold start, the file is replaced at the next save\n",
+                    // never overwrite a profile written for another model (an IQ1_M run replaced the IQ2_XXS profile, 03.11.)
+                    LLAMA_LOG_WARN("[fle-moe-profile] %s rejected: %s - cold start, the file is left untouched (not saved)\n",
                             mc->prof_path.c_str(), why.c_str());
+                    mc->prof_no_save = true;
                 }
             }
         }

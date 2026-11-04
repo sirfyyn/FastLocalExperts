@@ -2444,7 +2444,11 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         }
 
         if (extract_reasoning && inputs.enable_thinking) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            // V4.1 switches thinking off through the template variable thinking_mode ("chat"), which leaves
+            // enable_thinking set: its generation prompt then ends with a bare </think>, consume it as well
+            reasoning = is_v4
+                ? p.optional(p.choice({ THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END, p.literal(THINK_END) }))
+                : p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
             reasoning_with_tc = THINK_START +
                 p.reasoning(p.until_one_of({ TC_SEPARATOR + FC_START, FC_START, THINK_END })) +
                 p.space() + obligatory_tool_calls;

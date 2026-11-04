@@ -2069,8 +2069,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     float   fle_wscale     = 1.0f;            // fixed extra factor on the renormalised weights
     int64_t fle_layer_k = cparams.n_moe_active_experts;   // overridable per layer (--moe-active-layers)
     if (il >= 0 && (size_t) il < cparams.moe_active_layers.size() && cparams.moe_active_layers[il] > 0) {
-    if (il >= 0 && n_tokens <= 8) { llama_moe_register_router(il, gate_inp, exp_probs_b, (int) n_expert_used); }   // FLE_MOE_CPU_PRED
-
         fle_layer_k = cparams.moe_active_layers[il];
     }
     if (arch == LLM_ARCH_QWEN4EXP && norm_w && cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP &&
@@ -2274,6 +2272,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty()) {
         mcache = llama_moe_cache_lookup(up_exps);
     }
+    // FLE_MOE_CPU_PRED: only the model that owns the expert cache (not a drafter), and only once its router weights exist
+    if (mcache && il >= 0 && n_tokens <= 8 && gate_inp && gate_inp->data) {
+        llama_moe_register_router(il, gate_inp, exp_probs_b, (int) n_expert_used);
+    }
     if (mcache) {
         // ggml_get_rows does NOT broadcast over the token axis and requires a
         // contiguous index, and selected_experts is a view. Forgetting either one
@@ -2322,12 +2324,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         {
             const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
             constexpr float eps = 1e-6f;
-            if (limit > eps) {
+            if (limit > eps && (llm_arch_is_dsv4_family(arch) || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0))) {
+                // the same op as the CPU experts and the shared expert (silu(min(g,L)) * clamp(u,-L,L)); as one GLU node the CUDA
+                // backend fuses gate, up and the activation into one MMVQ pass with one quantized input (FLE 04.11.: V4.1 took the
+                // three-node branch below, which clamps after the silu)
+                act_g = ggml_swiglu_clamp(ctx0, gate_g, up_g, limit);
+            } else if (limit > eps) {
                 up_g = ggml_clamp(ctx0, up_g, -limit, limit);
-                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                    gate_g = ggml_clamp(ctx0, gate_g, -INFINITY, limit);
-                    act_g  = ggml_swiglu_split(ctx0, gate_g, up_g);
-                } else {
+                {
                     ggml_tensor * ga = ggml_silu(ctx0, gate_g);
                     ga    = ggml_clamp(ctx0, ga, -INFINITY, limit);
                     act_g = ggml_mul(ctx0, ga, up_g);

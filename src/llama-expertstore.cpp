@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -16,7 +17,13 @@
 #include <thread>
 #include <unordered_map>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
@@ -24,14 +31,75 @@
 #include <unistd.h>
 #endif
 
+// a file of the store: an fd on Linux, a HANDLE on Windows (both opened for unbuffered positional reads)
+typedef intptr_t es_file;
+
+#ifdef _WIN32
+static es_file es_open(const std::string & path) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring w((size_t) std::max(n, 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &w[0], n);
+    // FILE_FLAG_NO_BUFFERING = O_DIRECT: buffer, offset and length must be sector aligned (the store uses 4096)
+    HANDLE h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    return h == INVALID_HANDLE_VALUE ? (es_file) -1 : (es_file) h;
+}
+static void es_close(es_file f) { if (f != (es_file) -1) { CloseHandle((HANDLE) f); } }
+// positional read; returns bytes read, 0 at end of file, -1 on error
+static int64_t es_pread(es_file f, char * dst, size_t len, uint64_t off) {
+    OVERLAPPED ov = {};
+    ov.Offset     = (DWORD) (off & 0xffffffffu);
+    ov.OffsetHigh = (DWORD) (off >> 32);
+    DWORD got = 0;
+    const DWORD want = (DWORD) std::min<size_t>(len, (size_t) 1 << 30);
+    if (!ReadFile((HANDLE) f, dst, want, &got, &ov)) {
+        return GetLastError() == ERROR_HANDLE_EOF ? 0 : -1;
+    }
+    return (int64_t) got;
+}
+#else
+static es_file es_open(const std::string & path) {
+#ifdef O_DIRECT
+    return (es_file) ::open(path.c_str(), O_RDONLY | O_DIRECT);
+#else
+    return (es_file) ::open(path.c_str(), O_RDONLY);   // (no O_DIRECT here: buffered reads)
+#endif
+}
+static void es_close(es_file f) { if (f >= 0) { ::close((int) f); } }
+static int64_t es_pread(es_file f, char * dst, size_t len, uint64_t off) {
+    for (;;) {
+        const ssize_t r = pread((int) f, dst, len, (off_t) off);
+        if (r < 0 && errno == EINTR) { continue; }
+        return (int64_t) r;
+    }
+}
+#endif
+
 static constexpr size_t ES_ALIGN = 4096;
 
 static size_t es_round_up(size_t x) { return (x + ES_ALIGN - 1) & ~(ES_ALIGN - 1); }
 
-struct es_job { int fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
+// diagnostics for run-to-run differences: FLE_MOE_STORE_NOEVICT=1 never gives a slot up once the store is full;
+// FLE_MOE_STORE_VERIFY=1 compares every expert data_cb hands out with the model file's bytes and counts mismatches
+static bool es_noevict() { static const bool v = [] { const char * e = std::getenv("FLE_MOE_STORE_NOEVICT"); return e && atoi(e) != 0; }(); return v; }
+static bool es_verify()  { static const bool v = [] { const char * e = std::getenv("FLE_MOE_STORE_VERIFY");  return e && atoi(e) != 0; }(); return v; }
+static std::atomic<uint64_t> es_vfy_n{0}, es_vfy_bad{0};
+static const void * es_check(const ggml_tensor * src0, int32_t expert, int li, int role, int32_t slot, const char * p) {
+    if (!p || !es_verify()) { return p; }
+    const char * ref = (const char *) src0->data + (size_t) expert * src0->nb[2];
+    const uint64_t n = es_vfy_n.fetch_add(1) + 1;
+    if (std::memcmp(p, ref, src0->nb[2]) != 0) {
+        const uint64_t b = es_vfy_bad.fetch_add(1) + 1;
+        if (b <= 20) { std::fprintf(stderr, "[fle-store-verify] MISMATCH layer %d role %d expert %d slot %d (check %llu)\n", li, role, expert, slot, (unsigned long long) n); }
+    }
+    if (n % 200000 == 0) { std::fprintf(stderr, "[fle-store-verify] %llu checks, %llu mismatches\n", (unsigned long long) n, (unsigned long long) es_vfy_bad.load()); }
+    return p;
+}
+
+struct es_job { es_file fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
 
 struct llama_expert_store::impl {
-    struct role_t { int fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
+    struct role_t { es_file fd = -1; uint64_t off0 = 0; size_t nb2 = 0; size_t region = 0; size_t region_off = 0; };
     struct layer_t {
         int il = -1; int64_t n_expert = 0; role_t r[3]; int cls = 0; size_t blob = 0;
         std::vector<int32_t>      slot_of;   // expert -> slot, -1
@@ -40,11 +108,12 @@ struct llama_expert_store::impl {
     struct slot_t { int32_t li = -1; int32_t e = -1; uint32_t cnt = 0; uint8_t pre = 0; const char * staged[3] = { nullptr, nullptr, nullptr }; };
     std::unique_ptr<std::atomic<int>[]> inflight;   // per slot: prefetch reads still running
     std::unique_ptr<std::atomic<int>[]> pins;       // per slot: GPU-cache uploads reading it
+    std::unique_ptr<std::atomic<uint8_t>[]> bad;    // per slot: an asynchronous read of it failed (never published)
     std::mutex smtx;                                 // ownership changes vs acquire() from the upload thread
 
     std::vector<layer_t> layers;
     std::unordered_map<const void *, std::pair<int32_t, int32_t>> by_data;   // tensor data -> (layer index, role)
-    std::vector<int> fds;
+    std::vector<es_file> fds;
     char *  arena = nullptr;
     size_t  arena_bytes = 0;
     size_t  blob = 0;
@@ -83,16 +152,14 @@ struct llama_expert_store::impl {
                 j = q.front(); q.pop_front();
             }
             bool ok = true;
-#ifndef _WIN32
             size_t got = 0;
             while (got < j.len) {
-                const ssize_t r = pread(j.fd, j.dst + got, j.len - got, (off_t) (j.off + got));
+                const int64_t r = es_pread(j.fd, j.dst + got, j.len - got, j.off + got);
                 if (r <= 0) { ok = r == 0 && got > 0; break; }   // EOF after data: the tail past the file end is not needed
                 got += (size_t) r;
             }
-#endif
             if (j.ctr) {
-                if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; }
+                if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; bad[(size_t) (j.ctr - inflight.get())].store(1, std::memory_order_relaxed); }
                 j.ctr->fetch_sub(1, std::memory_order_release);
                 continue;
             }
@@ -104,8 +171,9 @@ struct llama_expert_store::impl {
         }
     }
 
-    void run(std::vector<es_job> & jobs) {
-        if (jobs.empty()) { return; }
+    bool run(std::vector<es_job> & jobs) {   // false: at least one read failed
+        if (jobs.empty()) { return true; }
+        const uint64_t err0 = [&] { std::lock_guard<std::mutex> lk(mtx); return read_err; }();
         {
             std::lock_guard<std::mutex> lk(mtx);
             for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) { q.push_front(*it); }   // demand before prefetch
@@ -115,6 +183,7 @@ struct llama_expert_store::impl {
         std::unique_lock<std::mutex> lk(mtx);
         done_cv.wait(lk, [&] { return pending == 0; });
         jobs.clear();
+        return read_err == err0;
     }
 
     // queue the three reads of expert e of layer li into slot s; returns the weight pointers via ptr_out
@@ -152,7 +221,35 @@ struct llama_expert_store::impl {
     }
 };
 
-#ifndef _WIN32
+#ifdef _WIN32
+// file and offset behind a mapped address: the view llama.cpp maps covers the whole file from offset 0
+static bool es_file_of(const void * addr, std::string & path, uint64_t & file_off) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery(addr, &mbi, sizeof(mbi)) || mbi.Type != MEM_MAPPED) { return false; }
+    wchar_t dev[MAX_PATH * 2] = {0};
+    if (!GetMappedFileNameW(GetCurrentProcess(), (LPVOID) addr, dev, MAX_PATH * 2)) { return false; }
+    // \Device\HarddiskVolumeN\... -> X:\...
+    std::wstring d(dev), dos;
+    wchar_t drives[512] = {0};
+    if (GetLogicalDriveStringsW(511, drives)) {
+        for (wchar_t * p = drives; *p; p += wcslen(p) + 1) {
+            wchar_t letter[3] = { p[0], L':', 0 }, target[MAX_PATH] = {0};
+            if (QueryDosDeviceW(letter, target, MAX_PATH)) {
+                const size_t n = wcslen(target);
+                if (d.compare(0, n, target) == 0 && (d.size() == n || d[n] == L'\\')) { dos = std::wstring(letter) + d.substr(n); break; }
+            }
+        }
+    }
+    if (dos.empty()) { return false; }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, dos.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string u((size_t) std::max(n, 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, dos.c_str(), -1, &u[0], n, nullptr, nullptr);
+    u.resize(strlen(u.c_str()));
+    path = u;
+    file_off = (uint64_t) ((const char *) addr - (const char *) mbi.AllocationBase);
+    return true;
+}
+#else
 // file and offset behind a mapped address, from /proc/self/maps
 static bool es_file_of(const void * addr, std::string & path, uint64_t & file_off) {
     FILE * f = std::fopen("/proc/self/maps", "r");
@@ -175,10 +272,6 @@ static bool es_file_of(const void * addr, std::string & path, uint64_t & file_of
 #endif
 
 std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector<llama_expert_store_layer> & in, size_t budget_bytes, int threads) {
-#ifdef _WIN32
-    (void) in; (void) budget_bytes; (void) threads;
-    return nullptr;
-#else
     auto * d = new impl();
     std::map<std::string, int> fd_of;
     for (const auto & il : in) {
@@ -193,12 +286,8 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
             if (!es_file_of(t->data, path, foff)) { ok = false; break; }
             auto it = fd_of.find(path);
             if (it == fd_of.end()) {
-                #ifdef O_DIRECT
-                const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
-#else
-                const int fd = ::open(path.c_str(), O_RDONLY);   // (no O_DIRECT here: buffered reads)
-#endif
-                if (fd < 0) { ok = false; break; }
+                const es_file fd = es_open(path);
+                if (fd == (es_file) -1) { ok = false; break; }
                 it = fd_of.emplace(path, fd).first;
                 d->fds.push_back(fd);
             }
@@ -213,7 +302,7 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         }
         if (!ok) {
             LLAMA_LOG_WARN("%s: layer %d: expert tensors not mapped from a file, store off\n", __func__, il.il);
-            for (int fd : d->fds) { ::close(fd); }
+            for (es_file fd : d->fds) { es_close(fd); }
             delete d;
             return nullptr;
         }
@@ -243,10 +332,15 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         d->cls_hi.push_back(n_slots);
     }
     if (n_slots == 0) { delete d; return nullptr; }
+#ifdef _WIN32
+    void * a = VirtualAlloc(nullptr, d->arena_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);   // 64 KiB aligned
+    if (!a) {
+#else
     void * a = mmap(nullptr, d->arena_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (a == MAP_FAILED) {
+#endif
         LLAMA_LOG_WARN("%s: arena of %.1f GB failed, store off\n", __func__, d->arena_bytes / 1e9);
-        for (int fd : d->fds) { ::close(fd); }
+        for (es_file fd : d->fds) { es_close(fd); }
         delete d;
         return nullptr;
     }
@@ -260,7 +354,8 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
     d->slots.resize(n_slots);
     d->inflight.reset(new std::atomic<int>[n_slots]);
     d->pins.reset(new std::atomic<int>[n_slots]);
-    for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); d->pins[i].store(0); }
+    d->bad.reset(new std::atomic<uint8_t>[n_slots]);
+    for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); d->pins[i].store(0); d->bad[i].store(0); }
     for (int i = 0; i < std::max(1, threads); ++i) { d->pool.emplace_back([d] { d->reader(); }); }
 #if defined(__linux__)
     // FLE_MOE_STORE_READER_CPUS="16-31": the readers wait on the SSD most of the time; keep them off the cores the compute threads use
@@ -279,7 +374,6 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
         LLAMA_LOG_INFO("%s: FLE_MOE_STORE: class %zu: %zu slots of %.2f MB\n", __func__, c, d->cls_hi[c] - d->cls_lo[c], d->cls_blob[c] / 1e6);
     }
     return std::unique_ptr<llama_expert_store>(new llama_expert_store(d));
-#endif
 }
 
 llama_expert_store::~llama_expert_store() {
@@ -288,16 +382,19 @@ llama_expert_store::~llama_expert_store() {
         (unsigned long long) st.hits, (unsigned long long) st.misses, (unsigned long long) st.evictions, st.read_bytes / 1e9, st.wait_ms,
         (unsigned long long) st.preloaded, st.preload_ms, (unsigned long long) st.pre_issued, (unsigned long long) st.pre_used,
         (unsigned long long) st.pre_wasted, (unsigned long long) d->read_err);
+    if (es_verify()) { std::fprintf(stderr, "[fle-store-verify] end: %llu checks, %llu mismatches\n", (unsigned long long) es_vfy_n.load(), (unsigned long long) es_vfy_bad.load()); }
     {
         std::lock_guard<std::mutex> lk(d->mtx);
         d->stop = true;
     }
     d->cv.notify_all();
     for (auto & t : d->pool) { t.join(); }
-#ifndef _WIN32
+#ifdef _WIN32
+    if (d->arena) { VirtualFree(d->arena, 0, MEM_RELEASE); }
+#else
     if (d->arena) { munmap(d->arena, d->arena_bytes); }
-    for (int fd : d->fds) { ::close(fd); }
 #endif
+    for (es_file fd : d->fds) { es_close(fd); }
     delete d;
 }
 
@@ -326,14 +423,11 @@ size_t llama_expert_store::preload(const std::vector<std::pair<int32_t, int32_t>
         ps.push_back(p);
         st.read_bytes += expert_bytes(li);
         if (ps.size() >= 256) {
-            d->run(jobs);
-            for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); }
-            n += ps.size(); ps.clear();
+            if (d->run(jobs)) { for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); } n += ps.size(); }
+            ps.clear();
         }
     }
-    d->run(jobs);
-    for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); }
-    n += ps.size();
+    if (d->run(jobs)) { for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); } n += ps.size(); }
     st.preloaded += n;
     st.preload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return n;
@@ -358,6 +452,10 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
                 const auto t0 = std::chrono::steady_clock::now();
                 while (d->inflight[(size_t) s].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
                 st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (d->bad[(size_t) s].exchange(0)) {   // its read failed: give the slot up, the expert stays on the mmap path
+                    L.slot_of[(size_t) e] = -1; S.li = -1; S.e = -1;
+                    continue;
+                }
                 for (int r = 0; r < 3; ++r) { L.ptr[r][(size_t) e] = S.staged[r]; }
             }
             if (S.pre == 1) { S.pre = 2; st.pre_used++; }
@@ -370,6 +468,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         if (dup) { continue; }
         // a slot: a never-used one first, then the least used of a sample, never one this call needs
         size_t victim = d->cls_free(L.cls);
+        if (victim == SIZE_MAX && es_noevict()) { continue; }   // FLE_MOE_STORE_NOEVICT: the set stays as filled
         if (victim == SIZE_MAX) {
             uint32_t best = UINT32_MAX;
             const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
@@ -434,9 +533,9 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
             d->cv.notify_all();
         } else {
             const auto t0 = std::chrono::steady_clock::now();
-            d->run(jobs);
+            const bool rok = d->run(jobs);
             st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); }
+            if (rok) { for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); } }   // else: they stay on the mmap path
         }
     }
     if (++d->n_ensure % 8192 == 0) {   // age: old popularity must not hold slots forever
@@ -462,6 +561,7 @@ bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<in
     if (e < 0 || e >= L.n_expert || L.slot_of[(size_t) e] >= 0) { return false; }
     // a slot: a never-used one, else the least used of a sample that is neither being read nor needed by the running layer
     size_t victim = d->cls_free(L.cls);
+    if (victim == SIZE_MAX && es_noevict()) { return false; }
     if (victim == SIZE_MAX) {
         uint32_t best = UINT32_MAX;
         const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
@@ -526,7 +626,7 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     const auto & L = s->d->layers[(size_t) it->second.first];
     if (expert < 0 || expert >= L.n_expert) { return nullptr; }
     const char * p = L.ptr[it->second.second][(size_t) expert];
-    if (p) { return p; }
+    if (p) { return es_check(src0, expert, it->second.first, it->second.second, L.slot_of[(size_t) expert], p); }
     const int32_t sl = L.slot_of[(size_t) expert];
     if (sl < 0) { return nullptr; }
     // FLE_MOE_STORE_ASYNC: read still running (or a prefetch not yet published): wait for this expert only, then publish it
@@ -534,11 +634,12 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     if (S.li != (int32_t) it->second.first || S.e != expert) { return nullptr; }
     const auto t0 = std::chrono::steady_clock::now();
     while (s->d->inflight[(size_t) sl].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
+    if (s->d->bad[(size_t) sl].load(std::memory_order_relaxed)) { return nullptr; }   // read failed: the mmap bytes (ensure gives the slot up)
     auto & st = const_cast<llama_expert_store *>(s)->st;
     st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     auto & LW = const_cast<impl::layer_t &>(L);
     for (int r = 0; r < 3; ++r) { LW.ptr[r][(size_t) expert] = S.staged[r]; }
-    return S.staged[it->second.second];
+    return es_check(src0, expert, it->second.first, it->second.second, sl, S.staged[it->second.second]);
 }
 
 bool llama_expert_store::ready_cb(const ggml_tensor * src0, int32_t expert, void * ud) {

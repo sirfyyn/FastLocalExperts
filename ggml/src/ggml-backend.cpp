@@ -2115,25 +2115,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // (the store reads past the page cache, so the mmap copy of a hot expert is usually not in RAM)
                     static const bool fle_store_upload = [] { const char * e = getenv("FLE_MOE_STORE_UPLOAD"); return e && atoi(e) != 0; }();
                     void * fle_dud = nullptr;
-                    ggml_moe_data_cb_t fle_dcb = fle_store_upload && node->op == GGML_OP_MUL_MAT_ID ? ggml_get_moe_data_callback(&fle_dud) : nullptr;
-                    std::function<void(int32_t, int32_t)> copy_range;
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        if (!fle_dcb) { copy_range(first_id, last_id); return; }
-                        int32_t run = -1;   // start of the current run of experts the store does not hold
-                        for (int32_t e = first_id; e <= last_id; ++e) {
-                            const void * p = fle_dcb(input, e, fle_dud);
-                            if (!p) { if (run < 0) { run = e; } continue; }
-                            if (run >= 0) { copy_range(run, e - 1); run = -1; }
-                            ggml_backend_tensor_set_async(split_backend, input_cpy, p, (size_t) e * expert_size, expert_size);
-                            if (e < n_expert - 1) {   // the padding past the expert, as copy_range does (MMQ reads a bit beyond)
-                                const size_t pad = std::min<size_t>(expert_size, 512);
-                                ggml_backend_tensor_set_async(split_backend, input_cpy, (const uint8_t *) input->data + (size_t) (e + 1) * expert_size,
-                                        (size_t) (e + 1) * expert_size, pad);
-                            }
-                        }
-                        if (run >= 0) { copy_range(run, last_id); }
-                    };
-                    copy_range = [&](int32_t first_id, int32_t last_id) {
+                    ggml_moe_unpin_cb_t fle_unpin = nullptr;
+                    ggml_moe_pin_cb_t fle_dcb = fle_store_upload && node->op == GGML_OP_MUL_MAT_ID ? ggml_get_moe_pin_callback(&fle_unpin, &fle_dud) : nullptr;
+                    auto copy_range = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2145,6 +2129,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                    };
+                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (!fle_dcb) { copy_range(first_id, last_id); return; }
+                        int32_t run = -1;   // start of the current run of experts the store does not hold
+                        for (int32_t e = first_id; e <= last_id; ++e) {
+                            int32_t pslot = -1;
+                            const void * p = fle_dcb(input, e, &pslot, fle_dud);   // pinned: not given up while it is copied
+                            if (!p) { if (run < 0) { run = e; } continue; }
+                            if (run >= 0) { copy_range(run, e - 1); run = -1; }
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, p, (size_t) e * expert_size, expert_size);
+                            // a host->device copy from pageable memory has left the source once it returns; unpin after it
+                            if (fle_unpin) { fle_unpin(pslot, fle_dud); }
+                            if (e < n_expert - 1) {   // the padding past the expert, as copy_range does (MMQ reads a bit beyond)
+                                const size_t pad = std::min<size_t>(expert_size, 512);
+                                ggml_backend_tensor_set_async(split_backend, input_cpy, (const uint8_t *) input->data + (size_t) (e + 1) * expert_size,
+                                        (size_t) (e + 1) * expert_size, pad);
+                            }
+                        }
+                        if (run >= 0) { copy_range(run, last_id); }
                     };
 
                     int id = 0;

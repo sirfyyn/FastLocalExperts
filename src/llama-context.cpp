@@ -1,3 +1,4 @@
+#include <string>
 #include <vector>
 #include <algorithm>
 #include "llama-context.h"
@@ -75,6 +76,30 @@ static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+
+// FLE_NODE_HASH="a,b,c": one line "[fle-node] n name hash" per evaluated tensor whose name contains one of the substrings
+// (FNV-1a of its bytes); two runs diff to the first tensor that differs (run-to-run nondeterminism). FLE_NODE_HASH_CAP: lines (default 40000).
+static bool fle_node_hash_cb(struct ggml_tensor * tt, bool ask, void * ud) {
+    (void)ud;
+    static const std::vector<std::string> pats = [] {
+        std::vector<std::string> v; std::string cur;
+        for (const char * c = std::getenv("FLE_NODE_HASH"); c && *c; ++c) { if (*c == ',') { if (!cur.empty()) { v.push_back(cur); } cur.clear(); } else { cur += *c; } }
+        if (!cur.empty()) { v.push_back(cur); }
+        return v; }();
+    static const long cap = [] { const char * e = std::getenv("FLE_NODE_HASH_CAP"); return e ? atol(e) : 40000L; }();
+    static long n = 0;
+    if (n >= cap) { return ask ? false : true; }
+    bool want = false;
+    for (const auto & p : pats) { if (strstr(tt->name, p.c_str())) { want = true; break; } }
+    if (ask) { return want; }
+    if (!want) { return true; }
+    std::vector<uint8_t> b(ggml_nbytes(tt));
+    ggml_backend_tensor_get(tt, b.data(), 0, b.size());
+    uint64_t h = 1469598103934665603ULL;
+    for (uint8_t c : b) { h = (h ^ c) * 1099511628211ULL; }
+    fprintf(stderr, "[fle-node] %ld %s ne=%lld,%lld,%lld %016llx\n", n++, tt->name, (long long) tt->ne[0], (long long) tt->ne[1], (long long) tt->ne[2], (unsigned long long) h);
+    return true;
+}
 
 static bool fle_mtp_dump_cb(struct ggml_tensor * tt, bool ask, void * ud) {
     (void)ud;
@@ -2193,6 +2218,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (std::getenv("FLE_DUMP_FFN_DENSITY")) {
             ggml_backend_sched_set_eval_callback(sched.get(), fle_ffn_density_cb, nullptr);
         } else
+        if (std::getenv("FLE_NODE_HASH")) {
+            ggml_backend_sched_set_eval_callback(sched.get(), fle_node_hash_cb, nullptr);
+        } else
         if (std::getenv("FLE_DUMP_MOE")) {
             ggml_backend_sched_set_eval_callback(sched.get(), fle_moe_dump_cb, nullptr);
         } else
@@ -2585,7 +2613,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // Patch 48: a long batch borrows the larger compute buffer from the expert cache, the next short call gives it back
     if (fle_ub_small > 0) {
-        if ((uint32_t) n_tokens_all >= fle_lend_min) {
+        const bool fle_in_win = fle_win > 0 && (uint32_t) n_tokens_all <= fle_win_max;   // windows run small ubatches
+        if ((uint32_t) n_tokens_all >= fle_lend_min && !fle_in_win) {
             if (!fle_big) { fle_lend_begin(); }
         } else if (fle_big) {
             fle_lend_end();
@@ -2602,7 +2631,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        const uint32_t fle_ub = fle_win > 0 && n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
+        // windows only for causal text generation: a non-causal or embedding call must stay one ubatch (attention, pooling)
+        const bool fle_win_ok = fle_win > 0 && cparams.causal_attn && !cparams.embeddings &&
+                                n_tokens_all > 1 && (uint32_t) n_tokens_all <= fle_win_max;
+        const uint32_t fle_ub = fle_win_ok ? std::min(fle_win, fle_ub_eff()) : fle_ub_eff();
         mctx = memory->init_batch(*balloc, fle_ub, output_all);
         if (!mctx) {
             return -2;

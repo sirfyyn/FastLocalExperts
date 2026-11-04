@@ -3,7 +3,7 @@ name: FLE binaries
 # Portable binary packages of the FLE engine (the llama.cpp fork with the expert pager), built from
 # source on GitHub-hosted runners. Workflow artifacts only: no release, no tag, no secrets.
 #
-#   ubuntu-cuda-12.8-x64   fle-<sha8>-bin-ubuntu-cuda-12.8-x64.tar.gz
+#   ubuntu-cuda-13.4-x64   fle-<sha8>-bin-ubuntu-cuda-13.4-x64.tar.gz
 #   win-cuda-13.4-x64      fle-<sha8>-bin-win-cuda-13.4-x64.zip
 #
 # Both are built with GGML_BACKEND_DL=ON and GGML_CPU_ALL_VARIANTS=ON: the CUDA backend and 9 to 14
@@ -111,7 +111,7 @@ jobs:
 
   # ---------------------------------------------------------------------------------------------
   linux:
-    name: ubuntu-cuda-12.8-x64
+    name: ubuntu-cuda-13.4-x64
     needs: [ui]
     if: ${{ inputs.platforms != 'windows' }}
     runs-on: ubuntu-24.04
@@ -119,7 +119,7 @@ jobs:
     # Ubuntu 22.04 on purpose: the oldest glibc (2.35) and libstdc++ the package needs, so it runs on
     # Ubuntu 22.04 and newer, Debian 12 and newer and on every newer distribution.
     container:
-      image: nvidia/cuda:12.8.2-devel-ubuntu22.04
+      image: nvidia/cuda:13.4.3-devel-ubuntu22.04
     defaults:
       run:
         shell: bash
@@ -171,9 +171,9 @@ jobs:
         uses: actions/cache/restore@v5
         with:
           path: .ccache
-          key: fle-ccache-linux-cuda12.8-u2204-${{ github.run_id }}-${{ github.run_attempt }}
+          key: fle-ccache-linux-cuda13.4-u2204-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            fle-ccache-linux-cuda12.8-u2204-
+            fle-ccache-linux-cuda13.4-u2204-
 
       - name: Show the toolchain
         run: |
@@ -230,7 +230,7 @@ jobs:
             --platform linux \
             --bin-dir build/bin \
             --out-dir dist \
-            --label ubuntu-cuda-12.8-x64 \
+            --label ubuntu-cuda-13.4-x64 \
             --commit "$SRC_SHA" \
             --ref "$SRC_REF" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
@@ -249,7 +249,7 @@ jobs:
         run: |
           python3 .github/fle-binaries/check_elf.py \
             --dir "check/${{ steps.package.outputs.name }}" \
-            --cuda-major 12 \
+            --cuda-major 13 \
             --max-glibc 2.35 \
             --ldd
 
@@ -285,7 +285,7 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: .ccache
-          key: fle-ccache-linux-cuda12.8-u2204-${{ github.run_id }}-${{ github.run_attempt }}
+          key: fle-ccache-linux-cuda13.4-u2204-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload the logs
         if: failure()
@@ -502,14 +502,14 @@ jobs:
   # Clean-room check on a plain runner (no CUDA, no container): the package plus the upstream cudart
   # package, nothing else. Can be re-run alone (gh run rerun --job), the package comes from the build job.
   verify-linux:
-    name: verify ubuntu-cuda-12.8-x64 (plain runner + upstream cudart)
+    name: verify ubuntu-cuda-13.4-x64 (plain runner + upstream cudart)
     needs: [ui, linux]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       # upstream llama.cpp release whose cudart package is unpacked next to the binaries (SHA-256 from the release)
-      CUDART_TAG: b11540
-      CUDART_SHA256: 8f44b435a6739de562b3b709cf2de09cba909adc1f32e3def526aa788b4ef62f
+      CUDART_TAG: b12102
+      CUDART_SHA256: 3ad63dc9fb84d27bd8407c9dd8d428e6120e2434dc35201a8aeeec6284c65312
     steps:
       - name: Check out the helper scripts
         uses: actions/checkout@v6
@@ -529,7 +529,7 @@ jobs:
           ls -l dl
           mkdir pkg
           tar -xzf "dl/${{ needs.linux.outputs.file }}" -C pkg --strip-components=1
-          CUDART_FILE="cudart-llama-$CUDART_TAG-bin-ubuntu-cuda-12.8-x64.tar.gz"
+          CUDART_FILE="cudart-llama-$CUDART_TAG-bin-ubuntu-cuda-13.4-x64.tar.gz"
           curl -fsSL --retry 5 --retry-delay 5 -o "$CUDART_FILE" "https://github.com/ggml-org/llama.cpp/releases/download/$CUDART_TAG/$CUDART_FILE"
           echo "$CUDART_SHA256  $CUDART_FILE" | sha256sum -c -
           mkdir cudart
@@ -543,7 +543,7 @@ jobs:
         run: |
           python3 .github/fle-binaries/check_elf.py \
             --dir pkg \
-            --cuda-major 12 \
+            --cuda-major 13 \
             --max-glibc 2.35 \
             --ldd \
             --cudart-present
@@ -566,7 +566,7 @@ jobs:
         shell: pwsh
     env:
       # upstream llama.cpp release whose cudart package is unpacked next to the binaries (SHA-256 from the release)
-      CUDART_TAG: b11540
+      CUDART_TAG: b12102
       CUDART_FILE: cudart-llama-bin-win-cuda-13.4-x64.zip
       CUDART_SHA256: 738f8c251ac22b70c3ae6f83a10cf222725df0395246a2cf58f32bdb85fbe668
     steps:

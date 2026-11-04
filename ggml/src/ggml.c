@@ -280,6 +280,20 @@ ggml_moe_pred_cb_t ggml_get_moe_pred_callback(void ** ud) {
     return g_moe_pred_cb;
 }
 
+static ggml_moe_pin_cb_t   g_moe_pin_cb   = NULL;
+static ggml_moe_unpin_cb_t g_moe_unpin_cb = NULL;
+static void *              g_moe_pin_ud   = NULL;
+
+void ggml_set_moe_pin_callback(ggml_moe_pin_cb_t pin, ggml_moe_unpin_cb_t unpin, void * ud) {
+    g_moe_pin_cb = pin; g_moe_unpin_cb = unpin; g_moe_pin_ud = ud;
+}
+
+ggml_moe_pin_cb_t ggml_get_moe_pin_callback(ggml_moe_unpin_cb_t * unpin, void ** ud) {
+    if (unpin) { *unpin = g_moe_unpin_cb; }
+    if (ud) { *ud = g_moe_pin_ud; }
+    return g_moe_pin_cb;
+}
+
 static ggml_moe_data_cb_t g_moe_data_cb = NULL;
 static void *             g_moe_data_ud = NULL;
 
