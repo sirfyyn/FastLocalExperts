@@ -313,6 +313,20 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         // FLE_MOE_POOL_STATS: wall time of the 1-token op by distinct CPU experts and by experts still in flight
         {
             static const long every = [] { const char * e = std::getenv("FLE_MOE_POOL_STATS"); return (e && *e) ? atol(e) : 0L; }();
+            if (every > 0 && n_tok > 1) {   // verify batches: wall time per call and per CPU pair, by token count
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fle_t0).count();
+                static double m_us[9] = {0}, m_pairs[9] = {0}, m_grp[9] = {0}; static long m_n[9] = {0}; static long m_calls = 0;
+                const int b = n_tok < 8 ? (int) n_tok : 8;
+                m_us[b] += us; m_pairs[b] += (double) np; m_grp[b] += (double) ng; m_n[b]++;
+                if (++m_calls % every == 0) {
+                    for (int k = 2; k <= 8; ++k) {
+                        if (!m_n[k]) { continue; }
+                        std::fprintf(stderr, "[fle-moe-pool] %d tokens: %ld calls, %.0f us per call, %.2f pairs, %.2f experts, %.1f us per expert\n", k, m_n[k],
+                                m_us[k] / m_n[k], m_pairs[k] / m_n[k], m_grp[k] / m_n[k], m_us[k] / std::max(1.0, m_grp[k]));
+                        m_us[k] = m_pairs[k] = m_grp[k] = 0; m_n[k] = 0;
+                    }
+                }
+            }
             if (every > 0 && n_tok == 1) {
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fle_t0).count();
                 static double s_us[5][3] = {{0}}; static long s_n[5][3] = {{0}}; static long calls = 0;
