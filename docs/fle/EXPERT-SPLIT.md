@@ -17,8 +17,8 @@ Per split layer `N` (DeepSeek-V4.1, `src/models/deepseek41.cpp`):
 | `blk.N.ffn_exps_slot.weight` | I32 `[n_expert]` | original id -> slot; `slot < n_hot`: row `slot` of the hot half, else row `slot - n_hot` of the cold half |
 | `blk.N.ffn_exps_id.weight` | I32 `[n_expert]` | slot -> original id (the inverse; checked at load) |
 
-KV: `fle.expert_split.version` = 1 (u32), `fle.expert_split.hot` (u32, the planned maximum hot count),
-`fle.expert_split.source` (string). `n_hot` may differ per layer (`ne2` of the hot half minus 1). A split layer has no
+KV: `fle.expert_split.version` = 1 (u32), `fle.expert_split.zero_row` = 1 (u32, required; the hot zero rows are also
+checked byte by byte at load), `fle.expert_split.hot` (u32, the planned maximum hot count), `fle.expert_split.source` (string). `n_hot` may differ per layer (`ne2` of the hot half minus 1). A split layer has no
 `ffn_*_exps`; a layer may also stay unsplit and keep them. The hot and cold halves may have different quant types (gate
 and up of one half must share a `vec_dot_type`, as for any CPU MoE layer). Router, `exp_probs_b` and the shared expert keep
 the original numbering.
@@ -30,9 +30,13 @@ the original numbering.
   The hot half follows the layer's device even if a CPU override (`-cmoe`, `-ot exps=CPU`) matches it
   (`llama-model-loader.cpp`); `LLM_FFN_EXPS_REGEX` and the `-fit` patterns exclude `_exps_hot`. The cold half goes where
   `-cmoe` puts experts today (host, mmap).
-- **Tables** (`src/llama-expertsplit.{h,cpp}`, built once per model in the context constructor): `hot_of[id]` (hot row or
-  `n_hot`) and `cold_of[id]` (cold row or `n_cold`) on the hot half's device, and the host skip table `cold_skip[n_cold + 1]`
-  (`1` for every real cold row, `0` for the zero row).
+- **Tables** (`src/llama-expertsplit.{h,cpp}`, built once per model in the context constructor, owned by the model
+  (`llama_model::fle_expert_split`, freed with it) and reached through `llama_layer::fle_split`): `hot_of[id]` (hot row or
+  `n_hot`) and `cold_of[id]` (cold row or `n_cold`) on the hot half's device (plain CPU buffer when the hot half is in host
+  memory), and the host skip table `cold_skip[n_cold + 1]` (`1` for every real cold row, `0` for the zero row). The model
+  builder passes the layer's tables to `build_moe_ffn` through `llm_graph_context::fle_split`.
+- **Cold half not in host memory** (no `-cmoe`, or `-ngmoe`): no skip table, no fused CPU op and no expert store for that
+  layer; its backend computes the zero row, which yields zeros.
 - **Graph** (`build_moe_ffn`, `src/llama-graph.cpp`): routing and weights stay in original ids. The GPU chain is the expert
   cache's hit chain over the hot half with `ids = get_rows(hot_of, selected)`. The CPU chain is the usual one (fused CPU op
   or `mul_mat_id`, the expert store, the CPU pool) over the cold half with `ids = get_rows(cold_of, selected)` and
@@ -44,9 +48,10 @@ the original numbering.
   that; past the MMVQ batch sizes `fle_is_moe_cache_w` sends `_exps_hot` and `_exps_cold` (op-offload copy) to the
   per-expert path, which tolerates repeats (MMQ/MMF would leave the repeated rows unwritten).
 - **Expert cache / store** (`src/llama-moecache.cpp`): split layers have no `ffn_*_exps`, so the GPU cache never selects
-  them. Their cold halves are registered in the RAM expert store (`FLE_MOE_STORE_GB`) after the cache layers and served in
-  cold-local numbering (`ensure` from the observer, `data_cb`, `ready_cb`, pinning). Without an expert cache the store is
-  still created for the cold halves.
+  them. Their cold halves (host memory, weights loaded) are registered in the RAM expert store (`FLE_MOE_STORE_GB`) after
+  the cache layers and served in cold-local numbering (`ensure` from the observer, `data_cb`, `ready_cb`, pinning). Without
+  an expert cache the store is still created for the cold halves; -fit's estimation model (no weights) does not end the
+  one-time init, so the real model still gets the store.
 
 ## Not in v1
 

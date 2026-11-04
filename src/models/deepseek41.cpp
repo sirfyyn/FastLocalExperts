@@ -240,6 +240,12 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     }
     const bool expert_split = split_version == 1;
     if (expert_split) {
+        // the engine relies on the trailing zero row of each half (the other half's experts map onto it)
+        uint32_t split_zero = 0;
+        ml.get_key(std::string("fle.expert_split.zero_row"), split_zero, false);
+        if (split_zero != 1) {
+            throw std::runtime_error(format("fle.expert_split.zero_row is %u, this engine needs 1 (one trailing zero row per half)", split_zero));
+        }
         uint32_t split_hot = 0;
         std::string split_src;
         ml.get_key(std::string("fle.expert_split.hot"), split_hot, false);
@@ -1147,10 +1153,11 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         // FLE expert deferral: the previous layer's deferred CPU experts are already in the graph (placed right after its merge, below)
         fle_defer_pending = nullptr;
 
-        // the reference normalizes only when it routes to more than one expert. A split layer hands its cold halves in; build_moe_ffn
-        // finds the hot half and the id tables through them (llama-expertsplit.h)
+        // the reference normalizes only when it routes to more than one expert. A split layer hands its cold halves in and its
+        // tables (hot half, id and skip tables; llama-expertsplit.h) through fle_split
         const bool split_layer = layer.ffn_up_exps_hot != nullptr;
-        GGML_ASSERT((!split_layer || llama_expert_split_lookup(layer.ffn_up_exps_cold)) && "split layer without tables (llama_expert_split_init)");
+        GGML_ASSERT((!split_layer || layer.fle_split) && "split layer without tables (llama_expert_split_init)");
+        fle_split = split_layer ? layer.fle_split : nullptr;
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 split_layer ? layer.ffn_up_exps_cold   : layer.ffn_up_exps,

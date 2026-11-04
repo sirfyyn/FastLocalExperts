@@ -2057,13 +2057,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // FLE split experts (llama-expertsplit.h): up/gate/down_exps are the cold halves of a split layer; nullptr for every other
-    // layer (one atomic load for an unsplit model)
-    const llama_expert_split_layer * split = llama_expert_split_lookup(up_exps);
+    // FLE split experts (llama-expertsplit.h): the caller set fle_split and handed the cold halves in as up/gate/down_exps;
+    // nullptr for every other layer
+    const llama_expert_split_layer * split = fle_split;
+    fle_split = nullptr;
     if (split) {
-        GGML_ASSERT(!gate_up_exps && gate_exps && down_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
-                    !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn &&
-                    "split experts: only separate gate/up/down without biases or scales, SiLU");
+        GGML_ASSERT(up_exps == split->up_cold && gate_exps == split->gate_cold && down_exps == split->down_cold &&
+                    "split experts: build_moe_ffn needs the cold halves of the layer whose tables are set");
+        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+                    !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty() &&
+                    "split experts: only separate gate/up/down without biases, scales or LoRA, SiLU");
     }
 
     // Register the pager's L+1 prediction (self-guarded no-op without the pager env). Not for a split layer: the pager would
@@ -2317,8 +2320,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(mc_slot_ids, "ffn_moe_split_hot_ids", il);
         cpu_ids = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, split->cold_of, sp_flat), n_expert_used, n_tokens);
         cb(cpu_ids, "ffn_moe_split_cold_ids", il);
+        // into the graph now, before the (marked) hit chain: otherwise this GPU get_rows lands inside the marked subgraph, which
+        // then produces an input of the CPU chain and the scheduler cannot fetch the CPU inputs early (FLE_MC_OVERLAP)
+        ggml_build_forward_expand(gf, cpu_ids);
         hc_up = split->up_hot; hc_gate = split->gate_hot; hc_down = split->down_hot;
-        cpu_tbl = split->cold_skip; cpu_dummy = LLAMA_EXPERT_SPLIT_RUN;
+        // the skip table only for a cold half in plain host memory: there the CPU path (and the fused op) runs it. A cold half on a
+        // device (no -cmoe) or in a repack buffer computes the zero row, which yields zeros.
+        if (split->cold_host) {
+            cpu_tbl = split->cold_skip; cpu_dummy = LLAMA_EXPERT_SPLIT_RUN;
+        }
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -2397,6 +2407,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_build_forward_expand(gf, fle_defer_pending);
     }
     fle_defer_pending = nullptr;
+
+    // FLE_MOE_DEFER_N: the CPU ids of the strong ranks now, the weak ranks one layer later. Sliced before the hit chain; for a split
+    // layer the slices are GPU copies of cpu_ids and must not end up inside the marked subgraph either (see cpu_ids above)
+    static const int fle_defer_n = [] { const char * e = std::getenv("FLE_MOE_DEFER_N"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+    const int64_t d_n = fle_defer ? std::min<int64_t>(fle_defer_n, n_expert_used - 1) : 0;   // 0: all CPU experts deferred (old behaviour)
+    ggml_tensor * sel_now = nullptr, * sel_late = nullptr;
+    if (d_n > 0) {
+        // argsort_top_k is ordered best first: ranks [0, k) now, [k, n_expert_used) one layer later
+        const int64_t k_now = n_expert_used - d_n;
+        sel_now  = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, k_now, n_tokens, cpu_ids->nb[1], 0));
+        sel_late = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, d_n,   n_tokens, cpu_ids->nb[1], k_now*cpu_ids->nb[0]));
+        if (split) {
+            ggml_build_forward_expand(gf, sel_now);
+            ggml_build_forward_expand(gf, sel_late);
+        }
+    }
+
     if (hit_chain && fle_mc_overlap) {
         mc_down_g = build_mc_hit_chain(true);
     }
@@ -2585,24 +2612,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    static const int fle_defer_n = [] { const char * e = std::getenv("FLE_MOE_DEFER_N"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
-    const int64_t d_n = fle_defer ? std::min<int64_t>(fle_defer_n, n_expert_used - 1) : 0;   // 0: all CPU experts deferred (old behaviour)
     ggml_tensor * experts = nullptr;
     ggml_tensor * experts_now = nullptr;   // FLE_MOE_DEFER_N: the strong ranks' CPU part, added in this layer
-    ggml_tensor * sel_now = nullptr, * sel_late = nullptr;
     if (d_n > 0) {
-        // argsort_top_k is ordered best first: ranks [0, k) now, [k, n_expert_used) one layer later
-        const int64_t k_now = n_expert_used - d_n;
-        sel_now  = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, k_now, n_tokens, cpu_ids->nb[1], 0));
-        sel_late = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, d_n,   n_tokens, cpu_ids->nb[1], k_now*cpu_ids->nb[0]));
         experts_now = build_cpu_chain(cur, sel_now);
         experts     = build_cpu_chain(cur, sel_late);
     } else {
         experts = build_cpu_chain(cur, cpu_ids);
     }
 
-    if (cpu_tbl) {
-        if (experts->op == GGML_OP_MUL_MAT_ID) {   // (the fused op carries the table itself)
+    // (a split layer always merges its hot half; its skip table only exists for a cold half in host memory)
+    if (mcache || split) {
+        if (cpu_tbl && experts->op == GGML_OP_MUL_MAT_ID) {   // (the fused op carries the table itself)
             experts->src[3] = cpu_tbl;
             experts->op_params[0] = cpu_dummy;
         }
@@ -2614,7 +2635,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // (with FLE_MOE_DEFER_N only the weak ranks; the strong ranks' CPU part is added below in this layer)
             fle_defer_experts = experts;
             experts = down_g;
-            if (experts_now && experts_now->op == GGML_OP_MUL_MAT_ID) {
+            if (cpu_tbl && experts_now && experts_now->op == GGML_OP_MUL_MAT_ID) {
                 experts_now->src[3] = cpu_tbl;
                 experts_now->op_params[0] = cpu_dummy;
             }

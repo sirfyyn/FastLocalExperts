@@ -6,13 +6,16 @@
 // role of a static GPU expert cache) and ffn_*_exps_cold (host memory, computed by the FLE CPU path). Each half carries one
 // trailing all-zero row. ffn_exps_slot maps original id -> slot (slot < n_hot: hot row, else cold row slot - n_hot).
 //
-// The router keeps the original numbering. Per split layer this module owns three small I32 tables, built once at load:
+// The router keeps the original numbering. Per split layer this module owns three small I32 tables, built once per model:
 //  - hot_of  [1, n_expert] (device of the hot half): original id -> hot row, or n_hot (zero row) for a cold expert
 //  - cold_of [1, n_expert] (same device):            original id -> cold row, or n_cold (zero row) for a hot expert
 //  - cold_skip [1, n_cold + 1] (host): the src[3] skip table of the CPU chain in cold-local numbering. Every real cold row
 //    holds LLAMA_EXPERT_SPLIT_RUN (the "not cached" dummy value: computed), the zero row holds 0 (skipped, never read).
 // The GPU chain over the hot half and the CPU chain over the cold half each yield zero for the other half's experts, so
 // their sum is the exact MoE output, as with the expert cache.
+//
+// The tables belong to the model (llama_model::fle_expert_split, freed with it); each split layer points at its own
+// (llama_layer::fle_split), so a model loaded for memory estimation (-fit) and freed again leaves nothing behind.
 
 #include <cstdint>
 #include <vector>
@@ -27,6 +30,8 @@ struct llama_expert_split_layer {
     int     il     = -1;
     int32_t n_hot  = 0;
     int32_t n_cold = 0;
+    bool    placeholder = false;   // model without weights (memory estimation): every id maps to the zero rows
+    bool    cold_host   = false;   // the cold half is in plain host memory (fused CPU op, expert store); else its own backend runs it
 
     ggml_tensor * up_hot    = nullptr;
     ggml_tensor * gate_hot  = nullptr;
@@ -40,14 +45,8 @@ struct llama_expert_split_layer {
     ggml_tensor * cold_skip = nullptr;
 };
 
-// build the tables of every split layer of the model; once per model, a no-op for unsplit models
+// build the tables of every split layer of the model and set llama_layer::fle_split; once per model, a no-op for unsplit models
 void llama_expert_split_init(const llama_model & model);
 
-// true once any loaded model has a split layer (a cheap guard for the graph builder)
-bool llama_expert_split_any();
-
-// the split layer whose cold up half is `up_cold`, nullptr otherwise
-const llama_expert_split_layer * llama_expert_split_lookup(const ggml_tensor * up_cold);
-
-// the split layers of `model` (layer order), empty for an unsplit model; used to register the cold halves in the expert store
+// the split layers of `model` (layer order), empty for an unsplit model or before llama_expert_split_init
 std::vector<const llama_expert_split_layer *> llama_expert_split_layers(const llama_model & model);

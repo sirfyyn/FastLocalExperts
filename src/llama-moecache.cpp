@@ -1567,8 +1567,26 @@ namespace {
 
 // FLE split experts without an expert cache (no cache flags, or no host-resident unsplit layer): the RAM expert store still
 // serves the cold halves. The moe_cache has no layers; only the observer (store requests) and the store use it. Never freed.
+// the split layers whose cold half the expert store can serve: weights loaded and the cold half in plain host memory (mmap). A
+// cold half on a device (no -cmoe, -ngmoe) is computed there; registering it would turn the store off for every layer.
+std::vector<const llama_expert_split_layer *> split_store_layers(const llama_model & model) {
+    std::vector<const llama_expert_split_layer *> out;
+    for (const auto * sl : llama_expert_split_layers(model)) {
+        if (!sl->placeholder && sl->cold_host) { out.push_back(sl); }
+    }
+    return out;
+}
+
+// a model loaded without weights (-fit memory estimation): its split layers carry placeholder tables
+bool split_dry_run(const llama_model & model) {
+    for (const auto * sl : llama_expert_split_layers(model)) {
+        if (sl->placeholder) { return true; }
+    }
+    return false;
+}
+
 void split_store_only(const llama_model & model) {
-    std::vector<const llama_expert_split_layer *> split = llama_expert_split_layers(model);
+    std::vector<const llama_expert_split_layer *> split = split_store_layers(model);
     if (split.empty() || g_store) {
         return;
     }
@@ -1599,6 +1617,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         int64_t budget_mib = 0;
         if (const char * e = std::getenv("FLE_MOE_CACHE_BUDGET_MIB")) { budget_mib = std::max<int64_t>(0, atoll(e)); }
         if (n_slots <= 0 && budget_mib <= 0) {
+            if (split_dry_run(model)) {
+                return;   // -fit's estimation model: the real split model comes next and still needs its expert store
+            }
             split_store_only(model);
             g_init_done = true;
             return;
@@ -1958,7 +1979,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             prof_prefill(mc, pf);
             prof_hot_mlock(mc, pf);
         }
-        mc->split = llama_expert_split_layers(model);
+        mc->split = split_store_layers(model);
         store_init(mc, pf.ok ? &pf : nullptr);
         if (!g_store && std::getenv("FLE_MOE_PREFETCH")) {
             ggml_set_moe_pred_callback(moe_pred_cb, mc);   // WILLNEED one layer ahead (moe_pred_cb without the store)

@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_expert_split_layer;
 
 // available models
 enum llm_type {
@@ -355,6 +356,8 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps_cold   = nullptr;
     struct ggml_tensor * ffn_exps_slot      = nullptr; // I32 [n_expert]: original id -> slot (slot >= n_hot: cold row slot - n_hot)
     struct ggml_tensor * ffn_exps_id        = nullptr; // I32 [n_expert]: slot -> original id
+    // the split layer's tables (owned by llama_model::fle_expert_split, set by llama_expert_split_init)
+    mutable const struct llama_expert_split_layer * fle_split = nullptr;
 
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
     struct ggml_tensor * ffn_gate_exps_s   = nullptr;
@@ -744,6 +747,10 @@ struct llama_model {
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
+
+    // FLE split experts: owner of the id/skip tables and their buffers (llama-expertsplit.cpp), built by the first context and
+    // freed with the model; the layers point into it (llama_layer::fle_split)
+    mutable std::shared_ptr<void> fle_expert_split;
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
