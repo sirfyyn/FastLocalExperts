@@ -1541,7 +1541,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         // as long as EVERY transfer takes exactly one step. If one takes longer, a shadow
         // slot is missing and the `if (slot < 0) break;` path is hit, which triggered the
         // collapse at a cap of 16. Cost: one slot per layer, 44 x 2.655 = 117 MiB.
-        mc->n_slots_total  = n_slots + (mc->fle_shadow ? (2 * (max_inserts > 0 ? max_inserts : 2)) : 0);
+        mc->n_slots_total  = n_slots + (mc->fle_shadow && max_inserts != 0 ? (2 * (max_inserts > 0 ? max_inserts : 2)) : 0);   // no shadow slots without uploads
         if (max_inserts >= 0) {   // 0 = no uploads while decoding: the cache stays as the profile filled it (same output for the same input)
             mc->max_inserts = max_inserts;
         }
