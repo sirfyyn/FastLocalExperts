@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -53,6 +54,10 @@ struct fle_pool {
     std::function<void(int64_t)> fn;
     int n = 0;
     std::atomic<bool> stop{false};
+    // idle: after ~20 ms without work a worker sleeps on cv (a server without requests must not hold the cores at 100 %)
+    std::mutex              sleep_mtx;
+    std::condition_variable sleep_cv;
+    std::atomic<int>        sleepers{0};
 
     static std::vector<int> cpus_from_env() {
         std::vector<int> c;
@@ -84,9 +89,17 @@ struct fle_pool {
                 for (;;) {
                     // spin on the generation (a layer is ~0.5 ms away), yield after a while
                     int spins = 0;
-                    while (gen.load(std::memory_order_acquire) == seen) {
+                    auto t_idle = std::chrono::steady_clock::now();
+                    while (gen.load(std::memory_order_seq_cst) == seen) {
                         if (stop.load(std::memory_order_relaxed)) { return; }
-                        if (++spins < 200000) { FLE_PAUSE(); } else { std::this_thread::yield(); }
+                        if (++spins < 200000) { FLE_PAUSE(); continue; }
+                        std::this_thread::yield();
+                        if ((spins & 1023) == 0 && std::chrono::steady_clock::now() - t_idle > std::chrono::milliseconds(20)) {
+                            std::unique_lock<std::mutex> lk(sleep_mtx);
+                            sleepers.fetch_add(1, std::memory_order_seq_cst);
+                            sleep_cv.wait(lk, [&] { return gen.load(std::memory_order_seq_cst) != seen || stop.load(); });
+                            sleepers.fetch_sub(1, std::memory_order_seq_cst);
+                        }
                     }
                     seen = gen.load(std::memory_order_acquire);
                     work();
@@ -102,7 +115,8 @@ struct fle_pool {
         fn = std::move(f); n_jobs = jobs;
         next.store(0, std::memory_order_release);
         done.store(0, std::memory_order_release);
-        gen.fetch_add(1, std::memory_order_acq_rel);
+        gen.fetch_add(1, std::memory_order_seq_cst);
+        if (sleepers.load(std::memory_order_seq_cst) > 0) { std::lock_guard<std::mutex> lk(sleep_mtx); sleep_cv.notify_all(); }
         work();
         while (done.load(std::memory_order_acquire) < n) { FLE_PAUSE(); }
     }
