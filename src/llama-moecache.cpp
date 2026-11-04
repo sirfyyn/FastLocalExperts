@@ -68,6 +68,7 @@ struct layer_state {
 
     // Patch 44a (FLE_MOE_PROFILE): lifetime routing counts of this layer, saved to / seeded from the profile file
     std::vector<uint64_t> prof_cnt;
+    std::vector<uint8_t>  prof_seen;   // FLE_MOE_PROFILE_UNION scratch: experts already counted in this call
     uint64_t              prof_total  = 0;   // sum of prof_cnt (aged: halved when it reaches prof_max_obs)
     int32_t               n_prefilled = 0;   // slots filled from the profile at start
 
@@ -437,13 +438,19 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     }
 
     std::lock_guard<std::mutex> lock(mc->mtx);
+    // FLE_MOE_PROFILE_UNION=1: the profile counts an expert once per call (per verify round), not once per token: a speculative
+    // round pays a CPU expert once however many of its tokens route to it, so the static cache should hold the experts most
+    // often in a round's union. Record with FLE_MOE_OBS_MAXTOK >= the verify batch (6 for n-max 5).
+    static const bool prof_union = [] { const char * e = std::getenv("FLE_MOE_PROFILE_UNION"); return e && atoi(e) != 0; }();
+    std::vector<uint8_t> & seen = ls->prof_seen;
+    if (prof_union && !ls->prof_cnt.empty()) { seen.assign(ls->prof_cnt.size(), 0); }
     for (int64_t t = 0; t < n_tokens; ++t) {
         for (int64_t i = 0; i < n_ids; ++i) {
             const int32_t id = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
             if (id < 0 || id >= (int32_t) ls->expert_slot.size()) {
                 continue;
             }
-            if (!ls->prof_cnt.empty()) {
+            if (!ls->prof_cnt.empty() && !(prof_union && seen[(size_t) id]++)) {
                 ls->prof_cnt[id]++;
                 mc->prof_dirty = true;
                 if (++ls->prof_total >= mc->prof_max_obs) {   // age: old runs must not dominate forever
