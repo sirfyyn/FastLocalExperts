@@ -249,7 +249,7 @@ jobs:
         run: |
           python3 .github/fle-binaries/check_elf.py \
             --dir "check/${{ steps.package.outputs.name }}" \
-            --cuda-major 12 \
+            --cuda-major 13 \
             --max-glibc 2.35 \
             --ldd
 
@@ -543,7 +543,7 @@ jobs:
         run: |
           python3 .github/fle-binaries/check_elf.py \
             --dir pkg \
-            --cuda-major 12 \
+            --cuda-major 13 \
             --max-glibc 2.35 \
             --ldd \
             --cudart-present
