@@ -369,6 +369,12 @@ extern "C" {
     GGML_API ggml_moe_data_cb_t ggml_get_moe_data_callback(void ** ud);
     // FLE expert store, asynchronous misses: true when the expert's bytes can be read now (resident, or not in the store at all);
     // mul_mat_id computes the ready experts first and the others after, when data_cb has waited for their reads
+    // FLE expert store, uploads: pin returns the expert's bytes and keeps its slot from being given up until unpin(slot)
+    // (NULL: not resident, use src0->data); for readers outside the op (the scheduler's prefill upload)
+    typedef const void * (*ggml_moe_pin_cb_t)(const struct ggml_tensor * src0, int32_t expert, int32_t * slot, void * ud);
+    typedef void         (*ggml_moe_unpin_cb_t)(int32_t slot, void * ud);
+    GGML_API void ggml_set_moe_pin_callback(ggml_moe_pin_cb_t pin, ggml_moe_unpin_cb_t unpin, void * ud);
+    GGML_API ggml_moe_pin_cb_t ggml_get_moe_pin_callback(ggml_moe_unpin_cb_t * unpin, void ** ud);
     typedef bool (*ggml_moe_ready_cb_t)(const struct ggml_tensor * src0, int32_t expert, void * ud);
     GGML_API void                ggml_set_moe_ready_callback(ggml_moe_ready_cb_t cb, void * ud);
     GGML_API ggml_moe_ready_cb_t ggml_get_moe_ready_callback(void ** ud);

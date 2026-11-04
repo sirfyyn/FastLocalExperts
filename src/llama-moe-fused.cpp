@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -14,6 +16,11 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include <cstdlib>
 #include <cstdio>
@@ -52,6 +59,10 @@ struct fle_pool {
     std::function<void(int64_t)> fn;
     int n = 0;
     std::atomic<bool> stop{false};
+    // idle: after ~20 ms without work a worker sleeps on cv (a server without requests must not hold the cores at 100 %)
+    std::mutex              sleep_mtx;
+    std::condition_variable sleep_cv;
+    std::atomic<int>        sleepers{0};
 
     static std::vector<int> cpus_from_env() {
         std::vector<int> c;
@@ -76,6 +87,8 @@ struct fle_pool {
 #if defined(__linux__)
                 cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
                 pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+                if (cpu >= 0 && cpu < 64) { SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << cpu); }
 #else
                 (void) cpu;
 #endif
@@ -83,9 +96,17 @@ struct fle_pool {
                 for (;;) {
                     // spin on the generation (a layer is ~0.5 ms away), yield after a while
                     int spins = 0;
-                    while (gen.load(std::memory_order_acquire) == seen) {
+                    auto t_idle = std::chrono::steady_clock::now();
+                    while (gen.load(std::memory_order_seq_cst) == seen) {
                         if (stop.load(std::memory_order_relaxed)) { return; }
-                        if (++spins < 200000) { FLE_PAUSE(); } else { std::this_thread::yield(); }
+                        if (++spins < 200000) { FLE_PAUSE(); continue; }
+                        std::this_thread::yield();
+                        if ((spins & 1023) == 0 && std::chrono::steady_clock::now() - t_idle > std::chrono::milliseconds(20)) {
+                            std::unique_lock<std::mutex> lk(sleep_mtx);
+                            sleepers.fetch_add(1, std::memory_order_seq_cst);
+                            sleep_cv.wait(lk, [&] { return gen.load(std::memory_order_seq_cst) != seen || stop.load(); });
+                            sleepers.fetch_sub(1, std::memory_order_seq_cst);
+                        }
                     }
                     seen = gen.load(std::memory_order_acquire);
                     work();
@@ -101,7 +122,8 @@ struct fle_pool {
         fn = std::move(f); n_jobs = jobs;
         next.store(0, std::memory_order_release);
         done.store(0, std::memory_order_release);
-        gen.fetch_add(1, std::memory_order_acq_rel);
+        gen.fetch_add(1, std::memory_order_seq_cst);
+        if (sleepers.load(std::memory_order_seq_cst) > 0) { std::lock_guard<std::mutex> lk(sleep_mtx); sleep_cv.notify_all(); }
         work();
         while (done.load(std::memory_order_acquire) < n) { FLE_PAUSE(); }
     }
@@ -182,14 +204,20 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         static bool said = false;
         if (!said) { said = true; std::fprintf(stderr, "[fle-moe-pool] fused CPU MoE op on the pool (ggml nth=%d)\n", nth); }
         if (ith != 0) { return; }   // the pool does the work; with nth > 1 the other ggml threads only wait at the next barrier
+        const auto fle_t0 = std::chrono::steady_clock::now();
         memset(dst->data, 0, ggml_nbytes(dst));
         const int64_t np = (int64_t) u->pairs.size();
         if (np == 0) { return; }
+        int fle_late = 0;   // distinct experts still being read when the op starts (FLE_MOE_POOL_STATS)
         // experts whose bytes are there first (asynchronous expert store), the ones still being read last: the tickets hand out
         // the resident work while the reads land, instead of a worker waiting on a missing expert early in the layer
         {
             void * rud = nullptr;
             ggml_moe_ready_cb_t rcb = ggml_get_moe_ready_callback(&rud);
+            if (rcb) {
+                int32_t last = -1;
+                for (const auto & q : u->pairs) { if (q.e != last && !rcb(gate, q.e, rud)) { fle_late++; } last = q.e; }
+            }
             if (rcb && np > 1) {
                 std::stable_partition(u->pairs.begin(), u->pairs.end(), [&](const pair_t & q) { return rcb(gate, q.e, rud); });
             }
@@ -282,6 +310,24 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
                 }
             }
         });
+        // FLE_MOE_POOL_STATS: wall time of the 1-token op by distinct CPU experts and by experts still in flight
+        {
+            static const long every = [] { const char * e = std::getenv("FLE_MOE_POOL_STATS"); return (e && *e) ? atol(e) : 0L; }();
+            if (every > 0 && n_tok == 1) {
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fle_t0).count();
+                static double s_us[5][3] = {{0}}; static long s_n[5][3] = {{0}}; static long calls = 0;
+                const int a = (int) std::min<int64_t>(ng, 4), b = std::min(fle_late, 2);
+                s_us[a][b] += us; s_n[a][b]++;
+                if (++calls % every == 0) {
+                    for (int x = 1; x <= 4; ++x) {
+                        std::fprintf(stderr, "[fle-moe-pool] 1 token, %d%s CPU experts: in RAM %ld x %.0f us | 1 in flight %ld x %.0f us | 2+ in flight %ld x %.0f us\n",
+                                x, x == 4 ? "+" : "", s_n[x][0], s_n[x][0] ? s_us[x][0] / s_n[x][0] : 0.0, s_n[x][1], s_n[x][1] ? s_us[x][1] / s_n[x][1] : 0.0,
+                                s_n[x][2], s_n[x][2] ? s_us[x][2] / s_n[x][2] : 0.0);
+                        for (int y = 0; y < 3; ++y) { s_us[x][y] = 0; s_n[x][y] = 0; }
+                    }
+                }
+            }
+        }
         if (n_tok == 1) { llama_moe_cpu_predict_after(u->il, (const float *) cur->data, n_embd); }   // FLE_MOE_CPU_PRED
         return;
     }
