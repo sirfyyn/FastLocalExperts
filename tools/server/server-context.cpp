@@ -4953,6 +4953,25 @@ void server_routes::init_routes() {
             if (eq) { switches[std::string(*e, eq - *e)] = std::string(eq + 1); }
         }
 
+        // run_id: one hash over what decides the output (build, model file, every FLE switch, sorted), so two runs with the
+        // same id ran the same engine on the same model with the same switches
+        {
+            std::string key = meta ? meta->build_info : std::string();
+            key += '\n'; key += params.model.path;
+            if (FILE * f = std::fopen(params.model.path.c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END); key += '\n'; key += std::to_string((long long) std::ftell(f));
+                std::fclose(f);
+            }
+            std::vector<std::string> kv;
+            for (auto it = switches.begin(); it != switches.end(); ++it) { kv.push_back(it.key() + "=" + it.value().get<std::string>()); }
+            std::sort(kv.begin(), kv.end());
+            for (auto & x : kv) { key += '\n'; key += x; }
+            uint64_t h = 1469598103934665603ULL;
+            for (unsigned char c : key) { h = (h ^ c) * 1099511628211ULL; }
+            char rid[20]; snprintf(rid, sizeof(rid), "%016llx", (unsigned long long) h);
+            engine["run_id"] = rid;
+        }
+
         json draft = {{"kind", nullptr}, {"n_max", nullptr}, {"block", nullptr}};
         if (!params.speculative.types.empty()) {
             draft["kind"]  = common_speculative_type_name_str(params.speculative.types);
@@ -4967,6 +4986,13 @@ void server_routes::init_routes() {
         }
         if (cu_rt > 0 && cu_rt < 13040) {
             warnings.push_back({{"code", "cuda_lt_13_4"}, {"level", "warn"}, {"text", "CUDA runtime is older than 13.4; the release packages are built and measured with 13.4."}});
+        }
+        if (const char * sg = std::getenv("FLE_MOE_STORE_GB"); sg && std::atof(sg) > 0) {
+            const double avail_gb = fle_mem_avail_gb();   // what is still free now, with the store already allocated
+            if (avail_gb >= 0 && avail_gb < 4.0) {
+                warnings.push_back({{"code", "ram_tight"}, {"level", "warn"},
+                        {"text", "Less than 4 GB of memory left for this process with the RAM expert store allocated; a larger request can get the engine killed."}});
+            }
         }
         if (const char * w = std::getenv("FLE_PREFILL_WINDOW"); w && std::atoi(w) > 8) {
             warnings.push_back({{"code", "prefill_window_gt_8"}, {"level", "warn"}, {"text", "FLE_PREFILL_WINDOW is above 8; 8 is the recommended value."}});
