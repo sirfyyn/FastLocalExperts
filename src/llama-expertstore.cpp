@@ -79,6 +79,23 @@ static constexpr size_t ES_ALIGN = 4096;
 
 static size_t es_round_up(size_t x) { return (x + ES_ALIGN - 1) & ~(ES_ALIGN - 1); }
 
+// diagnostics for run-to-run differences: FLE_MOE_STORE_NOEVICT=1 never gives a slot up once the store is full;
+// FLE_MOE_STORE_VERIFY=1 compares every expert data_cb hands out with the model file's bytes and counts mismatches
+static bool es_noevict() { static const bool v = [] { const char * e = std::getenv("FLE_MOE_STORE_NOEVICT"); return e && atoi(e) != 0; }(); return v; }
+static bool es_verify()  { static const bool v = [] { const char * e = std::getenv("FLE_MOE_STORE_VERIFY");  return e && atoi(e) != 0; }(); return v; }
+static std::atomic<uint64_t> es_vfy_n{0}, es_vfy_bad{0};
+static const void * es_check(const ggml_tensor * src0, int32_t expert, int li, int role, int32_t slot, const char * p) {
+    if (!p || !es_verify()) { return p; }
+    const char * ref = (const char *) src0->data + (size_t) expert * src0->nb[2];
+    const uint64_t n = es_vfy_n.fetch_add(1) + 1;
+    if (std::memcmp(p, ref, src0->nb[2]) != 0) {
+        const uint64_t b = es_vfy_bad.fetch_add(1) + 1;
+        if (b <= 20) { std::fprintf(stderr, "[fle-store-verify] MISMATCH layer %d role %d expert %d slot %d (check %llu)\n", li, role, expert, slot, (unsigned long long) n); }
+    }
+    if (n % 200000 == 0) { std::fprintf(stderr, "[fle-store-verify] %llu checks, %llu mismatches\n", (unsigned long long) n, (unsigned long long) es_vfy_bad.load()); }
+    return p;
+}
+
 struct es_job { es_file fd; uint64_t off; size_t len; char * dst; std::atomic<int> * ctr; };   // ctr: prefetch (async), nullptr: demand
 
 struct llama_expert_store::impl {
@@ -365,6 +382,7 @@ llama_expert_store::~llama_expert_store() {
         (unsigned long long) st.hits, (unsigned long long) st.misses, (unsigned long long) st.evictions, st.read_bytes / 1e9, st.wait_ms,
         (unsigned long long) st.preloaded, st.preload_ms, (unsigned long long) st.pre_issued, (unsigned long long) st.pre_used,
         (unsigned long long) st.pre_wasted, (unsigned long long) d->read_err);
+    if (es_verify()) { std::fprintf(stderr, "[fle-store-verify] end: %llu checks, %llu mismatches\n", (unsigned long long) es_vfy_n.load(), (unsigned long long) es_vfy_bad.load()); }
     {
         std::lock_guard<std::mutex> lk(d->mtx);
         d->stop = true;
@@ -450,6 +468,7 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
         if (dup) { continue; }
         // a slot: a never-used one first, then the least used of a sample, never one this call needs
         size_t victim = d->cls_free(L.cls);
+        if (victim == SIZE_MAX && es_noevict()) { continue; }   // FLE_MOE_STORE_NOEVICT: the set stays as filled
         if (victim == SIZE_MAX) {
             uint32_t best = UINT32_MAX;
             const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
@@ -542,6 +561,7 @@ bool llama_expert_store::prefetch(size_t li, int32_t e, std::vector<std::pair<in
     if (e < 0 || e >= L.n_expert || L.slot_of[(size_t) e] >= 0) { return false; }
     // a slot: a never-used one, else the least used of a sample that is neither being read nor needed by the running layer
     size_t victim = d->cls_free(L.cls);
+    if (victim == SIZE_MAX && es_noevict()) { return false; }
     if (victim == SIZE_MAX) {
         uint32_t best = UINT32_MAX;
         const size_t ns = d->cls_hi[(size_t) L.cls] - d->cls_lo[(size_t) L.cls];
@@ -606,7 +626,7 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     const auto & L = s->d->layers[(size_t) it->second.first];
     if (expert < 0 || expert >= L.n_expert) { return nullptr; }
     const char * p = L.ptr[it->second.second][(size_t) expert];
-    if (p) { return p; }
+    if (p) { return es_check(src0, expert, it->second.first, it->second.second, L.slot_of[(size_t) expert], p); }
     const int32_t sl = L.slot_of[(size_t) expert];
     if (sl < 0) { return nullptr; }
     // FLE_MOE_STORE_ASYNC: read still running (or a prefetch not yet published): wait for this expert only, then publish it
@@ -619,7 +639,7 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     auto & LW = const_cast<impl::layer_t &>(L);
     for (int r = 0; r < 3; ++r) { LW.ptr[r][(size_t) expert] = S.staged[r]; }
-    return S.staged[it->second.second];
+    return es_check(src0, expert, it->second.first, it->second.second, sl, S.staged[it->second.second]);
 }
 
 bool llama_expert_store::ready_cb(const ggml_tensor * src0, int32_t expert, void * ud) {

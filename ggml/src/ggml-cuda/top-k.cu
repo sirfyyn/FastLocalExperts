@@ -36,8 +36,66 @@ static void top_k_cub(ggml_cuda_pool & pool,
                          ncols, k, env));
 }
 
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+// FLE: DeviceTopK, made reproducible. The keys are unique (ordered float bits << 32 | inverted column), so ties pick
+// the smaller column and the selected set is the same in every run; the k columns are then sorted ascending in shared
+// memory, so the order is fixed too. cub::DeviceTopK itself only offers non-deterministic, unsorted output.
+static __global__ void fle_topk_keys(const float * __restrict__ src, uint64_t * __restrict__ keys, const int ncols) {
+    const int row = blockIdx.y;
+    for (int col = blockIdx.x * blockDim.x + threadIdx.x; col < ncols; col += gridDim.x * blockDim.x) {
+        const uint32_t bits = __float_as_uint(src[(size_t) row * ncols + col]);
+        const uint32_t ord  = bits ^ ((uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000U);
+        keys[(size_t) row * ncols + col] = ((uint64_t) ord << 32) | (uint64_t) (0xFFFFFFFFU - (uint32_t) col);
+    }
+}
 
+static __global__ void fle_topk_sorted_cols(const uint64_t * __restrict__ top, int * __restrict__ dst, const int k, const int kpad) {
+    extern __shared__ int sh[];
+    const int row = blockIdx.x;
+    for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+        sh[i] = i < k ? (int) (0xFFFFFFFFU - (uint32_t) top[(size_t) row * k + i]) : 0x7fffffff;
+    }
+    __syncthreads();
+    for (int kk = 2; kk <= kpad; kk <<= 1) {
+        for (int j = kk >> 1; j > 0; j >>= 1) {
+            for (int i = threadIdx.x; i < kpad; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const int a = sh[i], b = sh[ixj];
+                    if (((i & kk) == 0) ? (a > b) : (a < b)) { sh[i] = b; sh[ixj] = a; }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int i = threadIdx.x; i < k; i += blockDim.x) { dst[(size_t) row * k + i] = sh[i]; }
+}
+
+static void fle_top_k_cub_det(ggml_cuda_pool & pool, const float * src, int * dst, const int ncols, const int nrows, const int k,
+                              const int kpad, cudaStream_t stream) {
+    ggml_cuda_pool_alloc<uint64_t> keys_alloc(pool, (size_t) ncols * nrows);
+    ggml_cuda_pool_alloc<uint64_t> top_alloc(pool, (size_t) k * nrows);
+    uint64_t * keys = keys_alloc.get();
+    uint64_t * top  = top_alloc.get();
+    const dim3 grid((ncols + 255) / 256 < 64 ? (ncols + 255) / 256 : 64, nrows);
+    fle_topk_keys<<<grid, 256, 0, stream>>>(src, keys, ncols);
+
+    auto requirements = cuda::execution::require(cuda::execution::determinism::not_guaranteed,
+                                                 cuda::execution::output_ordering::unsorted);
+    auto env = cuda::std::execution::env{ cuda::stream_ref{ stream }, requirements };
+    size_t temp_storage_bytes = 0;
+    CUDA_CHECK(DeviceTopK::MaxKeys(nullptr, temp_storage_bytes, keys, top, ncols, k, env));
+    ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
+    for (int i = 0; i < nrows; i++) {
+        size_t bytes = temp_storage_bytes;
+        CUDA_CHECK(DeviceTopK::MaxKeys(temp_storage_alloc.get(), bytes, keys + (size_t) i * ncols, top + (size_t) i * k, ncols, k, env));
+    }
+    const int nth = kpad / 2 < 1024 ? (kpad / 2 > 32 ? kpad / 2 : 32) : 1024;
+    fle_topk_sorted_cols<<<nrows, nth, kpad * sizeof(int), stream>>>(top, dst, k, kpad);
+}
+
+#endif                            // CUB_TOP_K_AVAILABLE
+
+#if defined(GGML_CUDA_USE_CUB)
 static int next_power_of_2(int x) {
     int n = 1;
     while (n < x) {
@@ -45,8 +103,7 @@ static int next_power_of_2(int x) {
     }
     return n;
 }
-
-#endif                            // CUB_TOP_K_AVAILABLE
+#endif
 
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
@@ -226,13 +283,30 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
-    // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
-    // https://github.com/NVIDIA/cccl/issues/6391
-    // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
-    for (int i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+    // FLE: cub::DeviceTopK (CCCL >= 3.2, i.e. CUDA 13) alone gives the k indices in a run-to-run varying order
+    // (determinism::not_guaranteed, output_ordering::unsorted). DeepSeek-V4.1's indexer feeds that order into the
+    // attention's key order, so two runs of the same prompt summed differently and drifted apart. Default: DeviceTopK on
+    // unique keys, columns sorted ascending (fle_top_k_cub_det, reproducible). FLE_TOPK_UNSORTED=1: plain DeviceTopK;
+    // FLE_TOPK_ARGSORT=1: the argsort path CUDA 12 builds take.
+    static const bool fle_topk_unsorted = [] { const char * e = getenv("FLE_TOPK_UNSORTED"); return e && atoi(e) != 0; }();
+    static const bool fle_topk_argsort  = [] { const char * e = getenv("FLE_TOPK_ARGSORT");  return e && atoi(e) != 0; }();
+    if (fle_topk_unsorted) {
+        // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
+        // https://github.com/NVIDIA/cccl/issues/6391
+        for (int i = 0; i < nrows; i++) {
+            top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+        }
+        return;
     }
-#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    {
+        const int kpad = next_power_of_2((int) k);
+        if (!fle_topk_argsort && kpad <= 4096) {
+            fle_top_k_cub_det(pool, src0_d, dst_d, (int) ncols, (int) nrows, (int) k, kpad, stream);
+            return;
+        }
+    }
+#endif
+#if defined(GGML_CUDA_USE_CUB)
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);

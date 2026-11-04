@@ -204,6 +204,28 @@ static void fused_fn(ggml_tensor * dst, int ith, int nth, void * userdata) {
         static bool said = false;
         if (!said) { said = true; std::fprintf(stderr, "[fle-moe-pool] fused CPU MoE op on the pool (ggml nth=%d)\n", nth); }
         if (ith != 0) { return; }   // the pool does the work; with nth > 1 the other ggml threads only wait at the next barrier
+        // FLE_TRACE_FUSED=1: one line per call with FNV hashes of the input, the expert ids and the result (first run-to-run difference)
+        struct trace_guard {
+            const ggml_tensor * dst; int il; int64_t n_tok; bool on;
+            static uint64_t fnv(const void * p, size_t n, uint64_t h = 1469598103934665603ULL) {
+                const unsigned char * c = (const unsigned char *) p;
+                for (size_t i = 0; i < n; ++i) { h = (h ^ c[i]) * 1099511628211ULL; }
+                return h;
+            }
+            ~trace_guard() {
+                if (!on) { return; }
+                static std::atomic<uint64_t> n{0};
+                const ggml_tensor * cur = dst->src[0]; const ggml_tensor * ids = dst->src[1];
+                uint64_t hc = 1469598103934665603ULL, hi = hc;
+                for (int64_t t = 0; t < n_tok; ++t) {
+                    hc = fnv((const char *) cur->data + t*cur->nb[2], (size_t) cur->ne[0] * sizeof(float), hc);
+                    for (int64_t i = 0; i < ids->ne[0]; ++i) { hi = fnv((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0], sizeof(int32_t), hi); }
+                }
+                const uint64_t hd = fnv(dst->data, ggml_nbytes(dst));
+                std::fprintf(stderr, "[fle-trace] %llu il=%d tok=%lld in=%016llx ids=%016llx out=%016llx\n", (unsigned long long) n.fetch_add(1), il,
+                        (long long) n_tok, (unsigned long long) hc, (unsigned long long) hi, (unsigned long long) hd);
+            }
+        } fle_trace{ dst, u->il, n_tok, [] { const char * e = std::getenv("FLE_TRACE_FUSED"); return e && atoi(e) != 0; }() };
         const auto fle_t0 = std::chrono::steady_clock::now();
         memset(dst->data, 0, ggml_nbytes(dst));
         const int64_t np = (int64_t) u->pairs.size();
