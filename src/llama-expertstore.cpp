@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -40,6 +41,7 @@ struct llama_expert_store::impl {
     struct slot_t { int32_t li = -1; int32_t e = -1; uint32_t cnt = 0; uint8_t pre = 0; const char * staged[3] = { nullptr, nullptr, nullptr }; };
     std::unique_ptr<std::atomic<int>[]> inflight;   // per slot: prefetch reads still running
     std::unique_ptr<std::atomic<int>[]> pins;       // per slot: GPU-cache uploads reading it
+    std::unique_ptr<std::atomic<uint8_t>[]> bad;    // per slot: an asynchronous read of it failed (never published)
     std::mutex smtx;                                 // ownership changes vs acquire() from the upload thread
 
     std::vector<layer_t> layers;
@@ -87,12 +89,13 @@ struct llama_expert_store::impl {
             size_t got = 0;
             while (got < j.len) {
                 const ssize_t r = pread(j.fd, j.dst + got, j.len - got, (off_t) (j.off + got));
+                if (r < 0 && errno == EINTR) { continue; }
                 if (r <= 0) { ok = r == 0 && got > 0; break; }   // EOF after data: the tail past the file end is not needed
                 got += (size_t) r;
             }
 #endif
             if (j.ctr) {
-                if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; }
+                if (!ok) { std::lock_guard<std::mutex> lk(mtx); read_err++; bad[(size_t) (j.ctr - inflight.get())].store(1, std::memory_order_relaxed); }
                 j.ctr->fetch_sub(1, std::memory_order_release);
                 continue;
             }
@@ -104,8 +107,9 @@ struct llama_expert_store::impl {
         }
     }
 
-    void run(std::vector<es_job> & jobs) {
-        if (jobs.empty()) { return; }
+    bool run(std::vector<es_job> & jobs) {   // false: at least one read failed
+        if (jobs.empty()) { return true; }
+        const uint64_t err0 = [&] { std::lock_guard<std::mutex> lk(mtx); return read_err; }();
         {
             std::lock_guard<std::mutex> lk(mtx);
             for (auto it = jobs.rbegin(); it != jobs.rend(); ++it) { q.push_front(*it); }   // demand before prefetch
@@ -115,6 +119,7 @@ struct llama_expert_store::impl {
         std::unique_lock<std::mutex> lk(mtx);
         done_cv.wait(lk, [&] { return pending == 0; });
         jobs.clear();
+        return read_err == err0;
     }
 
     // queue the three reads of expert e of layer li into slot s; returns the weight pointers via ptr_out
@@ -260,7 +265,8 @@ std::unique_ptr<llama_expert_store> llama_expert_store::create(const std::vector
     d->slots.resize(n_slots);
     d->inflight.reset(new std::atomic<int>[n_slots]);
     d->pins.reset(new std::atomic<int>[n_slots]);
-    for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); d->pins[i].store(0); }
+    d->bad.reset(new std::atomic<uint8_t>[n_slots]);
+    for (size_t i = 0; i < n_slots; ++i) { d->inflight[i].store(0); d->pins[i].store(0); d->bad[i].store(0); }
     for (int i = 0; i < std::max(1, threads); ++i) { d->pool.emplace_back([d] { d->reader(); }); }
 #if defined(__linux__)
     // FLE_MOE_STORE_READER_CPUS="16-31": the readers wait on the SSD most of the time; keep them off the cores the compute threads use
@@ -326,14 +332,11 @@ size_t llama_expert_store::preload(const std::vector<std::pair<int32_t, int32_t>
         ps.push_back(p);
         st.read_bytes += expert_bytes(li);
         if (ps.size() >= 256) {
-            d->run(jobs);
-            for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); }
-            n += ps.size(); ps.clear();
+            if (d->run(jobs)) { for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); } n += ps.size(); }
+            ps.clear();
         }
     }
-    d->run(jobs);
-    for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); }
-    n += ps.size();
+    if (d->run(jobs)) { for (auto & q : ps) { d->assign(q.li, q.e, q.s, q.p); } n += ps.size(); }
     st.preloaded += n;
     st.preload_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return n;
@@ -358,6 +361,10 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
                 const auto t0 = std::chrono::steady_clock::now();
                 while (d->inflight[(size_t) s].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
                 st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (d->bad[(size_t) s].exchange(0)) {   // its read failed: give the slot up, the expert stays on the mmap path
+                    L.slot_of[(size_t) e] = -1; S.li = -1; S.e = -1;
+                    continue;
+                }
                 for (int r = 0; r < 3; ++r) { L.ptr[r][(size_t) e] = S.staged[r]; }
             }
             if (S.pre == 1) { S.pre = 2; st.pre_used++; }
@@ -434,9 +441,9 @@ void llama_expert_store::ensure(size_t li, const int32_t * experts, size_t n, st
             d->cv.notify_all();
         } else {
             const auto t0 = std::chrono::steady_clock::now();
-            d->run(jobs);
+            const bool rok = d->run(jobs);
             st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); }
+            if (rok) { for (size_t k = 0; k < np; ++k) { d->assign(li, ps[k].e, ps[k].s, ps[k].p); } }   // else: they stay on the mmap path
         }
     }
     if (++d->n_ensure % 8192 == 0) {   // age: old popularity must not hold slots forever
@@ -534,6 +541,7 @@ const void * llama_expert_store::data_cb(const ggml_tensor * src0, int32_t exper
     if (S.li != (int32_t) it->second.first || S.e != expert) { return nullptr; }
     const auto t0 = std::chrono::steady_clock::now();
     while (s->d->inflight[(size_t) sl].load(std::memory_order_acquire) > 0) { std::this_thread::yield(); }
+    if (s->d->bad[(size_t) sl].load(std::memory_order_relaxed)) { return nullptr; }   // read failed: the mmap bytes (ensure gives the slot up)
     auto & st = const_cast<llama_expert_store *>(s)->st;
     st.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     auto & LW = const_cast<impl::layer_t &>(L);
