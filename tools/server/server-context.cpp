@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <cstring>
+#include <chrono>
 #include <cctype>
 #include <mutex>
 #include <cstdio>
@@ -885,7 +886,8 @@ struct fle_live_t {
     bool has_last = false;
 };
 static fle_live_t & fle_live() { static fle_live_t * l = new fle_live_t(); return *l; }
-static const int64_t fle_t_start_us = ggml_time_us();
+// std::chrono, not ggml_time_us(): this runs while the DLL loads, before ggml_time_init() (Windows divides by the timer frequency)
+static const auto fle_t_start = std::chrono::steady_clock::now();
 #if !defined(_WIN32)
 extern char ** environ;
 #endif
@@ -4917,7 +4919,7 @@ void server_routes::init_routes() {
         json engine = {
             {"name", "fle"}, {"version", nullptr}, {"commit", meta ? json(meta->build_info) : json(nullptr)},
             {"model", meta ? json(meta->model_name) : json(nullptr)},
-            {"uptime_s", (ggml_time_us() - fle_t_start_us) / 1000000},
+            {"uptime_s", (long long) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - fle_t_start).count()},
         };
         if (const char * v = std::getenv("FLE_VERSION")) { engine["version"] = v; }
 
