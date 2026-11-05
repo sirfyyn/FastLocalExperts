@@ -1866,10 +1866,19 @@ double fle_mem_avail_gb() {
             }
             return ok;
         };
-        double lim = 0, cur = 0;
+        double lim = 0, cur = 0, file = 0;
         if (read_num("/sys/fs/cgroup" + cg + "/memory.max", lim)) {
             read_num("/sys/fs/cgroup" + cg + "/memory.current", cur);
-            const double left_gb = (lim - cur) / 1073741824.0;
+            // memory.current counts the page cache of the mmapped model too, which the kernel reclaims first: subtract it
+            if (FILE * f = std::fopen(("/sys/fs/cgroup" + cg + "/memory.stat").c_str(), "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), f)) {
+                    long long v = 0;
+                    if (std::sscanf(line, "file %lld", &v) == 1) { file = (double) v; break; }
+                }
+                std::fclose(f);
+            }
+            const double left_gb = (lim - (cur - file)) / 1073741824.0;
             if (left_gb > 0 && (avail_gb < 0 || left_gb < avail_gb)) { avail_gb = left_gb; }
         }
     }

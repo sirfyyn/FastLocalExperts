@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <cstring>
+#include <cctype>
 #include <mutex>
 #include <cstdio>
 #include <algorithm>
@@ -4938,8 +4939,17 @@ void server_routes::init_routes() {
         if (FILE * f = std::fopen("/proc/driver/nvidia/version", "r")) {
             char line[512] = {0};
             if (std::fgets(line, sizeof(line), f)) {
-                const char * k = std::strstr(line, "Kernel Module");
-                if (k) { k += 13; while (*k == ' ') { ++k; } while (*k && *k != ' ' && *k != '\n') { drv += *k++; } }
+                // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build ...": the first token
+                // after "Kernel Module" that starts with a digit and contains a dot
+                if (const char * k = std::strstr(line, "Kernel Module")) {
+                    for (k += 13; *k && drv.empty(); ) {
+                        while (*k == ' ') { ++k; }
+                        const char * t = k;
+                        while (*k && *k != ' ' && *k != '\n') { ++k; }
+                        const std::string tok(t, k - t);
+                        if (!tok.empty() && std::isdigit((unsigned char) tok[0]) && tok.find('.') != std::string::npos) { drv = tok; }
+                    }
+                }
             }
             std::fclose(f);
         }
@@ -4974,7 +4984,9 @@ void server_routes::init_routes() {
 
         json draft = {{"kind", nullptr}, {"n_max", nullptr}, {"block", nullptr}};
         if (!params.speculative.types.empty()) {
-            draft["kind"]  = common_speculative_type_name_str(params.speculative.types);
+            std::vector<enum common_speculative_type> types;   // without the "none" entry the list carries by default
+            for (auto t : params.speculative.types) { if (t != COMMON_SPECULATIVE_TYPE_NONE) { types.push_back(t); } }
+            draft["kind"]  = types.empty() ? json(nullptr) : json(common_speculative_type_name_str(types));
             draft["n_max"] = common_speculative_n_max(&params.speculative);
         }
 
