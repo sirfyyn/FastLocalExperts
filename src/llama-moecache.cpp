@@ -1617,8 +1617,10 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         int64_t budget_mib = 0;
         if (const char * e = std::getenv("FLE_MOE_CACHE_BUDGET_MIB")) { budget_mib = std::max<int64_t>(0, atoll(e)); }
         if (n_slots <= 0 && budget_mib <= 0) {
-            if (split_dry_run(model)) {
-                return;   // -fit's estimation model: the real split model comes next and still needs its expert store
+            if (split_dry_run(model) || split_store_layers(model).empty()) {
+                // -fit's estimation model, or a model without split layers (the DSpark drafter, -fit's extra-model probe):
+                // nothing to do here, and the real split model that comes later must still get its expert store
+                return;
             }
             split_store_only(model);
             g_init_done = true;
