@@ -1902,7 +1902,11 @@ static void ggml_cuda_mul_mat_id_dispatch(ggml_backend_cuda_context & ctx, const
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 // FLE: the slots of the MoE cache (moe_cache_up/gate/down.N). Past MMVQ batch sizes (hybrid prefill) a token can name the zero slot
 // several times; MMQ/MMF assume distinct experts per token, so these take the per-expert path (it tolerates the repeats)
-static bool fle_is_moe_cache_w(const ggml_tensor * t) { return strncmp(t->name, "moe_cache_", 10) == 0; }
+// FLE split experts: the hot half and the cold half (op offload; its device copy is named "CUDA0#blk.N.ffn_up_exps_cold...") name
+// their zero row once per expert the other half holds, the same repeats; only reached past the MMVQ batch sizes
+static bool fle_is_moe_cache_w(const ggml_tensor * t) {
+    return strncmp(t->name, "moe_cache_", 10) == 0 || strstr(t->name, "_exps_hot") != nullptr || strstr(t->name, "_exps_cold") != nullptr;
+}
 
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
@@ -5777,6 +5781,15 @@ static ggml_backend_dev_t ggml_backend_cuda_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+// FLE /fle/status: CUDA runtime and driver version as CUDA encodes them (13040 = 13.4); -1 when unknown
+static void fle_cuda_versions(int * runtime, int * driver) {
+    int r = -1, d = -1;
+    if (cudaRuntimeGetVersion(&r) != cudaSuccess) { r = -1; }
+    if (cudaDriverGetVersion(&d) != cudaSuccess) { d = -1; }
+    if (runtime) { *runtime = r; }
+    if (driver) { *driver = d; }
+}
+
 static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t reg) {
     static std::vector<ggml_backend_feature> features = []() {
         std::vector<ggml_backend_feature> features;
@@ -5853,6 +5866,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "fle_cuda_versions") == 0) {
+        return (void *)fle_cuda_versions;
     }
     // FLE expert pager. With GGML_BACKEND_DL this backend is a module loaded at run time (dlopen / LoadLibrary), its
     // symbols are not visible to libllama and libllama-common: they reach the pager through these entries.

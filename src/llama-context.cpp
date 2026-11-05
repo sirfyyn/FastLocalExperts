@@ -6,6 +6,7 @@
 #include <map>
 
 #include "llama-moecache.h"
+#include "llama-expertsplit.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -685,6 +686,8 @@ llama_context::llama_context(
     const bool fle_mtp_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
     const float fle_cache_bias = fle_mtp_ctx ? 0.0f : fle_env_f("FLE_MOE_CACHE_BIAS", params.moe_cache_bias);
 
+    // FLE split experts: the id and skip tables first (the expert store of the cache init registers the cold halves)
+    llama_expert_split_init(model);
     llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts, fle_cache_bias);
 
     t_start_us = model.t_start_us;

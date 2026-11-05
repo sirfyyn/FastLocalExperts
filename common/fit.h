@@ -14,6 +14,11 @@ enum common_params_fit_status {
 // a second model that shares the devices of the main model, e.g. a draft model
 //   - its context follows the context of the main model, so its memory is measured again whenever that context changes
 //   - shares_model tells the fit that the weights are already counted in the main model, as for an MTP context
+// FLE /fle/status: with FLE_MOE_CACHE_BUDGET_FIT the largest cache budget (MiB) that would have left the -fit-target margin
+// on device 0, set by the fit when the requested budget does not fit; -1 = no shortfall seen. The server prints it as
+// [fle-status-error] when the start then fails.
+int64_t common_fle_fit_max_mib();   // a function, not a variable: Windows DLLs do not export data automatically
+
 struct common_fit_extra_model {
     const char * path_model;
     llama_model_params * mparams;

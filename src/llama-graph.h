@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_expert_split_layer;
 
 struct llama_memory_context_i;
 
@@ -1020,6 +1021,9 @@ struct llm_graph_context {
     // FLE expert prediction (FLE_MOE_PREFETCH): the next layer's predicted expert ids (I32 [k, n_tokens]); build_moe_ffn hangs them on
     // the CPU gate mul_mat_id as src[4], so they reach the host with that op's inputs and the expert store can read ahead.
     mutable ggml_tensor * fle_pred_ids = nullptr;
+    // FLE split experts (llama-expertsplit.h): the caller sets the layer's tables (llama_layer::fle_split) and hands the cold halves
+    // in as up/gate/down_exps; build_moe_ffn consumes and clears it
+    mutable const struct llama_expert_split_layer * fle_split = nullptr;
     mutable ggml_tensor * fle_defer_experts = nullptr;
     mutable ggml_tensor * fle_defer_weights = nullptr;
     ggml_tensor * fle_defer_add(ggml_tensor * cur, ggml_tensor * experts, ggml_tensor * weights, int64_t n_expert_used, int il) const;

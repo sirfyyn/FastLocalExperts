@@ -39,6 +39,7 @@ add_library(llama
             llama-model.cpp
             llama-moecache.cpp
             llama-expertstore.cpp
+            llama-expertsplit.cpp
             llama-moe-fused.cpp
             llama-quant.cpp
             llama-sampler.cpp

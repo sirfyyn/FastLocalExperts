@@ -437,6 +437,10 @@ struct server_slot_stats {
 
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
+// FLE: memory this process may still use in GB: MemAvailable, or its cgroup's memory.max minus memory.current when that
+// is lower (systemd-run -p MemoryMax). -1 when unknown (not Linux).
+double fle_mem_avail_gb();
+
 struct server_metrics {
     int64_t t_start = 0;
 

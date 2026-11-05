@@ -9,6 +9,7 @@ const float * llama_get_dspark_ring(int32_t layer, int64_t before_pos, int32_t n
 #include <atomic>
 #include <map>
 #include "llama-moecache.h"
+#include "llama-expertsplit.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2056,8 +2057,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // Register the pager's L+1 prediction (self-guarded no-op without the pager env).
-    fle_pager_register_router(gate_exps, gate_inp, exp_probs_b, n_expert_used);
+    // FLE split experts (llama-expertsplit.h): the caller set fle_split and handed the cold halves in as up/gate/down_exps;
+    // nullptr for every other layer
+    const llama_expert_split_layer * split = fle_split;
+    fle_split = nullptr;
+    if (split) {
+        GGML_ASSERT(up_exps == split->up_cold && gate_exps == split->gate_cold && down_exps == split->down_cold &&
+                    "split experts: build_moe_ffn needs the cold halves of the layer whose tables are set");
+        GGML_ASSERT(!gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b &&
+                    !up_exps_s && !gate_exps_s && !down_exps_s && type_op == LLM_FFN_SILU && !weight_before_ffn && loras->empty() &&
+                    "split experts: only separate gate/up/down without biases, scales or LoRA, SiLU");
+    }
+
+    // Register the pager's L+1 prediction (self-guarded no-op without the pager env). Not for a split layer: the pager would
+    // see the cold half in cold-local numbering under the router's original ids.
+    if (!split) {
+        fle_pager_register_router(gate_exps, gate_inp, exp_probs_b, n_expert_used);
+    }
 
     // [FLE_MOE_K] Fewer active experts while decoding (training-free, arXiv 2609.04575, Sep 2026).
     // The selection stays top-k1; the denominator of the renormalisation takes either the probability mass
@@ -2287,6 +2303,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(mc_slot_ids, "ffn_moe_cache_slots", il);
     }
 
+    // the GPU ("hit") chain and the CPU chain's skip table: from the expert cache, or from the split layer (every token count:
+    // the hot half exists nowhere else). The CPU chain runs on `cpu_ids`: original ids, or cold-local rows of a split layer.
+    ggml_tensor * hc_up = nullptr, * hc_gate = nullptr, * hc_down = nullptr;
+    ggml_tensor * cpu_tbl   = nullptr;   // src[3] of the CPU chain
+    int32_t       cpu_dummy = 0;         // op_params[0]: the table value of the ids the CPU computes
+    ggml_tensor * cpu_ids   = selected_experts;
+    if (mcache) {
+        hc_up = mcache->up_c; hc_gate = mcache->gate_c; hc_down = mcache->down_c;
+        cpu_tbl = mcache->host_table; cpu_dummy = mcache->n_slots;
+    } else if (split) {
+        // original id -> hot row / cold row; the other half's zero row for an expert it does not hold
+        ggml_tensor * sp_flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, selected_experts), n_expert_used * n_tokens, 1);
+        mc_rows     = ggml_get_rows(ctx0, split->hot_of, sp_flat);
+        mc_slot_ids = ggml_reshape_2d(ctx0, mc_rows, n_expert_used, n_tokens);
+        cb(mc_slot_ids, "ffn_moe_split_hot_ids", il);
+        cpu_ids = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, split->cold_of, sp_flat), n_expert_used, n_tokens);
+        cb(cpu_ids, "ffn_moe_split_cold_ids", il);
+        // into the graph now, before the (marked) hit chain: otherwise this GPU get_rows lands inside the marked subgraph, which
+        // then produces an input of the CPU chain and the scheduler cannot fetch the CPU inputs early (FLE_MC_OVERLAP)
+        ggml_build_forward_expand(gf, cpu_ids);
+        hc_up = split->up_hot; hc_gate = split->gate_hot; hc_down = split->down_hot;
+        // the skip table only for a cold half in plain host memory: there the CPU path (and the fused op) runs it. A cold half on a
+        // device (no -cmoe) or in a repack buffer computes the zero row, which yields zeros.
+        if (split->cold_host) {
+            cpu_tbl = split->cold_skip; cpu_dummy = LLAMA_EXPERT_SPLIT_RUN;
+        }
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     ggml_tensor * mc_inp = cur;
 
@@ -2299,15 +2343,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     auto build_mc_hit_chain = [&](bool early) -> ggml_tensor * {
         // device-side chain over the cached experts, mirroring the LLM_FFN_SILU
         // activation (the only type_op the cache path is enabled for)
-        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, mcache->up_c,   mc_inp, mc_slot_ids);
-        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, mcache->gate_c, mc_inp, mc_slot_ids);
+        ggml_tensor * up_g   = ggml_mul_mat_id(ctx0, hc_up,   mc_inp, mc_slot_ids);
+        ggml_tensor * gate_g = ggml_mul_mat_id(ctx0, hc_gate, mc_inp, mc_slot_ids);
         cb(up_g,   "ffn_moe_cache_up",   il);
         cb(gate_g, "ffn_moe_cache_gate", il);
         if (early) {
             // fix the order in the graph: slot ids, then gate (marked) and up of the hit chain.
             // With the PCIe share (FLE_MOE_PCIE_FRAC) the get_rows node is marked instead: the cache rewrites the device table
-            // right before the marked subgraph starts, so the table lookup has to be part of it.
-            if (llama_moe_cache_pcie_on()) {
+            // right before the marked subgraph starts, so the table lookup has to be part of it (not for a split layer: its
+            // tables never change).
+            if (mcache && llama_moe_cache_pcie_on()) {
                 // the reshaped expert input is also an input of the CPU chain: it must sit before the marked node, otherwise
                 // the marked subgraph produces an input of the next one and the scheduler cannot fetch it early (trace 06.10.)
                 ggml_build_forward_expand(gf, mc_inp);
@@ -2341,7 +2386,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, mcache->down_c, act_g, mc_slot_ids);
+        ggml_tensor * down_g = ggml_mul_mat_id(ctx0, hc_down, act_g, mc_slot_ids);
         cb(down_g, "ffn_moe_cache_down", il);
         if (early) {
             ggml_build_forward_expand(gf, down_g);
@@ -2353,14 +2398,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     };
     ggml_tensor * mc_down_g = nullptr;
     static const bool fle_defer_env = [] { const char * e = std::getenv("FLE_MOE_DEFER"); return e && std::atoi(e) != 0; }();
-    const bool fle_defer = mcache && fle_mc_overlap && fle_defer_env && !weight_before_ffn && !down_exps_s && !down_exps_b;
+    // overlap and deferral as with the cache: for a split layer only where the cache graph would run (decode, verification)
+    const bool hit_chain = mcache || (split && n_tokens <= mc_maxtok);
+    const bool fle_defer = hit_chain && fle_mc_overlap && fle_defer_env && !weight_before_ffn && !down_exps_s && !down_exps_b;
     if (fle_defer && fle_defer_pending) {
         // the previous layer's CPU experts: after this layer's router (mc_slot_ids pulls it in), before the marked hit chain
         ggml_build_forward_expand(gf, mc_slot_ids);
         ggml_build_forward_expand(gf, fle_defer_pending);
     }
     fle_defer_pending = nullptr;
-    if (mcache && fle_mc_overlap) {
+
+    // FLE_MOE_DEFER_N: the CPU ids of the strong ranks now, the weak ranks one layer later. Sliced before the hit chain; for a split
+    // layer the slices are GPU copies of cpu_ids and must not end up inside the marked subgraph either (see cpu_ids above)
+    static const int fle_defer_n = [] { const char * e = std::getenv("FLE_MOE_DEFER_N"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
+    const int64_t d_n = fle_defer ? std::min<int64_t>(fle_defer_n, n_expert_used - 1) : 0;   // 0: all CPU experts deferred (old behaviour)
+    ggml_tensor * sel_now = nullptr, * sel_late = nullptr;
+    if (d_n > 0) {
+        // argsort_top_k is ordered best first: ranks [0, k) now, [k, n_expert_used) one layer later
+        const int64_t k_now = n_expert_used - d_n;
+        sel_now  = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, k_now, n_tokens, cpu_ids->nb[1], 0));
+        sel_late = ggml_cont(ctx0, ggml_view_2d(ctx0, cpu_ids, d_n,   n_tokens, cpu_ids->nb[1], k_now*cpu_ids->nb[0]));
+        if (split) {
+            ggml_build_forward_expand(gf, sel_now);
+            ggml_build_forward_expand(gf, sel_late);
+        }
+    }
+
+    if (hit_chain && fle_mc_overlap) {
         mc_down_g = build_mc_hit_chain(true);
     }
 
@@ -2376,13 +2440,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // FLE_MOE_FUSED_CPU=1: gate, up, clamped SwiGLU and down of the CPU experts as one op (llama-moe-fused.cpp)
         static const bool fle_fused = [] { const char * e = std::getenv("FLE_MOE_FUSED_CPU"); return e && std::atoi(e) != 0; }();
         static const bool fle_pool_env = [] { const char * e = std::getenv("FLE_MOE_POOL"); return e && std::atoi(e) != 0; }();
-        if (fle_fused && (!fle_pool_env || cur->ne[2] <= mc_maxtok) && mcache && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
+        // (a split layer: cold-local ids, the zero row n_cold is skipped through cold_skip like a cached expert)
+        if (fle_fused && (!fle_pool_env || cur->ne[2] <= mc_maxtok) && cpu_tbl && !gate_up_exps && gate_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
                 !up_exps_b && !gate_exps_b && !down_exps_b && type_op == LLM_FFN_SILU && !weight_before_ffn &&
                 il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f && llm_arch_is_dsv4_family(arch)) {
             ggml_tensor * pred = fle_pred_ids;
             fle_pred_ids = nullptr;
             ggml_tensor * fused = llama_moe_fused_cpu(ctx0, cur, selected_experts, gate_exps, up_exps, down_exps,
-                    mcache->host_table, mcache->n_slots, pred, hparams.swiglu_clamp_exp[il], il);
+                    cpu_tbl, cpu_dummy, pred, hparams.swiglu_clamp_exp[il], il);
             cb(fused, "ffn_moe_fused_cpu", il);
             return fused;
         }
@@ -2413,9 +2478,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
-            if (mcache) {
-                up->src[3] = mcache->host_table;
-                up->op_params[0] = mcache->n_slots;
+            if (cpu_tbl) {
+                up->src[3] = cpu_tbl;
+                up->op_params[0] = cpu_dummy;
             }
 
             if (up_exps_s) {
@@ -2430,14 +2495,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (gate_exps) {
                 cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
-                if (fle_pred_ids && mcache && cur->op == GGML_OP_MUL_MAT_ID && cur->src[4] == nullptr) {
+                if (fle_pred_ids && cpu_tbl && cur->op == GGML_OP_MUL_MAT_ID && cur->src[4] == nullptr) {
                     cur->src[4] = fle_pred_ids;
                 }
                 fle_pred_ids = nullptr;
 
-                if (mcache) {
-                    cur->src[3] = mcache->host_table;
-                    cur->op_params[0] = mcache->n_slots;
+                if (cpu_tbl) {
+                    cur->src[3] = cpu_tbl;
+                    cur->op_params[0] = cpu_dummy;
                 }
             } else {
                 cur = up;
@@ -2547,26 +2612,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    static const int fle_defer_n = [] { const char * e = std::getenv("FLE_MOE_DEFER_N"); return (e && *e) ? std::max(0, atoi(e)) : 0; }();
-    const int64_t d_n = fle_defer ? std::min<int64_t>(fle_defer_n, n_expert_used - 1) : 0;   // 0: all CPU experts deferred (old behaviour)
     ggml_tensor * experts = nullptr;
     ggml_tensor * experts_now = nullptr;   // FLE_MOE_DEFER_N: the strong ranks' CPU part, added in this layer
-    ggml_tensor * sel_now = nullptr, * sel_late = nullptr;
     if (d_n > 0) {
-        // argsort_top_k is ordered best first: ranks [0, k) now, [k, n_expert_used) one layer later
-        const int64_t k_now = n_expert_used - d_n;
-        sel_now  = ggml_cont(ctx0, ggml_view_2d(ctx0, selected_experts, k_now, n_tokens, selected_experts->nb[1], 0));
-        sel_late = ggml_cont(ctx0, ggml_view_2d(ctx0, selected_experts, d_n,   n_tokens, selected_experts->nb[1], k_now*selected_experts->nb[0]));
         experts_now = build_cpu_chain(cur, sel_now);
         experts     = build_cpu_chain(cur, sel_late);
     } else {
-        experts = build_cpu_chain(cur, selected_experts);
+        experts = build_cpu_chain(cur, cpu_ids);
     }
 
-    if (mcache) {
-        if (experts->op == GGML_OP_MUL_MAT_ID) {   // (the fused op carries the table itself)
-            experts->src[3] = mcache->host_table;
-            experts->op_params[0] = mcache->n_slots;
+    // (a split layer always merges its hot half; its skip table only exists for a cold half in host memory)
+    if (mcache || split) {
+        if (cpu_tbl && experts->op == GGML_OP_MUL_MAT_ID) {   // (the fused op carries the table itself)
+            experts->src[3] = cpu_tbl;
+            experts->op_params[0] = cpu_dummy;
         }
 
         ggml_tensor * down_g = mc_down_g ? mc_down_g : build_mc_hit_chain(false);
@@ -2576,13 +2635,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // (with FLE_MOE_DEFER_N only the weak ranks; the strong ranks' CPU part is added below in this layer)
             fle_defer_experts = experts;
             experts = down_g;
-            if (experts_now && experts_now->op == GGML_OP_MUL_MAT_ID) {
-                experts_now->src[3] = mcache->host_table;
-                experts_now->op_params[0] = mcache->n_slots;
+            if (cpu_tbl && experts_now && experts_now->op == GGML_OP_MUL_MAT_ID) {
+                experts_now->src[3] = cpu_tbl;
+                experts_now->op_params[0] = cpu_dummy;
             }
         } else {
             experts = ggml_add(ctx0, experts, down_g);
-            cb(experts, "ffn_moe_cache_merged", il);
+            cb(experts, split ? "ffn_moe_split_merged" : "ffn_moe_cache_merged", il);
         }
     }
 

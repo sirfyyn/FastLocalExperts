@@ -246,3 +246,8 @@ Chat template and parser:
 - [PEG parser](docs/development/parsing.md) - alternative to regex that llama.cpp uses to parse model's output
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
+
+FLE engine:
+- [FLE environment switches](docs/fle/ENV.md)
+- [Split experts](docs/fle/EXPERT-SPLIT.md) - hot/cold expert halves in the GGUF: loader in `src/models/deepseek41.cpp`, tables in
+  `src/llama-expertsplit.{h,cpp}`, graph in `build_moe_ffn` (`src/llama-graph.cpp`), expert store registration in `src/llama-moecache.cpp`
