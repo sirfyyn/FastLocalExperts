@@ -6,6 +6,8 @@
 
 **An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU.**
 
+*Best performance measured on Linux.*
+
 A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork for running large MoE GGUF models locally (local LLM
 inference) that keeps the hot experts of a large MoE model in a GPU
 cache, computes the rest on the CPU, and drafts with the model's own multi-token-prediction head.
@@ -54,7 +56,7 @@ by how much, written so that someone with similar hardware can reproduce it.
 | **Quality** of FLE-IQ3_M | KL divergence against BF16 within the noise of Unsloth UD-IQ4_XS on three texts, at 4.8 GB less | [report 3](https://sirfyyn.github.io/FastLocalExperts/#s3) |
 | **Benchmarks**, one run each | IFBench 80.3 / 83.0 (strict / loose) and GPQA Diamond 88.9: level with Qwen's card (81.3, 91.7). LiveCodeBench v6 85.5: below the card (91.9) | [report 5.4](https://sirfyyn.github.io/FastLocalExperts/#s5-4) |
 
-Hardware: AMD Ryzen 9 9950X3D (16 cores), 120 GB DDR5, one NVIDIA RTX PRO 4500 Blackwell (32 GB), Linux. FLE decodes at
+Hardware: AMD Ryzen 9 9950X3D (16 cores), 120 GB DDR5, one NVIDIA RTX PRO 4500 Blackwell (32 GB), Linux. **Best performance measured on Linux**; every figure here comes from it. FLE decodes at
 about 100 tokens/s on the 24 prompts of bracket B1e and at 91 tokens/s on the six tasks of the Strata comparison; the
 report's title says ~90.
 
