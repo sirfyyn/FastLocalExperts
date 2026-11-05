@@ -4992,7 +4992,10 @@ void server_routes::init_routes() {
 
         json profile = lib_part("profile"), gpu_cache = lib_part("gpu_cache"), store = lib_part("store");
         json warnings = json::array();
-        if (gpu_cache.is_object() && gpu_cache.value("inserts", -1) == 0 && profile.is_object() && !profile.value("loaded", false)) {
+        const bool cache_static = gpu_cache.is_object() && gpu_cache.contains("inserts") && gpu_cache.at("inserts").is_number_integer() &&
+                gpu_cache.at("inserts").get<int>() == 0;
+        const bool prof_loaded = profile.is_object() && profile.contains("loaded") && profile.at("loaded").is_boolean() && profile.at("loaded").get<bool>();
+        if (cache_static && !prof_loaded) {
             warnings.push_back({{"code", "inserts0_no_profile"}, {"level", "warn"},
                     {"text", "Static GPU cache (--moe-expert-cache-inserts 0) without a loaded usage profile: the cache stays empty and decoding is slow."}});
         }
