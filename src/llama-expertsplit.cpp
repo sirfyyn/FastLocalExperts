@@ -139,6 +139,10 @@ void llama_expert_split_init(const llama_model & model) {
                     throw std::runtime_error(format("split layer %d: expert %" PRId64 " has slot %d, the id table disagrees", x->il, e, sl));
                 }
                 if (sl < x->n_hot) { hot_of[(size_t) e] = sl; } else { cold_of[(size_t) e] = sl - x->n_hot; }
+                if (sl >= x->n_hot) {
+                    if (x->cold_ids.empty()) { x->cold_ids.assign((size_t) x->n_cold, -1); }
+                    x->cold_ids[(size_t) (sl - x->n_hot)] = (int32_t) e;
+                }
             }
             // the hot zero row is computed for every cold expert on the GPU: it must really be zero
             for (const ggml_tensor * t : { x->gate_hot, x->up_hot, x->down_hot }) {

@@ -1280,6 +1280,17 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
                 cs.push_back({ pl->cnt[(size_t) x], (int32_t) li, x });
             }
         }
+        // split layers (store index after the cache layers): the profile counts original ids, the store wants cold rows
+        for (size_t k = 0; k < mc->split.size(); ++k) {
+            const auto * sl = mc->split[k];
+            const prof_layer * pl = pf->find(sl->il);
+            if (!pl || sl->cold_ids.size() != (size_t) sl->n_cold || pl->cnt.size() != (size_t) (sl->n_hot + sl->n_cold)) { continue; }
+            for (int32_t r = 0; r < sl->n_cold; ++r) {
+                const int32_t e = sl->cold_ids[(size_t) r];
+                if (e < 0 || pl->cnt[(size_t) e] == 0) { continue; }
+                cs.push_back({ pl->cnt[(size_t) e], (int32_t) (mc->layers.size() + k), r });
+            }
+        }
         std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
         std::vector<std::pair<int32_t, int32_t>> want;
         for (const auto & c : cs) { want.push_back({ c.li, c.x }); }
@@ -1596,7 +1607,28 @@ void split_store_only(const llama_model & model) {
     }
     auto * mc = new moe_cache();
     mc->split = std::move(split);
-    store_init(mc, nullptr);
+    // warm start from FLE_MOE_PROFILE: the profile was recorded on the unsplit source (same experts, other file size), so
+    // its header is taken as written; only the counts per original id are used, to order the cold rows. The checksum still holds.
+    prof_file pf;
+    if (const char * pp = std::getenv("FLE_MOE_PROFILE"); pp && *pp) {
+        if (FILE * f = std::fopen(pp, "rb")) {
+            char line[512];
+            while (std::fgets(line, sizeof(line), f)) {
+                unsigned long long v = 0;
+                if (std::sscanf(line, "model_size %llu", &v) == 1) { mc->prof_model_size = v; }
+                else if (std::strncmp(line, "model_desc ", 11) == 0) { mc->prof_model_desc = line + 11; while (!mc->prof_model_desc.empty() && (mc->prof_model_desc.back() == '\n' || mc->prof_model_desc.back() == '\r')) { mc->prof_model_desc.pop_back(); } }
+                else if (std::sscanf(line, "n_layer %llu", &v) == 1) { mc->prof_n_layer = (uint32_t) v; }
+                else if (std::strncmp(line, "layers ", 7) == 0) { break; }
+            }
+            std::fclose(f);
+            std::string why;
+            if (!prof_read(pp, *mc, pf, why)) {
+                LLAMA_LOG_WARN("%s: FLE split experts: profile %s not used for the warm start (%s)\n", __func__, pp, why.c_str());
+                pf = prof_file();
+            }
+        }
+    }
+    store_init(mc, pf.ok ? &pf : nullptr);
     if (!g_store) {
         delete mc;
         return;

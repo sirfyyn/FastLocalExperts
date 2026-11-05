@@ -43,6 +43,8 @@ struct llama_expert_split_layer {
     ggml_tensor * hot_of    = nullptr;
     ggml_tensor * cold_of   = nullptr;
     ggml_tensor * cold_skip = nullptr;
+
+    std::vector<int32_t> cold_ids;   // cold row -> original expert id (host copy, for the store's warm start by usage profile)
 };
 
 // build the tables of every split layer of the model and set llama_layer::fle_split; once per model, a no-op for unsplit models
