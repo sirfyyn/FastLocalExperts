@@ -5001,8 +5001,12 @@ void server_routes::init_routes() {
             warnings.push_back({{"code", "inserts0_no_profile"}, {"level", "warn"},
                     {"text", "Static GPU cache (--moe-expert-cache-inserts 0) without a loaded usage profile: the cache stays empty and decoding is slow."}});
         }
-        if (cu_rt > 0 && cu_rt < 13040) {
-            warnings.push_back({{"code", "cuda_lt_13_4"}, {"level", "warn"}, {"text", "CUDA runtime is older than 13.4; the release packages are built and measured with 13.4."}});
+        if (gpu_cache.is_object() && gpu_cache.contains("inserts_auto") && gpu_cache.at("inserts_auto").is_boolean() && gpu_cache.at("inserts_auto").get<bool>()) {
+            warnings.push_back({{"code", "inserts0_overridden"}, {"level", "info"},
+                    {"text", "--moe-expert-cache-inserts 0 without a loaded usage profile: the GPU cache learns while decoding instead of staying empty."}});
+        }
+        if (cu_rt > 0 && cu_rt < 13000) {
+            warnings.push_back({{"code", "cuda_lt_13"}, {"level", "warn"}, {"text", "CUDA runtime is older than 13; the release packages are built and measured with CUDA 13."}});
         }
         if (const char * sg = std::getenv("FLE_MOE_STORE_GB"); sg && std::atof(sg) > 0) {
             const double avail_gb = fle_mem_avail_gb();   // what is still free now, with the store already allocated

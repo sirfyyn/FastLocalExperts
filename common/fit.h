@@ -18,6 +18,9 @@ enum common_params_fit_status {
 // on device 0, set by the fit when the requested budget does not fit; -1 = no shortfall seen. The server prints it as
 // [fle-status-error] when the start then fails.
 int64_t common_fle_fit_max_mib();   // a function, not a variable: Windows DLLs do not export data automatically
+// FLE_MOE_CACHE_BUDGET_MIB=auto: while on, the fit only measures that largest budget and returns before changing anything.
+// Switching it on or off clears the measured value.
+void common_fle_fit_probe(bool on);
 
 struct common_fit_extra_model {
     const char * path_model;

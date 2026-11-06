@@ -135,6 +135,8 @@ struct moe_cache {
     bool                    prof_loaded     = false;
     bool                    prof_no_save    = false;      // the file belongs to another model: read nothing, write nothing
     uint64_t                prof_base_steps = 0;          // steps recorded by earlier runs
+    bool                    prof_auto       = false;      // FLE_MOE_PROFILE=auto: learn with inserts, freeze at prof_mature steps
+    uint64_t                prof_mature     = 4000;       // FLE_MOE_PROFILE_MATURE_STEPS
     uint64_t                prof_saves      = 0;
     std::chrono::steady_clock::time_point prof_last_save{};
     std::vector<prof_layer> prof_keep;                    // layers of the loaded file without a cache in this run
@@ -215,6 +217,7 @@ moe_cache * g_cache = nullptr;
 struct fle_status_t {
     std::string prof_path;
     int         prof_state = -1;      // -1 no profile set, 0 not found (cold start), 1 loaded, 2 rejected
+    bool        inserts_auto = false; // inserts 0 was asked for without a loaded profile: the cache learns instead
     std::string prof_reason;
     uint64_t    prof_steps = 0;
     int64_t     budget_mib = 0;
@@ -1745,6 +1748,30 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 }
             }
         }
+        // A static cache (inserts 0) is filled by the usage profile only. Without a loaded one it would stay empty for the
+        // whole run at half the speed (Rhea G3 with a profile of another model: 26 instead of 59 tok/s), so it learns instead.
+        // FLE_MOE_INSERTS_STRICT=1 keeps the empty cache. With shadow slots the slot plan already assumes the given value.
+        if (mc->max_inserts == 0 && g_fle_st.prof_state != 1 && !mc->fle_shadow && !std::getenv("FLE_MOE_INSERTS_STRICT")) {
+            mc->max_inserts = 1;
+            g_fle_st.inserts_auto = true;
+            LLAMA_LOG_WARN("[fle-moe-profile] --moe-expert-cache-inserts 0 without a loaded profile would leave the cache empty: using 1 insert per step\n");
+        }
+        // FLE_MOE_PROFILE=auto: a static cache from a profile beats inserting once the profile fits the work (Rhea G3: 60.5 against
+        // 52.8 tok/s, DeepSeek-V4.1: 37.7 against 33.9). So learn with inserts until the profile has seen enough steps, then freeze;
+        // a mature profile starts frozen and is not written any more, so runs start from the same state.
+        if (std::getenv("FLE_MOE_PROFILE_AUTO") && !mc->fle_shadow) {
+            mc->prof_auto = true;
+            if (const char * e = std::getenv("FLE_MOE_PROFILE_MATURE_STEPS")) { if (atoll(e) > 0) { mc->prof_mature = (uint64_t) atoll(e); } }
+            if (g_fle_st.prof_state == 1 && pf.steps >= mc->prof_mature) {
+                mc->max_inserts = 0;
+                mc->prof_no_save = true;
+                LLAMA_LOG_INFO("[fle-moe-profile] auto: profile has %" PRIu64 " steps, static cache\n", pf.steps);
+            } else {
+                if (mc->max_inserts == 0) { mc->max_inserts = 1; }
+                if (!std::getenv("FLE_MOE_PROFILE_SAVE_SEC")) { mc->prof_save_sec = 60; }
+                LLAMA_LOG_INFO("[fle-moe-profile] auto: learning until %" PRIu64 " steps\n", mc->prof_mature);
+            }
+        }
 
         // Patch 44b: global byte budget. Plans the usable slots of every layer before any tensor exists.
         std::map<int, int32_t> plan_use;   // empty = every layer gets mc->n_slots, as before
@@ -2651,6 +2678,13 @@ void llama_moe_cache_step() {
                     h, h + m, h + m ? 100.0 * (double) h / (double) (h + m) : 0.0,
                     mc->prefilled_slots, mc->prefill_cap, mc->prof_loaded ? "loaded" : "none", 100.0 * mc->prefill_mass);
         }
+        if (mc->prof_auto && mc->max_inserts > 0 && (mc->n_steps & 63) == 0 && mc->prof_base_steps + mc->n_steps >= mc->prof_mature) {
+            prof_write(mc, "mature");
+            mc->max_inserts = 0;
+            mc->prof_no_save = true;
+            g_fle_st.inserts = 0;
+            LLAMA_LOG_INFO("[fle-moe-profile] auto: %" PRIu64 " steps seen, cache frozen\n", mc->prof_base_steps + mc->n_steps);
+        }
         if (mc->prof_save_sec > 0 && (mc->n_steps & 63) == 0 && mc->prof_dirty &&
                 std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - mc->prof_last_save).count() >= mc->prof_save_sec) {
             prof_write(mc, "periodic");
@@ -2826,6 +2860,7 @@ const char * llama_fle_status_json(void) {
         snprintf(b, sizeof(b), "\"requested_mib\":%lld,\"fitted_mib\":%lld,\"inserts\":%d,\"experts\":%lld",
                 (long long) st.budget_mib, (long long) (st.fitted_bytes >> 20), st.inserts, (long long) st.experts);
         o += b;
+        o += st.inserts_auto ? ",\"inserts_auto\":true" : ",\"inserts_auto\":false";
         uint64_t h = 0, m = 0;
         if (g_cache) { for (auto & ls : g_cache->layers) { h += ls.n_hit; m += ls.n_miss; } }
         if (h + m > 0) { snprintf(b, sizeof(b), ",\"hit\":%.4f", (double) h / (double) (h + m)); o += b; } else { o += ",\"hit\":null"; }

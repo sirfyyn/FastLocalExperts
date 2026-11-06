@@ -14,6 +14,8 @@
 
 static int64_t g_fle_fit_max_mib = -1;
 int64_t common_fle_fit_max_mib() { return g_fle_fit_max_mib; }
+static bool g_fle_fit_probe = false;
+void common_fle_fit_probe(bool on) { g_fle_fit_probe = on; g_fle_fit_max_mib = -1; }
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -358,6 +360,7 @@ static void common_params_fit_impl(
                 if (e_fit && atoi(e_fit) != 0 && e_mib && atoll(e_mib) > 0) {
                     const int64_t target = (int64_t) margins[0] - atoll(e_mib) * MiB;   // the margin without the cache
                     g_fle_fit_max_mib = std::max<int64_t>(0, (projected_free_per_device[0] - target) / MiB);
+                    if (g_fle_fit_probe) { return; }
                 }
             }
             if (projected_free_per_device[0] >= margins[0]) {
