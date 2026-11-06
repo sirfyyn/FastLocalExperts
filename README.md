@@ -17,7 +17,7 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 [Technical report](https://sirfyyn.github.io/FastLocalExperts/) ·
 [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf) ·
 [Model files](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF) ·
-[Rin (DeepSeek V4.1 Flash)](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF) ·
+[Rin (DeepSeek V4.1 Flash)](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-FLE-GGUF) ·
 [Quick start](#quick-start) ·
 [Films](#making-rhea-fast-eight-short-films) ·
 [Website](https://sirfyyn.de/en/fle/) ·
@@ -61,7 +61,7 @@ by how much, written so that someone with similar hardware can reproduce it.
 | **Quality** of FLE-IQ3_M | KL divergence against BF16 within the noise of Unsloth UD-IQ4_XS on three texts, at 4.8 GB less | [report 3](https://sirfyyn.github.io/FastLocalExperts/#s3) |
 | **Benchmarks**, one run each | IFBench 80.3 / 83.0 (strict / loose) and GPQA Diamond 88.9: level with Qwen's card (81.3, 91.7). LiveCodeBench v6 85.5: below the card (91.9) | [report 5.4](https://sirfyyn.github.io/FastLocalExperts/#s5-4) |
 
-**DeepSeek V4.1 Flash** (ISTA-DASLab GSQ-RCO IQ2_XXS, 232 GiB) on the same machine: **50.6 tokens/s** with the DSpark draft model (v1.2.5, three fresh starts: 49.8 / 50.8 / 50.6, the same answer every time, lossless at temperature 0), exact without the draft 37.6. **[Rin](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF)**, a 2-bit build of the same model split into a hot half on the GPU and a cold half in RAM: **53.4 tokens/s** (v1.2.6 package check), KL divergence to the original 0.29 against 0.25 for ISTA's IQ2_XXS. Lossy; the model card has the numbers.
+**DeepSeek V4.1 Flash** (ISTA-DASLab GSQ-RCO IQ2_XXS, 232 GiB) on the same machine: **50.6 tokens/s** with the DSpark draft model (v1.2.5, three fresh starts: 49.8 / 50.8 / 50.6, the same answer every time, lossless at temperature 0), exact without the draft 37.6. **[Rin](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-FLE-GGUF)**, a 2-bit build of the same model split into a hot half on the GPU and a cold half in RAM: **53.4 tokens/s** (v1.2.6 package check), KL divergence to the original 0.29 against 0.25 for ISTA's IQ2_XXS. Lossy; the model card has the numbers.
 
 Hardware: AMD Ryzen 9 9950X3D (16 cores), 120 GB DDR5, one NVIDIA RTX PRO 4500 Blackwell (32 GB), Linux. **Best performance measured on Linux**; every figure here comes from it. FLE decodes at
 about 100 tokens/s on the 24 prompts of bracket B1e and at 91 tokens/s on the six tasks of the Strata comparison; the
@@ -234,7 +234,7 @@ hybrids are splices of public quantizations by [Unsloth](https://unsloth.ai) and
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab): whole expert layers, chosen layer by layer by measured sensitivity,
 copied byte for byte.
 
-DeepSeek V4.1 Flash: [Rin - Deepseek V4.1 Flash 1017](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF) (a split 2-bit build from ISTA-DASLab's GSQ-RCO quants, MIT, needs FLE v1.2.6 or newer) and the [DSpark draft model](https://huggingface.co/sirfyyn/DeepSeek-V4.1-Flash-1017-DSpark-FLE-GGUF).
+DeepSeek V4.1 Flash: [Rin - Deepseek V4.1 Flash 1017](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-FLE-GGUF) (a split 2-bit build from ISTA-DASLab's GSQ-RCO quants, MIT, needs FLE v1.2.6 or newer) and the [DSpark draft model](https://huggingface.co/sirfyyn/DeepSeek-V4.1-Flash-1017-DSpark-FLE-GGUF).
 
 A dense 27B model that runs on this engine: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF), IQ4_XS, 15.3 GB, with a DFlash2 draft head. Details and measurements: https://sirfyyn.de/en/katy/
 
