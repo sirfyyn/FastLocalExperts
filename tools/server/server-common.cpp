@@ -9,6 +9,10 @@
 
 #include "server-common.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -1831,4 +1835,52 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+double fle_mem_avail_gb() {
+    double avail_gb = -1.0;
+    if (FILE * f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), f)) {
+            long long kb = 0;
+            if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) { avail_gb = kb / 1048576.0; break; }
+        }
+        std::fclose(f);
+    }
+    // the own cgroup (v2): "0::/system.slice/run-u123.scope" in /proc/self/cgroup
+    std::string cg;
+    if (FILE * f = std::fopen("/proc/self/cgroup", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f)) {
+            if (std::strncmp(line, "0::", 3) == 0) { cg = line + 3; while (!cg.empty() && (cg.back() == '\n' || cg.back() == '\r')) { cg.pop_back(); } break; }
+        }
+        std::fclose(f);
+    }
+    if (!cg.empty()) {
+        const auto read_num = [](const std::string & path, double & out) {
+            bool ok = false;
+            if (FILE * f = std::fopen(path.c_str(), "r")) {
+                char v[64] = {0};
+                if (std::fgets(v, sizeof(v), f) && std::strncmp(v, "max", 3) != 0) { out = std::atof(v); ok = true; }
+                std::fclose(f);
+            }
+            return ok;
+        };
+        double lim = 0, cur = 0, file = 0;
+        if (read_num("/sys/fs/cgroup" + cg + "/memory.max", lim)) {
+            read_num("/sys/fs/cgroup" + cg + "/memory.current", cur);
+            // memory.current counts the page cache of the mmapped model too, which the kernel reclaims first: subtract it
+            if (FILE * f = std::fopen(("/sys/fs/cgroup" + cg + "/memory.stat").c_str(), "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof(line), f)) {
+                    long long v = 0;
+                    if (std::sscanf(line, "file %lld", &v) == 1) { file = (double) v; break; }
+                }
+                std::fclose(f);
+            }
+            const double left_gb = (lim - (cur - file)) / 1073741824.0;
+            if (left_gb > 0 && (avail_gb < 0 || left_gb < avail_gb)) { avail_gb = left_gb; }
+        }
+    }
+    return avail_gb;
 }

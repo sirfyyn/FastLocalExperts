@@ -246,6 +246,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+    ctx_http.get ("/fle/status",               ex_wrapper(routes.get_fle_status)); // FLE: status for FLE Link
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
@@ -474,10 +475,40 @@ int llama_server(common_params & params, int argc, char ** argv) {
             });
         }
 
+        // FLE: RAM check before loading. The RAM expert store (FLE_MOE_STORE_GB) is allocated up front and filled at the
+        // warm start; when it is larger than the memory this process may use, the kernel kills the engine later (exit -9,
+        // no message). Limit: fle_mem_avail_gb() (MemAvailable or what the cgroup still allows).
+        if (const char * sg = std::getenv("FLE_MOE_STORE_GB"); sg && std::atof(sg) > 0) {
+            const double avail_gb = fle_mem_avail_gb();
+            const double need_gb = std::atof(sg);
+            if (avail_gb > 0 && need_gb > avail_gb) {
+                fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"ram_too_small\",\"need_gb\":%.1f,\"free_gb\":%.1f,\"text\":"
+                        "\"FLE_MOE_STORE_GB=%s is larger than the memory available to this process (%.1f GB); lower it.\"}}\n",
+                        need_gb, avail_gb, sg, avail_gb);
+                SRV_ERR("FLE_MOE_STORE_GB=%s needs more memory than is available (%.1f GB)\n", sg, avail_gb);
+                clean_up();
+                if (ctx_http.thread.joinable()) {
+                    ctx_http.thread.join();
+                }
+                return 1;
+            }
+            if (avail_gb > 0 && need_gb + 8.0 > avail_gb) {
+                SRV_WRN("FLE_MOE_STORE_GB=%s leaves less than 8 GB of the %.1f GB available for the model's other host tensors and the system\n", sg, avail_gb);
+            }
+        }
+
         if (!ctx_server.load_model(params)) {
             clean_up();
             if (ctx_http.thread.joinable()) {
                 ctx_http.thread.join();
+            }
+            // FLE /fle/status: the start error for FLE Link, once, as one JSON line (the HTTP server does not answer any more)
+            if (common_fle_fit_max_mib() >= 0) {
+                fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"fit_budget_too_large\",\"max_mib\":%lld,\"text\":"
+                        "\"FLE_MOE_CACHE_BUDGET_MIB does not fit next to the model and context; at most %lld MiB with these settings.\"}}\n",
+                        (long long) common_fle_fit_max_mib(), (long long) common_fle_fit_max_mib());
+            } else {
+                fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"model_load_failed\",\"text\":\"The model or its context could not be loaded; see the log above.\"}}\n");
             }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;

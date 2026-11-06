@@ -1,5 +1,7 @@
 #include "llama-moecache.h"
+#include "llama.h"
 #include "llama-expertstore.h"
+#include "llama-expertsplit.h"
 
 #include <algorithm>
 
@@ -183,6 +185,9 @@ struct moe_cache {
 
     std::vector<layer_state> layers;
     std::map<const ggml_tensor *, size_t> by_up_src;
+    // FLE split layers (llama-expertsplit.h): never cached (their hot half is resident); their cold halves follow `layers` in the
+    // expert store (store layer index layers.size() + k) and are observed in cold-local numbering
+    std::vector<const llama_expert_split_layer *> split;
 
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
@@ -204,6 +209,22 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+
+// FLE status (/fle/status in the server): what the start decided, filled once by llama_moe_cache_init / store_init,
+// read by llama_fle_status_json(); the live counters are read from the cache and the store when asked
+struct fle_status_t {
+    std::string prof_path;
+    int         prof_state = -1;      // -1 no profile set, 0 not found (cold start), 1 loaded, 2 rejected
+    std::string prof_reason;
+    uint64_t    prof_steps = 0;
+    int64_t     budget_mib = 0;
+    int64_t     fitted_bytes = -1;    // -1: no cache
+    int64_t     experts = -1;
+    int32_t     inserts = -1;
+    int64_t     warm_experts = -1;
+    double      warm_gb = -1.0;
+};
+static fle_status_t & g_fle_st = *new fle_status_t();
 std::mutex g_init_mtx;
 bool g_init_done = false;
 
@@ -306,6 +327,32 @@ static void moe_pred_cb(const char * name, const struct ggml_tensor * pred, void
 void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
 
+    // FLE split layer ("ffn_gate_exps_cold" also matches the observer's "ffn_gate_exps"): the ids are cold-local rows. Only the
+    // expert store uses them (resident before the CPU reads them); no LRU, profile, WILLNEED or share count for these layers.
+    if (!mc->split.empty() && strstr(name, "_exps_cold")) {
+        if (g_store) {
+            const int il_s = parse_layer_from_name(name);
+            for (size_t k = 0; k < mc->split.size(); ++k) {
+                const llama_expert_split_layer * sl = mc->split[k];
+                if (sl->il != il_s) { continue; }
+                int32_t want[64]; size_t nw = 0;
+                for (int64_t t = 0; t < ids->ne[1] && nw < 64; ++t) {
+                    for (int64_t i = 0; i < ids->ne[0] && nw < 64; ++i) {
+                        const int32_t x = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + i*ids->nb[0]);
+                        if (x < 0 || x >= sl->n_cold) { continue; }   // the zero row n_cold: a hot expert, never read
+                        bool dup = false;
+                        for (size_t q = 0; q < nw; ++q) { if (want[q] == x) { dup = true; break; } }
+                        if (!dup) { want[nw++] = x; }
+                    }
+                }
+                std::lock_guard<std::mutex> lock(mc->mtx);
+                g_store->ensure(mc->layers.size() + k, want, nw, nullptr);
+                break;
+            }
+        }
+        return;
+    }
+
     static const bool wn_on = std::getenv("FLE_MOE_WILLNEED_NOW") != nullptr;
     if (wn_on && !g_store && ids->ne[1] <= 4) {
         const int il0 = parse_layer_from_name(name);
@@ -355,7 +402,9 @@ void moe_obs_cb(const char * name, const struct ggml_tensor * ids, void * ud) {
                     if (L.expert_slot[(size_t) x] < 0) { L.pub.bias_host[(size_t) x] = v; L.pub.bias_dirty = true; }
                 };
                 for (size_t k = 0; k < nw; ++k) { if (g_store->resident(li, want[k])) { set_hot(l, want[k], hb); } }
-                for (const auto & x : ev) { set_hot(mc->layers[(size_t) x.first], x.second, 0.0f); }
+                for (const auto & x : ev) {
+                    if ((size_t) x.first < mc->layers.size()) { set_hot(mc->layers[(size_t) x.first], x.second, 0.0f); }   // (not a split layer's slot)
+                }
             }
             break;
         }
@@ -1147,10 +1196,13 @@ void prof_hot_mlock(moe_cache * mc, const prof_file & pf) {
 // ---- FLE_MOE_STORE_GB: RAM tier for the CPU-side experts (llama-expertstore.cpp) ---------------------------------------
 static void store_init(moe_cache * mc, const prof_file * pf) {
     const char * e = std::getenv("FLE_MOE_STORE_GB");
-    if (!e || atof(e) <= 0.0 || mc->layers.empty()) { return; }
+    if (!e || atof(e) <= 0.0 || (mc->layers.empty() && mc->split.empty())) { return; }
     const char * th = std::getenv("FLE_MOE_STORE_THREADS");
     std::vector<llama_expert_store_layer> in;
     for (const auto & ls : mc->layers) { in.push_back({ ls.pub.il, { ls.pub.gate_src, ls.pub.up_src, ls.pub.down_src } }); }
+    // split layers after the cache layers (the store's layer index is the position here); cold-local experts, the zero row
+    // is registered with the rest but never requested
+    for (const auto * sl : mc->split) { in.push_back({ sl->il, { sl->gate_cold, sl->up_cold, sl->down_cold } }); }
     g_store_raw = llama_expert_store::create(in, (size_t) (atof(e) * 1e9), (th && *th) ? std::max(1, atoi(th)) : 8).release();
     if (!g_store) { return; }
     // warm start: the hottest experts after the ones the GPU cache takes (as prof_hot_mlock), across layers by count
@@ -1171,6 +1223,17 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
                 cs.push_back({ pl->cnt[(size_t) x], (int32_t) li, x });
             }
         }
+        // split layers (store index after the cache layers): the profile counts original ids, the store wants cold rows
+        for (size_t k = 0; k < mc->split.size(); ++k) {
+            const auto * sl = mc->split[k];
+            const prof_layer * pl = pf->find(sl->il);
+            if (!pl || sl->cold_ids.size() != (size_t) sl->n_cold || pl->cnt.size() != (size_t) (sl->n_hot + sl->n_cold)) { continue; }
+            for (int32_t r = 0; r < sl->n_cold; ++r) {
+                const int32_t e = sl->cold_ids[(size_t) r];
+                if (e < 0 || pl->cnt[(size_t) e] == 0) { continue; }
+                cs.push_back({ pl->cnt[(size_t) e], (int32_t) (mc->layers.size() + k), r });
+            }
+        }
         std::stable_sort(cs.begin(), cs.end(), [](const cand & a, const cand & b) { return a.cnt > b.cnt; });
         std::vector<std::pair<int32_t, int32_t>> want;
         for (const auto & c : cs) { want.push_back({ c.li, c.x }); }
@@ -1188,6 +1251,7 @@ static void store_init(moe_cache * mc, const prof_file * pf) {
                 }
             }
         }
+        g_fle_st.warm_experts = (int64_t) n; g_fle_st.warm_gb = g_store->stats().read_bytes / 1e9;
         std::fprintf(stderr, "[fle-store] warm start: %zu experts (%.1f GB) in %.1f s\n", n,
             g_store->stats().read_bytes / 1e9, g_store->stats().preload_ms / 1000.0);
     }
@@ -1453,6 +1517,71 @@ int llama_moe_cache_max_tokens() {
     return (e && *e) ? std::max(1, atoi(e)) : 8;
 }
 
+namespace {
+
+// FLE split experts without an expert cache (no cache flags, or no host-resident unsplit layer): the RAM expert store still
+// serves the cold halves. The moe_cache has no layers; only the observer (store requests) and the store use it. Never freed.
+// the split layers whose cold half the expert store can serve: weights loaded and the cold half in plain host memory (mmap). A
+// cold half on a device (no -cmoe, -ngmoe) is computed there; registering it would turn the store off for every layer.
+std::vector<const llama_expert_split_layer *> split_store_layers(const llama_model & model) {
+    std::vector<const llama_expert_split_layer *> out;
+    for (const auto * sl : llama_expert_split_layers(model)) {
+        if (!sl->placeholder && sl->cold_host) { out.push_back(sl); }
+    }
+    return out;
+}
+
+// a model loaded without weights (-fit memory estimation): its split layers carry placeholder tables
+bool split_dry_run(const llama_model & model) {
+    for (const auto * sl : llama_expert_split_layers(model)) {
+        if (sl->placeholder) { return true; }
+    }
+    return false;
+}
+
+void split_store_only(const llama_model & model) {
+    std::vector<const llama_expert_split_layer *> split = split_store_layers(model);
+    if (split.empty() || g_store) {
+        return;
+    }
+    const char * e = std::getenv("FLE_MOE_STORE_GB");
+    if (!e || atof(e) <= 0.0) {
+        return;
+    }
+    auto * mc = new moe_cache();
+    mc->split = std::move(split);
+    // warm start from FLE_MOE_PROFILE: the profile was recorded on the unsplit source (same experts, other file size), so
+    // its header is taken as written; only the counts per original id are used, to order the cold rows. The checksum still holds.
+    prof_file pf;
+    if (const char * pp = std::getenv("FLE_MOE_PROFILE"); pp && *pp) {
+        if (FILE * f = std::fopen(pp, "rb")) {
+            char line[512];
+            while (std::fgets(line, sizeof(line), f)) {
+                unsigned long long v = 0;
+                if (std::sscanf(line, "model_size %llu", &v) == 1) { mc->prof_model_size = v; }
+                else if (std::strncmp(line, "model_desc ", 11) == 0) { mc->prof_model_desc = line + 11; while (!mc->prof_model_desc.empty() && (mc->prof_model_desc.back() == '\n' || mc->prof_model_desc.back() == '\r')) { mc->prof_model_desc.pop_back(); } }
+                else if (std::sscanf(line, "n_layer %llu", &v) == 1) { mc->prof_n_layer = (uint32_t) v; }
+                else if (std::strncmp(line, "layers ", 7) == 0) { break; }
+            }
+            std::fclose(f);
+            std::string why;
+            if (!prof_read(pp, *mc, pf, why)) {
+                LLAMA_LOG_WARN("%s: FLE split experts: profile %s not used for the warm start (%s)\n", __func__, pp, why.c_str());
+                pf = prof_file();
+            }
+        }
+    }
+    store_init(mc, pf.ok ? &pf : nullptr);
+    if (!g_store) {
+        delete mc;
+        return;
+    }
+    ggml_set_moe_obs_callback(moe_obs_cb, mc);
+    LLAMA_LOG_INFO("%s: FLE split experts: expert store for the cold halves of %zu layers (no expert cache)\n", __func__, mc->split.size());
+}
+
+} // namespace
+
 void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t max_inserts, float cache_bias) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
@@ -1463,6 +1592,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         int64_t budget_mib = 0;
         if (const char * e = std::getenv("FLE_MOE_CACHE_BUDGET_MIB")) { budget_mib = std::max<int64_t>(0, atoll(e)); }
         if (n_slots <= 0 && budget_mib <= 0) {
+            if (split_dry_run(model) || split_store_layers(model).empty()) {
+                // -fit's estimation model, or a model without split layers (the DSpark drafter, -fit's extra-model probe):
+                // nothing to do here, and the real split model that comes later must still get its expert store
+                return;
+            }
+            split_store_only(model);
             g_init_done = true;
             return;
         }
@@ -1526,17 +1661,21 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         if (groups.empty()) {
             LLAMA_LOG_INFO("%s: LLAMA_MOE_CACHE_SLOTS=%d but no host-resident expert layers found - disabled\n", __func__, n_slots);
             delete mc;
+            split_store_only(model);   // a fully split model: its hot halves are the cache, the store still serves the cold ones
             return;
         }
 
         // Patch 44a: read the usage profile before anything is allocated (44b plans slot counts from it)
         prof_file pf;
+        g_fle_st.prof_path = mc->prof_path;
         if (!mc->prof_path.empty()) {
             std::string why;
             if (prof_read(mc->prof_path, *mc, pf, why) && prof_validate(pf, groups, why)) {
                 LLAMA_LOG_INFO("[fle-moe-profile] loaded %s: %zu layers, %" PRIu64 " steps recorded by earlier runs\n",
                         mc->prof_path.c_str(), pf.layers.size(), pf.steps);
+                g_fle_st.prof_state = 1; g_fle_st.prof_steps = pf.steps;
             } else {
+                g_fle_st.prof_state = why == "not found" ? 0 : 2; g_fle_st.prof_reason = why;
                 pf = prof_file();
                 if (why == "not found") {
                     LLAMA_LOG_INFO("[fle-moe-profile] %s not found - cold start, the file is created at the first save\n",
@@ -1817,6 +1956,7 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             prof_prefill(mc, pf);
             prof_hot_mlock(mc, pf);
         }
+        mc->split = split_store_layers(model);
         store_init(mc, pf.ok ? &pf : nullptr);
 
         // A DEDICATED backend for the upload thread. The path goes through the buffer:
@@ -1909,6 +2049,11 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
         }
         g_cache = mc;
         g_init_done = true;
+        {
+            int64_t ne = 0;
+            for (auto & L : mc->layers) { ne += L.pub.n_slots; }
+            g_fle_st.experts = ne; g_fle_st.fitted_bytes = (int64_t) vram; g_fle_st.inserts = mc->max_inserts; g_fle_st.budget_mib = mc->budget_mib;
+        }
 
         LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, %.1f MiB device memory\n",
                 __func__, mc->layers.size(), mc->n_slots, mc->max_inserts, vram/1024.0/1024.0);
@@ -2590,4 +2735,54 @@ void llama_moe_cpu_predict_after(int il, const float * x, int64_t n_embd) {
         g_cr_q.push_back({ il + 1, std::vector<float>(x, x + n_embd) });
     }
     g_cr_cv.notify_one();
+}
+
+// ---- FLE status as JSON (for /fle/status): start decisions + live counters, unknown values as null -------------------
+static void fle_json_str(std::string & o, const std::string & v) {
+    o += '"';
+    for (char c : v) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; }
+        else if ((unsigned char) c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+        else { o += c; }
+    }
+    o += '"';
+}
+
+const char * llama_fle_status_json(void) {
+    static thread_local std::string o;
+    o.clear();
+    char b[256];
+    const fle_status_t & st = g_fle_st;
+    const char * ro = std::getenv("FLE_MOE_PROFILE_READONLY");
+    o += "{\"profile\":{\"loaded\":"; o += st.prof_state == 1 ? "true" : "false";
+    o += ",\"path\":"; if (st.prof_path.empty()) { o += "null"; } else { fle_json_str(o, st.prof_path); }
+    o += ",\"checksum_ok\":"; o += st.prof_state == 1 ? "true" : (st.prof_state == 2 ? "false" : "null");
+    o += ",\"readonly\":"; o += (ro && atoi(ro) != 0) ? "true" : "false";
+    o += ",\"steps\":"; if (st.prof_state == 1) { snprintf(b, sizeof(b), "%" PRIu64, st.prof_steps); o += b; } else { o += "null"; }
+    o += ",\"rejected_reason\":"; if (st.prof_state == 2) { fle_json_str(o, st.prof_reason); } else { o += "null"; }
+    o += ",\"state\":\""; o += st.prof_state == 1 ? "loaded" : st.prof_state == 0 ? "not_found" : st.prof_state == 2 ? "rejected" : "none"; o += "\"}";
+    o += ",\"gpu_cache\":{";
+    if (st.fitted_bytes >= 0) {
+        snprintf(b, sizeof(b), "\"requested_mib\":%lld,\"fitted_mib\":%lld,\"inserts\":%d,\"experts\":%lld",
+                (long long) st.budget_mib, (long long) (st.fitted_bytes >> 20), st.inserts, (long long) st.experts);
+        o += b;
+        uint64_t h = 0, m = 0;
+        if (g_cache) { for (auto & ls : g_cache->layers) { h += ls.n_hit; m += ls.n_miss; } }
+        if (h + m > 0) { snprintf(b, sizeof(b), ",\"hit\":%.4f", (double) h / (double) (h + m)); o += b; } else { o += ",\"hit\":null"; }
+    } else {
+        o += "\"requested_mib\":null,\"fitted_mib\":null,\"inserts\":null,\"experts\":null,\"hit\":null";
+    }
+    o += "},\"store\":{";
+    const char * sg = std::getenv("FLE_MOE_STORE_GB");
+    if (g_store) {
+        const auto & ss = g_store->stats();
+        snprintf(b, sizeof(b), "\"gb\":%s,\"warm_experts\":%lld,\"hits\":%llu,\"misses\":%llu,\"evictions\":%llu,\"read_gb\":%.2f",
+                sg ? sg : "null", (long long) st.warm_experts, (unsigned long long) ss.hits, (unsigned long long) ss.misses,
+                (unsigned long long) ss.evictions, ss.read_bytes / 1e9);
+        o += b;
+    } else {
+        o += "\"gb\":null,\"warm_experts\":null,\"hits\":null,\"misses\":null,\"evictions\":null,\"read_gb\":null";
+    }
+    o += "}}";
+    return o.c_str();
 }

@@ -454,6 +454,10 @@ namespace GGUFMeta {
         return get_key(llm_kv(kid), result, required);
     }
 
+    // FLE split experts: fle.expert_split.* keys are read by their literal names (no arch prefix)
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result,    bool required);
+    template bool llama_model_loader::get_key<std::string>(const std::string & key, std::string & result, bool required);
+
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
@@ -1283,6 +1287,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     tn.str().c_str(), ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                     ggml_backend_buft_name(buft), ggml_backend_buft_name(ggml_backend_cpu_buffer_type()));
             buft = ggml_backend_cpu_buffer_type();
+        }
+
+        // FLE split experts: the hot half is the layer's resident GPU expert set, so a CPU override (-cmoe, -ot exps=CPU) does not
+        // move it; it follows the layer's own device (still host when the layer itself is on the CPU)
+        if ((tn.tensor == LLM_TENSOR_FFN_GATE_EXPS_HOT || tn.tensor == LLM_TENSOR_FFN_UP_EXPS_HOT || tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS_HOT) &&
+                ggml_backend_buft_is_host(buft) && !ggml_backend_buft_is_host(buft_list->front().second)) {
+            if (ggml_backend_buffer_type_t b = select_weight_buft(hparams, t_meta, op, buft_list)) {
+                LLAMA_LOG_DEBUG("tensor %s: split hot experts stay on %s (CPU override ignored)\n", tn.str().c_str(), ggml_backend_buft_name(b));
+                buft = b;
+            }
         }
 
         // avoid using a host buffer when using mmap

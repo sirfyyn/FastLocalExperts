@@ -18,6 +18,11 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <cstring>
+#include <chrono>
+#include <cctype>
+#include <mutex>
+#include <cstdio>
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -872,6 +877,20 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 //
 // server_context_impl (private implementation)
 //
+
+// FLE /fle/status: live counters, updated when a request finishes (server loop), read by the HTTP thread
+struct fle_live_t {
+    struct part { uint64_t n_gen = 0, t_gen_us = 0, n_prompt = 0; double t_prompt_ms = 0.0; uint64_t n_draft = 0, n_acc = 0, n_verif = 0, requests = 0; };
+    std::mutex mtx;
+    part total, last;
+    bool has_last = false;
+};
+static fle_live_t & fle_live() { static fle_live_t * l = new fle_live_t(); return *l; }
+// std::chrono, not ggml_time_us(): this runs while the DLL loads, before ggml_time_init() (Windows divides by the timer frequency)
+static const auto fle_t_start = std::chrono::steady_clock::now();
+#if !defined(_WIN32)
+extern char ** environ;
+#endif
 
 struct server_context_impl {
     friend struct server_context;
@@ -4352,6 +4371,17 @@ private:
         metrics.n_draft_accepted    += slot.stats.n_draft_accepted;
         metrics.n_draft_verif_steps += slot.stats.n_draft_verif_steps;
 
+        {
+            fle_live_t::part p;
+            p.n_gen = n; p.t_gen_us = t_us; p.n_prompt = slot.stats.n_prompt_processed; p.t_prompt_ms = slot.stats.t_prompt_ms();
+            p.n_draft = slot.stats.n_draft_tokens; p.n_acc = slot.stats.n_draft_accepted; p.n_verif = slot.stats.n_draft_verif_steps; p.requests = 1;
+            auto & L = fle_live();
+            std::lock_guard<std::mutex> lk(L.mtx);
+            L.last = p; L.has_last = true;
+            L.total.n_gen += p.n_gen; L.total.t_gen_us += p.t_gen_us; L.total.n_prompt += p.n_prompt; L.total.t_prompt_ms += p.t_prompt_ms;
+            L.total.n_draft += p.n_draft; L.total.n_acc += p.n_acc; L.total.n_verif += p.n_verif; L.total.requests++;
+        }
+
         auto & dst = metrics.n_accepted_per_pos;
         const auto & src = slot.n_accepted_per_pos;
 
@@ -4875,6 +4905,149 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         res->ok({{"status", "ok"}});
+        return res;
+    };
+
+    // FLE: one JSON object for FLE Link (schema 1): engine, CUDA, FLE switches, profile, GPU cache, store, draft, warnings, live
+    // counters; unknown values are null. Accessible during sleep: it only reads process state and the library's counters.
+    this->get_fle_status = [this](const server_http_req &) {
+        auto res = create_response(true);
+        json lib = nullptr;
+        try { lib = json::parse(llama_fle_status_json()); } catch (const std::exception &) { lib = nullptr; }
+        const auto lib_part = [&](const char * k) { return lib.is_object() && lib.contains(k) ? lib.at(k) : json(nullptr); };
+
+        json engine = {
+            {"name", "fle"}, {"version", nullptr}, {"commit", meta ? json(meta->build_info) : json(nullptr)},
+            {"model", meta ? json(meta->model_name) : json(nullptr)},
+            {"uptime_s", (long long) std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - fle_t_start).count()},
+        };
+        if (const char * v = std::getenv("FLE_VERSION")) { engine["version"] = v; }
+
+        // CUDA: runtime from the backend module (GGML_BACKEND_DL: only reachable via proc address), driver release from the kernel module
+        int cu_rt = -1, cu_drv = -1;
+        json gpus = json::array();
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            if (auto fn = (void (*)(int *, int *)) ggml_backend_reg_get_proc_address(reg, "fle_cuda_versions")) { fn(&cu_rt, &cu_drv); }
+        }
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) { continue; }
+            size_t free_b = 0, total_b = 0;
+            ggml_backend_dev_memory(dev, &free_b, &total_b);
+            gpus.push_back({{"index", (int) gpus.size()}, {"name", ggml_backend_dev_description(dev)}, {"vram_mib", (long long) (total_b >> 20)}});
+        }
+        std::string drv;
+        if (FILE * f = std::fopen("/proc/driver/nvidia/version", "r")) {
+            char line[512] = {0};
+            if (std::fgets(line, sizeof(line), f)) {
+                // "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  615.71.09  Release Build ...": the first token
+                // after "Kernel Module" that starts with a digit and contains a dot
+                if (const char * k = std::strstr(line, "Kernel Module")) {
+                    for (k += 13; *k && drv.empty(); ) {
+                        while (*k == ' ') { ++k; }
+                        const char * t = k;
+                        while (*k && *k != ' ' && *k != '\n') { ++k; }
+                        const std::string tok(t, k - t);
+                        if (!tok.empty() && std::isdigit((unsigned char) tok[0]) && tok.find('.') != std::string::npos) { drv = tok; }
+                    }
+                }
+            }
+            std::fclose(f);
+        }
+        const auto ver = [](int v) { return v > 0 ? json(std::to_string(v / 1000) + "." + std::to_string((v % 1000) / 10)) : json(nullptr); };
+        json cuda = {{"runtime", ver(cu_rt)}, {"driver", drv.empty() ? json(nullptr) : json(drv)}, {"driver_cuda", ver(cu_drv)}, {"gpus", gpus}};
+
+        json switches = json::object();
+        for (char ** e = environ; e && *e; ++e) {
+            if (std::strncmp(*e, "FLE_", 4) != 0) { continue; }
+            const char * eq = std::strchr(*e, '=');
+            if (eq) { switches[std::string(*e, eq - *e)] = std::string(eq + 1); }
+        }
+
+        // run_id: one hash over what decides the output (build, model file, every FLE switch, sorted), so two runs with the
+        // same id ran the same engine on the same model with the same switches
+        {
+            std::string key = meta ? meta->build_info : std::string();
+            key += '\n'; key += params.model.path;
+            if (FILE * f = std::fopen(params.model.path.c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END); key += '\n'; key += std::to_string((long long) std::ftell(f));
+                std::fclose(f);
+            }
+            std::vector<std::string> kv;
+            for (auto it = switches.begin(); it != switches.end(); ++it) { kv.push_back(it.key() + "=" + it.value().get<std::string>()); }
+            std::sort(kv.begin(), kv.end());
+            for (auto & x : kv) { key += '\n'; key += x; }
+            uint64_t h = 1469598103934665603ULL;
+            for (unsigned char c : key) { h = (h ^ c) * 1099511628211ULL; }
+            char rid[20]; snprintf(rid, sizeof(rid), "%016llx", (unsigned long long) h);
+            engine["run_id"] = rid;
+        }
+
+        json draft = {{"kind", nullptr}, {"n_max", nullptr}, {"block", nullptr}};
+        if (!params.speculative.types.empty()) {
+            std::vector<enum common_speculative_type> types;   // without the "none" entry the list carries by default
+            for (auto t : params.speculative.types) { if (t != COMMON_SPECULATIVE_TYPE_NONE) { types.push_back(t); } }
+            draft["kind"]  = types.empty() ? json(nullptr) : json(common_speculative_type_name_str(types));
+            draft["n_max"] = common_speculative_n_max(&params.speculative);
+        }
+
+        json profile = lib_part("profile"), gpu_cache = lib_part("gpu_cache"), store = lib_part("store");
+        json warnings = json::array();
+        const bool cache_static = gpu_cache.is_object() && gpu_cache.contains("inserts") && gpu_cache.at("inserts").is_number_integer() &&
+                gpu_cache.at("inserts").get<int>() == 0;
+        const bool prof_loaded = profile.is_object() && profile.contains("loaded") && profile.at("loaded").is_boolean() && profile.at("loaded").get<bool>();
+        if (cache_static && !prof_loaded) {
+            warnings.push_back({{"code", "inserts0_no_profile"}, {"level", "warn"},
+                    {"text", "Static GPU cache (--moe-expert-cache-inserts 0) without a loaded usage profile: the cache stays empty and decoding is slow."}});
+        }
+        if (cu_rt > 0 && cu_rt < 13040) {
+            warnings.push_back({{"code", "cuda_lt_13_4"}, {"level", "warn"}, {"text", "CUDA runtime is older than 13.4; the release packages are built and measured with 13.4."}});
+        }
+        if (const char * sg = std::getenv("FLE_MOE_STORE_GB"); sg && std::atof(sg) > 0) {
+            const double avail_gb = fle_mem_avail_gb();   // what is still free now, with the store already allocated
+            if (avail_gb >= 0 && avail_gb < 4.0) {
+                warnings.push_back({{"code", "ram_tight"}, {"level", "warn"},
+                        {"text", "Less than 4 GB of memory left for this process with the RAM expert store allocated; a larger request can get the engine killed."}});
+            }
+        }
+        if (const char * w = std::getenv("FLE_PREFILL_WINDOW"); w && std::atoi(w) > 8) {
+            warnings.push_back({{"code", "prefill_window_gt_8"}, {"level", "warn"}, {"text", "FLE_PREFILL_WINDOW is above 8; 8 is the recommended value."}});
+        }
+
+        const auto live_part = [&](const fle_live_t::part & p) {
+            json j = {
+                {"decode_tps",  p.t_gen_us ? json((double) p.n_gen * 1e6 / (double) p.t_gen_us) : json(nullptr)},
+                {"prefill_tps", p.t_prompt_ms > 0 ? json((double) p.n_prompt * 1e3 / p.t_prompt_ms) : json(nullptr)},
+                {"draft_accept",   p.n_draft ? json((double) p.n_acc / (double) p.n_draft) : json(nullptr)},
+                {"draft_mean_len", p.n_verif ? json(1.0 + (double) p.n_acc / (double) p.n_verif) : json(nullptr)},
+                {"cache_hit", gpu_cache.is_object() && gpu_cache.contains("hit") ? gpu_cache.at("hit") : json(nullptr)},
+                {"store_hits", nullptr}, {"store_misses", nullptr}, {"store_evictions", nullptr}, {"store_read_gb", nullptr},
+                {"cpu_experts_per_round", nullptr},
+                {"requests", p.requests},
+            };
+            return j;
+        };
+        json live;
+        {
+            auto & L = fle_live();
+            std::lock_guard<std::mutex> lk(L.mtx);
+            live["since_start"]  = live_part(L.total);
+            live["last_request"] = L.has_last ? live_part(L.last) : json(nullptr);
+        }
+        // the store counts since start only (no per-request split)
+        if (store.is_object()) {
+            for (const char * k : {"hits", "misses", "evictions", "read_gb"}) {
+                live["since_start"][std::string("store_") + k] = store.value(k, json(nullptr));
+            }
+        }
+        // the cache hit rate is since start too
+        if (live["last_request"].is_object()) { live["last_request"]["cache_hit"] = nullptr; }
+
+        res->ok({
+            {"schema", 1}, {"engine", engine}, {"cuda", cuda}, {"switches", switches}, {"profile", profile}, {"gpu_cache", gpu_cache},
+            {"store", store}, {"draft", draft}, {"warnings", warnings}, {"live", live},
+        });
         return res;
     };
 
