@@ -2982,7 +2982,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     // FLE_DRAFT_UBATCH=N: the draft context's ubatch (and batch) cap. It drafts a few tokens a round and takes the target's
     // features in chunks; with the target's -ub 4096 its compute buffer took ~1.45 GiB of VRAM the expert cache could use
-    if (const char * e = std::getenv("FLE_DRAFT_UBATCH"); e && atoi(e) > 0) {
+    // Not for an MTP head: it catches up on the target's whole batch, so a smaller batch aborts on the first prompt above it.
+    const bool fle_is_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (const char * e = std::getenv("FLE_DRAFT_UBATCH"); e && atoi(e) > 0 && !fle_is_mtp) {
         result.n_ubatch = std::min<int32_t>(result.n_ubatch, atoi(e));
         result.n_batch  = std::min<int32_t>(result.n_batch, std::max<int32_t>(atoi(e), result.n_ubatch));
     }
