@@ -1,4 +1,4 @@
-[![FLE Link: run FLE in one command](https://flelink.run/media/banner-engine.jpg)](https://flelink.run)
+[![FLE Link: run FLE in one command](https://flelink.run/media/banner-engine.jpg?v=20261106)](https://flelink.run)
 
 <div align="center">
 
@@ -210,14 +210,11 @@ accepted, expert-cache hits, GPU use), launch profiles that show the full comman
 speed test. It can also attach to a llama-server that already runs, also as a systemd service. This repository is the
 engine only; FLE Link and the engine can be replaced independently.
 
-<a href="https://github.com/sirfyyn/fle-studio/blob/main/docs/media/fle-studio.mp4"><img alt="FLE Link (then called FLE Studio) running Rhea (FLE-IQ3_M with its MTP head): a question, the answer streaming, the live data. Click for the full video." src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/fle-studio.gif"></a>
+<a href="https://flelink.run"><img alt="FLE Link running Rin (DeepSeek V4.1 Flash, 763B) on FLE: a pagoda answer, the finished scene in the preview, and the live numbers beside it." src="media/flelink-chat.png" width="860"></a>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-dark.png">
-  <img alt="The engine view of FLE Link attached to a systemd service running FLE" src="https://raw.githubusercontent.com/sirfyyn/fle-studio/main/docs/media/engine-light.png">
-</picture>
+<img alt="The engine page of FLE Link: Rin loaded on FLE v1.2.6, and the card with what the engine reports (speed, accepted drafts, usage profile, RAM store)." src="media/flelink-engine.png" width="860">
 
-Recorded on the reference machine against the running service. The speeds in the recording are single answers right
+Recorded on the reference machine. The speeds in the screenshots are single answers right
 after a restart, not measurements; the measured numbers are in [Results](#results).
 
 ### FLE Durable: an agent on top
