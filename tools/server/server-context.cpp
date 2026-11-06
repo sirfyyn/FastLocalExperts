@@ -4997,7 +4997,8 @@ void server_routes::init_routes() {
         const bool cache_static = gpu_cache.is_object() && gpu_cache.contains("inserts") && gpu_cache.at("inserts").is_number_integer() &&
                 gpu_cache.at("inserts").get<int>() == 0;
         const bool prof_loaded = profile.is_object() && profile.contains("loaded") && profile.at("loaded").is_boolean() && profile.at("loaded").get<bool>();
-        if (cache_static && !prof_loaded) {
+        const bool learned_frozen = gpu_cache.is_object() && gpu_cache.contains("learned_frozen") && gpu_cache.at("learned_frozen").is_boolean() && gpu_cache.at("learned_frozen").get<bool>();
+        if (cache_static && !prof_loaded && !learned_frozen) {
             warnings.push_back({{"code", "inserts0_no_profile"}, {"level", "warn"},
                     {"text", "Static GPU cache (--moe-expert-cache-inserts 0) without a loaded usage profile: the cache stays empty and decoding is slow."}});
         }

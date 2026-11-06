@@ -1368,6 +1368,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 max_mib = common_fle_fit_max_mib();
                 common_fle_fit_probe(false);
             }
+            // A DSpark or DFlash drafter cannot be measured by the fit: take its file and its context (measured on DeepSeek-V4.1:
+            // 4970 MiB weights, about 700 MiB context with FLE_DRAFT_UBATCH=512, about 1500 MiB with -ub 4096) off the budget.
+            if (max_mib > 0 && common_fle_fit_extra_failed()) {
+                std::ifstream f(params_dft.model.path, std::ios::binary | std::ios::ate);
+                const int64_t dft_mib = f ? (int64_t) f.tellg() / (1024 * 1024) : 0;
+                max_mib -= dft_mib + (std::getenv("FLE_DRAFT_UBATCH") ? 700 : 1500);
+                LOG_INF("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: %lld MiB kept for the drafter's weights and context\n", __func__, (long long) dft_mib);
+            }
             // 64 MiB of slack: the real fit must not fall short by rounding and give up a layer for it
             const int64_t use_mib = max_mib - 64;
             common_set_env("FLE_MOE_CACHE_BUDGET_MIB", std::to_string(std::max<int64_t>(0, use_mib)));

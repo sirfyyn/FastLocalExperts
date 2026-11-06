@@ -21,6 +21,7 @@ int64_t common_fle_fit_max_mib();   // a function, not a variable: Windows DLLs 
 // FLE_MOE_CACHE_BUDGET_MIB=auto: while on, the fit only measures that largest budget and returns before changing anything.
 // Switching it on or off clears the measured value.
 void common_fle_fit_probe(bool on);
+bool common_fle_fit_extra_failed();   // the extra model could not be measured and is not in that value
 
 struct common_fit_extra_model {
     const char * path_model;

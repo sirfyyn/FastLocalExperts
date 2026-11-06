@@ -136,7 +136,7 @@ struct moe_cache {
     bool                    prof_no_save    = false;      // the file belongs to another model: read nothing, write nothing
     uint64_t                prof_base_steps = 0;          // steps recorded by earlier runs
     bool                    prof_auto       = false;      // FLE_MOE_PROFILE=auto: learn with inserts, freeze at prof_mature steps
-    uint64_t                prof_mature     = 4000;       // FLE_MOE_PROFILE_MATURE_STEPS
+    uint64_t                prof_mature     = 16000;      // FLE_MOE_PROFILE_MATURE_STEPS
     uint64_t                prof_saves      = 0;
     std::chrono::steady_clock::time_point prof_last_save{};
     std::vector<prof_layer> prof_keep;                    // layers of the loaded file without a cache in this run
@@ -218,6 +218,7 @@ struct fle_status_t {
     std::string prof_path;
     int         prof_state = -1;      // -1 no profile set, 0 not found (cold start), 1 loaded, 2 rejected
     bool        inserts_auto = false; // inserts 0 was asked for without a loaded profile: the cache learns instead
+    bool        learned_frozen = false; // FLE_MOE_PROFILE=auto: learned in this run and frozen
     std::string prof_reason;
     uint64_t    prof_steps = 0;
     int64_t     budget_mib = 0;
@@ -2683,6 +2684,7 @@ void llama_moe_cache_step() {
             mc->max_inserts = 0;
             mc->prof_no_save = true;
             g_fle_st.inserts = 0;
+            g_fle_st.learned_frozen = true;
             LLAMA_LOG_INFO("[fle-moe-profile] auto: %" PRIu64 " steps seen, cache frozen\n", mc->prof_base_steps + mc->n_steps);
         }
         if (mc->prof_save_sec > 0 && (mc->n_steps & 63) == 0 && mc->prof_dirty &&
@@ -2861,6 +2863,7 @@ const char * llama_fle_status_json(void) {
                 (long long) st.budget_mib, (long long) (st.fitted_bytes >> 20), st.inserts, (long long) st.experts);
         o += b;
         o += st.inserts_auto ? ",\"inserts_auto\":true" : ",\"inserts_auto\":false";
+        o += st.learned_frozen ? ",\"learned_frozen\":true" : ",\"learned_frozen\":false";
         uint64_t h = 0, m = 0;
         if (g_cache) { for (auto & ls : g_cache->layers) { h += ls.n_hit; m += ls.n_miss; } }
         if (h + m > 0) { snprintf(b, sizeof(b), ",\"hit\":%.4f", (double) h / (double) (h + m)); o += b; } else { o += ",\"hit\":null"; }
