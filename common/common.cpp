@@ -1370,7 +1370,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
             // A DSpark or DFlash drafter cannot be measured by the fit: take its file and its context (measured on DeepSeek-V4.1:
             // 4970 MiB weights, about 700 MiB context with FLE_DRAFT_UBATCH=512, about 1500 MiB with -ub 4096) off the budget.
-            if (max_mib > 0 && common_fle_fit_extra_failed()) {
+            // An MTP head shares the main model's weights and fits in the margin (Rhea G3, n-max 4: no deduction, 20.2 GB cache).
+            if (max_mib > 0 && common_fle_fit_extra_failed() && !spec_mtp) {
                 std::ifstream f(params_dft.model.path, std::ios::binary | std::ios::ate);
                 const int64_t dft_mib = f ? (int64_t) f.tellg() / (1024 * 1024) : 0;
                 max_mib -= dft_mib + (std::getenv("FLE_DRAFT_UBATCH") ? 700 : 1500);
