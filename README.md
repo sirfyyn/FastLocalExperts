@@ -4,9 +4,11 @@
 
 # FLE · Fast Local Experts
 
-**An 89 GB Mixture-of-Experts model at ~90 tokens/s on one 32 GB GPU.**
+**DeepSeek V4.1 Flash (763B) at about 50 tokens/s and an 89 GB Qwen model at ~90 tokens/s, each on one 32 GB GPU.**
 
 *Best performance measured on Linux.*
+
+**Run it in one command with [FLE Link](https://flelink.run):** `curl -fsSL https://flelink.run/install.sh | sh`, then `flelink run rin-deepseek-v41-dspark`. FLE Link installs this engine, fetches the model and serves an OpenAI- and Anthropic-compatible API.
 
 A [llama.cpp](https://github.com/ggml-org/llama.cpp) fork for running large MoE GGUF models locally (local LLM
 inference) that keeps the hot experts of a large MoE model in a GPU
@@ -15,6 +17,7 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 [Technical report](https://sirfyyn.github.io/FastLocalExperts/) ·
 [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf) ·
 [Model files](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF) ·
+[Rin (DeepSeek V4.1 Flash)](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF) ·
 [Quick start](#quick-start) ·
 [Films](#making-rhea-fast-eight-short-films) ·
 [Website](https://sirfyyn.de/en/fle/) ·
@@ -40,8 +43,10 @@ its 48 MoE layers, so most of its weights are idle at any moment. FLE splits the
 shared weights, the KV cache and a cache of hot experts live on the GPU; the bulk of the routed experts stays in system
 RAM and is computed on the CPU when it is not cached.
 
-FLE was built and measured for one model on one machine: Qwen3.8-Flash-Next as the 88.87 GB FLE-IQ3_M file on a
-workstation with one 32 GB GPU and 120 GB of RAM. It is not a general system. The
+FLE was built and measured on one machine, a workstation with one 32 GB GPU and 120 GB of RAM, first for Qwen3.8-Flash-Next
+(the 88.87 GB FLE-IQ3_M file) and since v1.2.4 for DeepSeek V4.1 Flash (763B parameters), whose experts do not fit in RAM
+either: a RAM expert store, a usage profile that decides what stays on the card, and the DSpark draft model carry it.
+It is not a general system. The
 [technical report](https://sirfyyn.github.io/FastLocalExperts/) is a measured account of what worked, what did not, and
 by how much, written so that someone with similar hardware can reproduce it.
 
@@ -55,6 +60,8 @@ by how much, written so that someone with similar hardware can reproduce it.
 | **Prefill** | **FLE is slower**: upstream with `-ub 4096` processes 4k and 8.6k prompts 24 % and 12 % faster, Strata 2.3 to 2.7 times as fast. Prefill is the next work item | [report 5.1](https://sirfyyn.github.io/FastLocalExperts/#s5-1), [5.3](https://sirfyyn.github.io/FastLocalExperts/#s5-3) |
 | **Quality** of FLE-IQ3_M | KL divergence against BF16 within the noise of Unsloth UD-IQ4_XS on three texts, at 4.8 GB less | [report 3](https://sirfyyn.github.io/FastLocalExperts/#s3) |
 | **Benchmarks**, one run each | IFBench 80.3 / 83.0 (strict / loose) and GPQA Diamond 88.9: level with Qwen's card (81.3, 91.7). LiveCodeBench v6 85.5: below the card (91.9) | [report 5.4](https://sirfyyn.github.io/FastLocalExperts/#s5-4) |
+
+**DeepSeek V4.1 Flash** (ISTA-DASLab GSQ-RCO IQ2_XXS, 232 GiB) on the same machine: **50.6 tokens/s** with the DSpark draft model (v1.2.5, three fresh starts: 49.8 / 50.8 / 50.6, the same answer every time, lossless at temperature 0), exact without the draft 37.6. **[Rin](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF)**, a 2-bit build of the same model split into a hot half on the GPU and a cold half in RAM: **53.4 tokens/s** (v1.2.6 package check), KL divergence to the original 0.29 against 0.25 for ISTA's IQ2_XXS. Lossy; the model card has the numbers.
 
 Hardware: AMD Ryzen 9 9950X3D (16 cores), 120 GB DDR5, one NVIDIA RTX PRO 4500 Blackwell (32 GB), Linux. **Best performance measured on Linux**; every figure here comes from it. FLE decodes at
 about 100 tokens/s on the 24 prompts of bracket B1e and at 91 tokens/s on the six tasks of the Strata comparison; the
@@ -113,6 +120,16 @@ copying cache misses over PCIe and a rebase onto current upstream all lost
 ([report 6](https://sirfyyn.github.io/FastLocalExperts/#s6)).
 
 ## Quick start
+
+**Easiest: [FLE Link](https://flelink.run).** One command installs the engine that fits your GPU, checks that a model fits before it downloads, and serves it:
+
+```bash
+curl -fsSL https://flelink.run/install.sh | sh
+flelink run rin-deepseek-v41-dspark     # DeepSeek V4.1 Flash, needs about 120 GB RAM and 260 GB of fast disk
+flelink run fle-iq3-m                    # Qwen3.8-Flash-Next
+```
+
+The rest of this section builds and starts the engine by hand.
 
 As tested: Linux with CUDA, one NVIDIA GPU with 32 GB, a CPU with AVX2 and 120 GB of RAM (we have not tested how much
 less is enough). The download below is 90.4 GB.
@@ -219,6 +236,8 @@ the pruned file has its own repo,
 hybrids are splices of public quantizations by [Unsloth](https://unsloth.ai) and
 [ISTA-DASLab](https://huggingface.co/ISTA-DASLab): whole expert layers, chosen layer by layer by measured sensitivity,
 copied byte for byte.
+
+DeepSeek V4.1 Flash: [Rin - Deepseek V4.1 Flash 1017](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-GGUF) (a split 2-bit build from ISTA-DASLab's GSQ-RCO quants, MIT, needs FLE v1.2.6 or newer) and the [DSpark draft model](https://huggingface.co/sirfyyn/DeepSeek-V4.1-Flash-1017-DSpark-FLE-GGUF).
 
 A dense 27B model that runs on this engine: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF), IQ4_XS, 15.3 GB, with a DFlash2 draft head. Details and measurements: https://sirfyyn.de/en/katy/
 
