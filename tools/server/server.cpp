@@ -13,6 +13,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -479,8 +480,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // warm start; when it is larger than the memory this process may use, the kernel kills the engine later (exit -9,
         // no message). Limit: fle_mem_avail_gb() (MemAvailable or what the cgroup still allows).
         if (const char * sg = std::getenv("FLE_MOE_STORE_GB"); sg && std::atof(sg) > 0) {
-            const double avail_gb = fle_mem_avail_gb();
+            double avail_gb = fle_mem_avail_gb();
             const double need_gb = std::atof(sg);
+            // A store of the engine that just stopped still comes free for a moment: wait before giving up (immediate restarts)
+            for (int i = 0; i < 30 && avail_gb > 0 && need_gb > avail_gb; ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                avail_gb = fle_mem_avail_gb();
+            }
             if (avail_gb > 0 && need_gb > avail_gb) {
                 fprintf(stderr, "[fle-status-error] {\"error\":{\"code\":\"ram_too_small\",\"need_gb\":%.1f,\"free_gb\":%.1f,\"text\":"
                         "\"FLE_MOE_STORE_GB=%s is larger than the memory available to this process (%.1f GB); lower it.\"}}\n",

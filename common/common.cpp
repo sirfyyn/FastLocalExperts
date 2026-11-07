@@ -1370,11 +1370,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
             // A DSpark or DFlash drafter cannot be measured by the fit: take its file and its context (measured on DeepSeek-V4.1:
             // 4970 MiB weights, about 700 MiB context with FLE_DRAFT_UBATCH=512, about 1500 MiB with -ub 4096) off the budget.
-            // An MTP head shares the main model's weights and fits in the margin (Rhea G3, n-max 4: no deduction, 20.2 GB cache).
-            if (max_mib > 0 && common_fle_fit_extra_failed() && !spec_mtp) {
+            // An MTP head keeps the target's batch and a context of its own: about 1500 MiB beside its file as well (Rhea G3 with
+            // 262144 context: 15000 MiB fit, 16000 ran out of memory, the fit alone said 18237).
+            if (max_mib > 0 && common_fle_fit_extra_failed()) {
                 std::ifstream f(params_dft.model.path, std::ios::binary | std::ios::ate);
                 const int64_t dft_mib = f ? (int64_t) f.tellg() / (1024 * 1024) : 0;
-                max_mib -= dft_mib + (std::getenv("FLE_DRAFT_UBATCH") ? 700 : 1500);
+                max_mib -= dft_mib + (!spec_mtp && std::getenv("FLE_DRAFT_UBATCH") ? 700 : 1500);
                 LOG_INF("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: %lld MiB kept for the drafter's weights and context\n", __func__, (long long) dft_mib);
             }
             // 64 MiB of slack: the real fit must not fall short by rounding and give up a layer for it
