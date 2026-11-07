@@ -31,7 +31,8 @@ touch the compute path.
 - `profile.state`: `loaded`, `not_found` (cold start), `rejected` (with `rejected_reason`, e.g. a checksum or model
   mismatch) or `none` (no `FLE_MOE_PROFILE`).
 - `gpu_cache.fitted_mib`: device memory the cache actually took; `experts`: usable slots over all layers.
-- Warnings (`code` stays fixed, `text` is English): `inserts0_no_profile`, `cuda_lt_13_4`, `prefill_window_gt_8`, `ram_tight`
+- `gpu_cache.inserts_auto`: `true` when `inserts 0` was asked for without a loaded profile and the cache learns instead. `gpu_cache.learned_frozen`: with `FLE_MOE_PROFILE=auto`, learned in this run and frozen.
+- Warnings (`code` stays fixed, `text` is English): `inserts0_no_profile` (only with `FLE_MOE_INSERTS_STRICT`), `inserts0_overridden`, `cuda_lt_13` (runtime older than 13), `prefill_window_gt_8`, `ram_tight`
   (less than 4 GB left for the process with the store allocated).
 - `live`: decode and prefill tok/s and DSpark acceptance from finished requests; `draft_mean_len` = 1 + accepted per verify step.
 

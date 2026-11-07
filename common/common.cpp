@@ -1288,8 +1288,27 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// FLE_MOE_PROFILE=auto: one usage profile per model in the cache directory, learned and then frozen (FLE_MOE_PROFILE_AUTO)
+static void fle_profile_auto(const std::string & model_path) {
+    const char * e = std::getenv("FLE_MOE_PROFILE");
+    if (!e || std::strcmp(e, "auto") != 0) {
+        return;
+    }
+    const size_t cut = model_path.find_last_of("/\\");
+    const std::string name = cut == std::string::npos ? model_path : model_path.substr(cut + 1);
+    std::ifstream f(model_path, std::ios::binary | std::ios::ate);
+    const long long size = f ? (long long) f.tellg() : 0;
+    const std::string dir = fs_get_cache_directory() + "fle-profiles/";
+    fs_create_directory_with_parents(dir);
+    const std::string path = dir + name + "-" + std::to_string(size) + ".prof";
+    common_set_env("FLE_MOE_PROFILE", path);
+    common_set_env("FLE_MOE_PROFILE_AUTO", "1");
+    LOG_INF("%s: FLE_MOE_PROFILE=auto: %s\n", __func__, path.c_str());
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    fle_profile_auto(params.model.path);
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1317,6 +1336,60 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // off: the margin is then exactly params.fit_params_target, as before. (Devices are not split: the cache of
         // every layer sits next to its router, which is device 0 for the usual single-GPU setup.)
         std::vector<size_t> fit_target = params.fit_params_target;
+
+        const common_fit_extra_model extra = {
+            /*.path_model   =*/ params_dft.model.path.c_str(),
+            /*.mparams      =*/ &mparams_dft,
+            /*.cparams      =*/ &cparams_dft,
+            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+        };
+
+        // FLE_MOE_CACHE_BUDGET_MIB=auto: as much cache as fits next to the model, the context and the drafter on device 0.
+        // A split model keeps its hot half on the GPU and has no cache, so auto means no budget there.
+        if (const char * e_auto = std::getenv("FLE_MOE_CACHE_BUDGET_MIB"); e_auto && std::strcmp(e_auto, "auto") == 0 && !fit_target.empty()) {
+            bool split = false;
+            gguf_init_params gip = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            if (gguf_context * g = gguf_init_from_file(params.model.path.c_str(), gip)) {
+                split = gguf_find_key(g, "fle.expert_split.version") >= 0;
+                gguf_free(g);
+            }
+            int64_t max_mib = -1;
+            if (!split) {
+                const int64_t huge_mib = 1024 * 1024;
+                common_set_env("FLE_MOE_CACHE_BUDGET_FIT", "1");
+                common_set_env("FLE_MOE_CACHE_BUDGET_MIB", std::to_string(huge_mib));
+                std::vector<size_t> probe_target = fit_target;
+                probe_target[0] += (size_t) huge_mib * 1024 * 1024;
+                llama_model_params mp = mparams;
+                llama_context_params cp = cparams;
+                common_fle_fit_probe(true);
+                common_fit_params(params.model.path.c_str(), &mp, &cp, params.tensor_split, params.tensor_buft_overrides.data(),
+                    probe_target.data(), params.fit_params_min_ctx, has_draft || spec_mtp ? &extra : nullptr, GGML_LOG_LEVEL_ERROR);
+                max_mib = common_fle_fit_max_mib();
+                common_fle_fit_probe(false);
+            }
+            // A DSpark or DFlash drafter cannot be measured by the fit: take its file and its context (measured on DeepSeek-V4.1:
+            // 4970 MiB weights, about 700 MiB context with FLE_DRAFT_UBATCH=512, about 1500 MiB with -ub 4096) off the budget.
+            // An MTP head keeps the target's batch and a context of its own: about 1500 MiB beside its file as well (Rhea G3 with
+            // 262144 context: 15000 MiB fit, 16000 ran out of memory, the fit alone said 18237).
+            if (max_mib > 0 && common_fle_fit_extra_failed()) {
+                std::ifstream f(params_dft.model.path, std::ios::binary | std::ios::ate);
+                const int64_t dft_mib = f ? (int64_t) f.tellg() / (1024 * 1024) : 0;
+                max_mib -= dft_mib + (!spec_mtp && std::getenv("FLE_DRAFT_UBATCH") ? 700 : 1500);
+                LOG_INF("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: %lld MiB kept for the drafter's weights and context\n", __func__, (long long) dft_mib);
+            }
+            // 64 MiB of slack: the real fit must not fall short by rounding and give up a layer for it
+            const int64_t use_mib = max_mib - 64;
+            common_set_env("FLE_MOE_CACHE_BUDGET_MIB", std::to_string(std::max<int64_t>(0, use_mib)));
+            if (split) {
+                LOG_INF("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: split model, no expert cache\n", __func__);
+            } else if (use_mib > 0) {
+                LOG_INF("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: %lld MiB fit on device 0\n", __func__, (long long) use_mib);
+            } else {
+                LOG_WRN("%s: FLE_MOE_CACHE_BUDGET_MIB=auto: no room for an expert cache on device 0 (or more than one device)\n", __func__);
+            }
+        }
+
         {
             const char * e_fit = std::getenv("FLE_MOE_CACHE_BUDGET_FIT");
             const char * e_mib = std::getenv("FLE_MOE_CACHE_BUDGET_MIB");
@@ -1326,13 +1399,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                         __func__, atoll(e_mib), fit_target[0] / (1024*1024));
             }
         }
-
-        const common_fit_extra_model extra = {
-            /*.path_model   =*/ params_dft.model.path.c_str(),
-            /*.mparams      =*/ &mparams_dft,
-            /*.cparams      =*/ &cparams_dft,
-            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
-        };
 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,

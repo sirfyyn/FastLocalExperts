@@ -14,6 +14,10 @@
 
 static int64_t g_fle_fit_max_mib = -1;
 int64_t common_fle_fit_max_mib() { return g_fle_fit_max_mib; }
+static bool g_fle_fit_probe = false;
+static bool g_fle_fit_extra_failed = false;
+void common_fle_fit_probe(bool on) { g_fle_fit_probe = on; g_fle_fit_max_mib = -1; if (on) { g_fle_fit_extra_failed = false; } }
+bool common_fle_fit_extra_failed() { return g_fle_fit_extra_failed; }
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -227,6 +231,7 @@ static void common_params_fit_impl(
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                g_fle_fit_extra_failed = true;
                 dmds_extra = dmds_t(devs.size() + 1);
                 n_ctx_extra = cparams->n_ctx;
                 return;
@@ -358,6 +363,7 @@ static void common_params_fit_impl(
                 if (e_fit && atoi(e_fit) != 0 && e_mib && atoll(e_mib) > 0) {
                     const int64_t target = (int64_t) margins[0] - atoll(e_mib) * MiB;   // the margin without the cache
                     g_fle_fit_max_mib = std::max<int64_t>(0, (projected_free_per_device[0] - target) / MiB);
+                    if (g_fle_fit_probe) { return; }
                 }
             }
             if (projected_free_per_device[0] >= margins[0]) {
