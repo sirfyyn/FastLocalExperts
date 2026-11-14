@@ -205,9 +205,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             ggml_row_size(g_cs->type, g_cs->ne[0] - 1));
     cb(g_last, "g_last", il);
 
-    // TODO: remove this cont when CUDA supports non-cont unary ops
-    g_last = ggml_cont(ctx0, g_last);
-
     // [1, 1, n_chunks, H_v * n_seqs] KDA: [S_k, 1, n_chunks, H_v * n_seqs]
     ggml_tensor * g_last_exp_t = ggml_transpose(ctx0, ggml_exp(ctx0, g_last));
     cb(g_last_exp_t, "g_last_exp_t", il);
@@ -460,6 +457,36 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
 
     const int64_t n_seqs = ubatch.n_seqs;
 
+    if (mctx_cur->r_window()) {
+        // one window [channels, w], a row per column: gather the d history columns through an input, then keep the
+        // newest w columns of the conv input. A rollback only changes the indices of the next read.
+        const int64_t d = conv_kernel_size - 1;
+        const int64_t w = mctx_cur->r_win_w();
+        const size_t  e = ggml_element_size(conv_states_all);
+        GGML_ASSERT(n_seqs == 1 && kv_head == 0);
+
+        if (mctx_cur->get_rs_z() >= 0) {
+            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, ggml_view_1d(ctx0, conv_states_all, w * conv_channels, 0), 0));
+        }
+
+        ggml_tensor * hist = ggml_transpose(ctx0, ggml_get_rows(ctx0, conv_states_all, inp->r_win_idx));
+        cb(hist, "conv_states", il);
+
+        ggml_tensor * qkv_t = ggml_transpose(ctx0, qkv_mixed);
+        cb(qkv_t, "qkv_mixed_transposed", il);
+
+        ggml_tensor * conv_input = ggml_concat(ctx0, hist, qkv_t, 0);
+        cb(conv_input, "conv_input", il);
+
+        const int64_t wn = std::min<int64_t>(conv_input->ne[0], w);
+        ggml_tensor * src = ggml_view_3d(ctx0, conv_input, wn, conv_channels, n_seqs, conv_input->nb[1], conv_input->nb[2], (conv_input->ne[0] - wn) * e);
+        ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all, conv_channels, wn, n_seqs, conv_states_all->nb[1], conv_states_all->nb[1] * w, 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_transpose(ctx0, src), dst));
+
+        GGML_UNUSED(d);
+        return conv_input;
+    }
+
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
     cb(conv_states, "conv_states", il);
 
@@ -556,6 +583,22 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 ggml_cpy(ctx0, new_state,
                     ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
                         kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+
+        return output;
+    }
+
+    if (mctx_cur->s_replay(il)) {
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, 1);
+        ggml_gated_delta_net_set_replay(gdn_out, cparams.n_rs_seq + 1, ssm_states_all, mctx_cur->get_rec_l(il), inp->replay_m);
+        res->add_fused_node({n_seq_tokens > 1 ? LLM_FUSED_OP_GDN_CH : LLM_FUSED_OP_GDN_AR, gdn_out, il});
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
 
         return output;
     }

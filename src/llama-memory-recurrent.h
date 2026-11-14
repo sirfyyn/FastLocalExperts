@@ -18,6 +18,7 @@ class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
             const llama_model & model,
+                         bool   no_alloc,
                     ggml_type   type_r,
                     ggml_type   type_s,
                          bool   offload,
@@ -73,6 +74,17 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    // FLE_RS_WINDOW=1: the conv history r holds one window of history plus verify columns per cell, one copy per
+    // layer instead of one per snapshot; a rollback only moves the start of the window. Single sequence only.
+    bool     r_window = false;
+    uint32_t r_win_d  = 0; // history columns
+    uint32_t r_win_w  = 0; // window columns
+    uint32_t r_win_ch = 0; // channels
+
+    // FLE_GDN_REPLAY=1: S keeps two rows, k/v/g/beta of the last verify batch are recorded per layer
+    bool s_replay = false;
+    std::vector<bool> s_replay_l; // per layer: only layers in a CUDA buffer replay
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
@@ -90,6 +102,19 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
+        // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
+        uint32_t rs_max = 0;
+
+        // FLE_RS_WINDOW: columns written by the last ubatch, and where this ubatch reads its history
+        uint32_t win_n     = 0;
+        uint32_t win_start = 0;
+
+        // FLE_GDN_REPLAY: tokens to fold before the next ubatch, and the size of the last ubatch
+        int32_t  rep_m = 0;
+        uint32_t rep_n = 0;
+        int32_t  rep_pend = 0; // fold restored from a saved state, applied by the next ubatch
 
         std::set<llama_seq_id> seq_id;
 
@@ -111,6 +136,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> rec_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
@@ -120,8 +146,11 @@ private:
 
     const uint32_t n_seq_max = 1;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    // ggml contexts for the RS cache along with the allocated backend buffers:
+    llama_memory_bufs ctxs_bufs;
+
+    // true if no layers - can happen if the layer filter removes all layers
+    bool is_empty() const;
 
     size_t total_size() const;
 
@@ -134,6 +163,8 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    void state_clear(llama_seq_id seq_id, uint32_t cell_head, uint32_t cell_count);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -172,6 +203,16 @@ public:
     uint32_t get_size() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
+
+    bool     r_window() const;
+    uint32_t r_win_w() const;
+    uint32_t r_win_d() const;
+
+    bool s_replay() const;
+    bool s_replay(int32_t il) const;
+    int32_t replay_m() const;
+    ggml_tensor * get_rec_l(int32_t il) const;
+    uint32_t r_win_start() const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 

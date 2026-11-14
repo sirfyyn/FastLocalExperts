@@ -1,5 +1,8 @@
 #include "fit.h"
 
+#include "common.h"
+#include "json.h"
+#include "llama-cpp.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
@@ -11,9 +14,6 @@
 #include <set>
 #include <string>
 #include <vector>
-
-static int64_t g_fle_fit_max_mib = -1;
-int64_t common_fle_fit_max_mib() { return g_fle_fit_max_mib; }
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -29,6 +29,32 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// RAII: send llama logs below min_level to the debug log
+struct common_fit_log_scope {
+    common_fit_log_scope(ggml_log_level min_level) : min_level(min_level) {
+        llama_log_get(&original_logger.callback, &original_logger.user_data);
+        llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+            const common_fit_log_scope * self = (const common_fit_log_scope *) user_data;
+            const ggml_log_level level_eff = level >= self->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+            self->original_logger.callback(level_eff, text, self->original_logger.user_data);
+        }, this);
+    }
+
+    ~common_fit_log_scope() {
+        llama_log_set(original_logger.callback, original_logger.user_data);
+    }
+
+    common_fit_log_scope(const common_fit_log_scope &) = delete;
+    common_fit_log_scope & operator=(const common_fit_log_scope &) = delete;
+
+private:
+    struct {
+        ggml_log_callback callback;
+        void * user_data;
+    } original_logger;
+    ggml_log_level min_level;
+};
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -38,22 +64,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
-    struct user_data_t {
-        struct {
-            ggml_log_callback callback;
-            void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
-    };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
-
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
+    common_fit_log_scope log_scope(log_level);
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
@@ -61,14 +72,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
         llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
 
@@ -150,9 +159,79 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_free(ctx);
     llama_model_free(model);
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
+}
+
+std::vector<common_memory_breakdown_row> common_fit_measure(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint32_t * n_ctx_train,
+        uint32_t * n_ctx,
+        ggml_log_level log_level) {
+    common_fit_log_scope log_scope(log_level);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model_ptr model(llama_model_load_from_file(path_model, mparams_copy));
+    if (!model) {
+        throw std::runtime_error("failed to load model");
+    }
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), *cparams));
+    if (!ctx) {
+        throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    if (n_ctx_train) {
+        *n_ctx_train = llama_model_n_ctx_train(model.get());
+    }
+    if (n_ctx) {
+        *n_ctx = llama_n_ctx(ctx.get());
+    }
+
+    return common_memory_breakdown_rows(ctx.get());
+}
+
+common_memory_reports common_measure_memory(common_params & params) {
+    const ggml_log_level log_level = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+    const char * path_model = params.model.path.c_str();
+
+    common_memory_reports res;
+
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+
+    // max: what --fit picks now, no-op with -fit off
+    {
+        auto mparams_fit = mparams;
+        auto cparams_fit = cparams;
+        common_fit_apply(params, mparams_fit, cparams_fit);
+        res.info_max = common_fit_measure(path_model, &mparams_fit, &cparams_fit, &res.n_ctx_train, &res.n_ctx_max, log_level);
+    }
+
+    // min: the smallest context --fit may pick (--fit only changes n_ctx when it is 0)
+    uint32_t n_ctx_min = cparams.n_ctx;
+    if (n_ctx_min == 0 && params.fit_params) {
+        const uint32_t n_streams = cparams.kv_unified ? 1 : std::max<uint32_t>(1, cparams.n_seq_max);
+        // -c 0 sets fit_params_min_ctx to UINT32_MAX, cap at n_ctx_train like --fit
+        n_ctx_min = (uint32_t) std::min<uint64_t>(
+            uint64_t(params.fit_params_min_ctx) * n_streams,
+            uint64_t(res.n_ctx_train) * n_streams);
+    }
+    if (n_ctx_min == 0 || n_ctx_min >= res.n_ctx_max) {
+        // nothing to reduce, or -fit off with the trained context
+        res.n_ctx_min = res.n_ctx_max;
+        res.info_min  = res.info_max;
+    } else {
+        cparams.n_ctx = n_ctx_min;
+        res.info_min  = common_fit_measure(path_model, &mparams, &cparams, nullptr, &res.n_ctx_min, log_level);
+    }
+
+    return res;
 }
 
 common_device_memory_data_vec common_get_device_memory_data(
@@ -352,14 +431,6 @@ static void common_params_fit_impl(
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
-            if (projected_free_per_device[0] < margins[0]) {
-                const char * e_fit = std::getenv("FLE_MOE_CACHE_BUDGET_FIT");
-                const char * e_mib = std::getenv("FLE_MOE_CACHE_BUDGET_MIB");
-                if (e_fit && atoi(e_fit) != 0 && e_mib && atoll(e_mib) > 0) {
-                    const int64_t target = (int64_t) margins[0] - atoll(e_mib) * MiB;   // the margin without the cache
-                    g_fle_fit_max_mib = std::max<int64_t>(0, (projected_free_per_device[0] - target) / MiB);
-                }
-            }
             if (projected_free_per_device[0] >= margins[0]) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
@@ -530,7 +601,7 @@ static void common_params_fit_impl(
             case LAYER_FRACTION_MOE: {
                 static std::array<std::string, n_strings> patterns;
                 if (patterns[il].empty()) {
-                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps(?!_hot)";   // FLE split: hot half stays
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
                 }
                 return patterns[il].c_str();
             }
@@ -625,7 +696,7 @@ static void common_params_fit_impl(
 
     int64_t global_surplus_cpu_moe = 0;
     if (hp_nex > 0) {
-        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps(?!_hot)"; // matches all MoE tensors (not the FLE split hot half)
+        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
         tensor_buft_overrides[1] = {nullptr, nullptr};
@@ -913,8 +984,7 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
-void common_memory_breakdown_print(const struct llama_context * ctx) {
-    //const auto & devices = ctx->get_model().devices;
+std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const struct llama_context * ctx) {
     const auto * model = llama_get_model(ctx);
 
     std::vector<ggml_backend_dev_t> devices;
@@ -924,15 +994,6 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
-    std::vector<std::array<std::string, 9>> table_data;
-    table_data.reserve(devices.size());
-    const std::string template_header = "%s: | %s | %s   %s    %s   %s   %s   %s    %s |\n";
-    const std::string template_gpu    = "%s: | %s | %s = %s + (%s = %s + %s + %s) + %s |\n";
-    const std::string template_other  = "%s: | %s | %s   %s    %s = %s + %s + %s    %s |\n";
-
-    table_data.push_back({template_header, "memory breakdown [MiB]", "total", "free", "self", "model", "context", "compute", "unaccounted"});
-
-    constexpr size_t MiB = 1024 * 1024;
     const std::vector<std::string> desc_prefixes_strip = {"NVIDIA ", "GeForce ", "Tesla ", "AMD ", "Radeon ", "Instinct "};
 
     // track seen buffer types to avoid double counting:
@@ -971,72 +1032,130 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         }
     }
 
-    // print memory breakdown for each device:
+    std::vector<common_memory_breakdown_row> rows;
+    rows.reserve(devices.size() + 1 + memory_breakdown.size());
+
     for (size_t i = 0; i < devices.size(); i++) {
         ggml_backend_dev_t dev = devices[i];
-        llama_memory_breakdown_data mb = mb_dev[i];
 
-        const std::string name = ggml_backend_dev_name(dev);
-        std::string desc = ggml_backend_dev_description(dev);
+        common_memory_breakdown_row row;
+        row.kind        = common_memory_breakdown_row::DEVICE;
+        row.name        = ggml_backend_dev_name(dev);
+        row.description = ggml_backend_dev_description(dev);
         for (const std::string & prefix : desc_prefixes_strip) {
-            if (desc.length() >= prefix.length() && desc.substr(0, prefix.length()) == prefix) {
-                desc = desc.substr(prefix.length());
+            if (row.description.length() >= prefix.length() && row.description.substr(0, prefix.length()) == prefix) {
+                row.description = row.description.substr(prefix.length());
             }
         }
 
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-
-        const size_t self = mb.model + mb.context + mb.compute;
-        const int64_t unaccounted = static_cast<int64_t>(total) - static_cast<int64_t>(free) - static_cast<int64_t>(self);
-
-        table_data.push_back({
-            template_gpu,
-            "  - " + name + " (" + desc + ")",
-            std::to_string(total / MiB),
-            std::to_string(free / MiB),
-            std::to_string(self / MiB),
-            std::to_string(mb.model / MiB),
-            std::to_string(mb.context / MiB),
-            std::to_string(mb.compute / MiB),
-            std::to_string(unaccounted / static_cast<int64_t>(MiB))});
+        row.total   = total;
+        row.free    = free;
+        row.model   = mb_dev[i].model;
+        row.context = mb_dev[i].context;
+        row.compute = mb_dev[i].compute;
+        rows.push_back(std::move(row));
     }
 
-    // print memory breakdown for host:
     {
-        const size_t self = mb_host.model + mb_host.context + mb_host.compute;
-        table_data.push_back({
-            template_other,
-            "  - Host",
-            "", // total
-            "", // free
-            std::to_string(self / MiB),
-            std::to_string(mb_host.model / MiB),
-            std::to_string(mb_host.context / MiB),
-            std::to_string(mb_host.compute / MiB),
-            ""}); // unaccounted
+        common_memory_breakdown_row row;
+        row.kind    = common_memory_breakdown_row::HOST;
+        row.name    = "Host";
+        row.model   = mb_host.model;
+        row.context = mb_host.context;
+        row.compute = mb_host.compute;
+        rows.push_back(std::move(row));
     }
 
-    // print memory breakdown for all remaining buffer types:
+    // all remaining buffer types:
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
         if (seen_buffer_types.count(buft) == 1) {
             continue;
         }
-        const std::string name = ggml_backend_buft_name(buft);
-        const size_t self = mb.model + mb.context + mb.compute;
+        common_memory_breakdown_row row;
+        row.kind    = common_memory_breakdown_row::BUFFER_TYPE;
+        row.name    = ggml_backend_buft_name(buft);
+        row.model   = mb.model;
+        row.context = mb.context;
+        row.compute = mb.compute;
+        rows.push_back(std::move(row));
+
+        seen_buffer_types.insert(buft);
+    }
+
+    return rows;
+}
+
+void common_memory_breakdown_print(const struct llama_context * ctx) {
+    const std::vector<common_memory_breakdown_row> rows = common_memory_breakdown_rows(ctx);
+
+    std::vector<std::array<std::string, 9>> table_data;
+    table_data.reserve(rows.size() + 1);
+
+    // same data as the table below, for --log-jsonl consumers
+    common_json json_rows = common_json::array();
+    const std::string template_header = "%s: | %s | %s   %s    %s   %s   %s   %s    %s |\n";
+    const std::string template_gpu    = "%s: | %s | %s = %s + (%s = %s + %s + %s) + %s |\n";
+    const std::string template_other  = "%s: | %s | %s   %s    %s = %s + %s + %s    %s |\n";
+
+    table_data.push_back({template_header, "memory breakdown [MiB]", "total", "free", "self", "model", "context", "compute", "unaccounted"});
+
+    constexpr size_t MiB = 1024 * 1024;
+
+    for (const auto & row : rows) {
+        const size_t self = row.model + row.context + row.compute;
+
+        if (row.kind == common_memory_breakdown_row::DEVICE) {
+            const int64_t unaccounted = row.total - row.free - static_cast<int64_t>(self);
+
+            table_data.push_back({
+                template_gpu,
+                "  - " + row.name + " (" + row.description + ")",
+                std::to_string(row.total / MiB),
+                std::to_string(row.free / MiB),
+                std::to_string(self / MiB),
+                std::to_string(row.model / MiB),
+                std::to_string(row.context / MiB),
+                std::to_string(row.compute / MiB),
+                std::to_string(unaccounted / static_cast<int64_t>(MiB))});
+
+            json_rows.push_back({
+                {"kind",        "device"},
+                {"name",        row.name},
+                {"description", row.description},
+                {"total",       row.total / MiB},
+                {"free",        row.free / MiB},
+                {"self",        self / MiB},
+                {"model",       row.model / MiB},
+                {"context",     row.context / MiB},
+                {"compute",     row.compute / MiB},
+                {"unaccounted", unaccounted / static_cast<int64_t>(MiB)},
+            });
+            continue;
+        }
+
         table_data.push_back({
             template_other,
-            "  - " + name,
+            "  - " + row.name,
             "", // total
             "", // free
             std::to_string(self / MiB),
-            std::to_string(mb.model / MiB),
-            std::to_string(mb.context / MiB),
-            std::to_string(mb.compute / MiB),
+            std::to_string(row.model / MiB),
+            std::to_string(row.context / MiB),
+            std::to_string(row.compute / MiB),
             ""}); // unaccounted
-        seen_buffer_types.insert(buft);
+
+        json_rows.push_back({
+            {"kind",    row.kind == common_memory_breakdown_row::HOST ? "host" : "buffer_type"},
+            {"name",    row.name},
+            {"self",    self / MiB},
+            {"model",   row.model / MiB},
+            {"context", row.context / MiB},
+            {"compute", row.compute / MiB},
+        });
     }
 
     for (size_t j = 1; j < table_data[0].size(); j++) {
@@ -1053,6 +1172,11 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
     }
+
+    LOG_JSON("fit_memory_breakdown", common_json({
+        {"unit", "MiB"},
+        {"rows", json_rows},
+    }));
 }
 
 void common_fit_print(

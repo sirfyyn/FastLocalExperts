@@ -57,18 +57,7 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     // Feature fusion layer: projects 3 target layers to draft hidden size
     fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
 
-    // FLE: per-target-layer RMS norm before the fusion (the MiniMax-M3 EAGLE3 variant has
-    // fc_norm.0/1/2; Llama EAGLE3 does not -> optional, otherwise nullptr = skipped in the graph)
-    const int64_t n_embd_tgt = n_embd_inp / (int64_t) target_layer_ids.size();
-    if (ml->get_tensor_meta(tn(LLM_TENSOR_FC_NORM_0, "weight").str().c_str())) {
-        fc_norm[0] = create_tensor(tn(LLM_TENSOR_FC_NORM_0, "weight"), {n_embd_tgt}, 0);
-        fc_norm[1] = create_tensor(tn(LLM_TENSOR_FC_NORM_1, "weight"), {n_embd_tgt}, 0);
-        fc_norm[2] = create_tensor(tn(LLM_TENSOR_FC_NORM_2, "weight"), {n_embd_tgt}, 0);
-        LLAMA_LOG_INFO("%s: EAGLE3 per-target-layer fc_norm loaded (n_embd_tgt = %lld)\n", __func__, (long long) n_embd_tgt);
-    }
-
-    // upstream: RMSNorm on the fused target features (input of fc), only when
-    // norm_before_fc is set.
+    // RMSNorm on the fused target features (input to fc), only when norm_before_fc is set.
     if (hparams.norm_before_fc) {
         output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd_inp}, 0);
     }
@@ -111,18 +100,6 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_eagle3::build_arch_graph(const llm_graph_params & params) const {
-    switch (params.gtype) {
-        case LLM_GRAPH_TYPE_ENCODER:
-            return std::make_unique<graph<true>>(*this, params);
-        case LLM_GRAPH_TYPE_DEFAULT:
-        case LLM_GRAPH_TYPE_DECODER:
-            return std::make_unique<graph<false>>(*this, params);
-        default:
-            GGML_ABORT("invalid graph type");
-    };
-}
-
 template <>
 ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
     ggml_tensor * cur = nullptr;
@@ -148,22 +125,7 @@ template <>
 llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     ggml_tensor * cur = nullptr;
 
-    cur = build_inp_embd_enc();       // [3*n_embd_tgt, n_tokens]
-
-    // Per-target-layer RMS norm before fusion (MiniMax-M3 EAGLE3): reshape [d,3,n] -> rms_norm over d -> *gamma_i.
-    // Avoids a gapped-view cpy (no segment cont); only when fc_norm is present, otherwise raw fusion (Llama EAGLE3).
-    if (model.fc_norm[0]) {
-        const int64_t d = hparams.n_embd_inp_enc() / 3;
-        cur = ggml_reshape_3d(ctx0, cur, d, 3, n_tokens);                          // free (contiguous)
-        cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);                    // norm over dim0 per (segment, token)
-        ggml_tensor * gamma = ggml_concat(ctx0, ggml_concat(ctx0,
-                ggml_reshape_2d(ctx0, model.fc_norm[0], d, 1),
-                ggml_reshape_2d(ctx0, model.fc_norm[1], d, 1), 1),
-                ggml_reshape_2d(ctx0, model.fc_norm[2], d, 1), 1);                 // [d, 3] per-segment scale
-        cur = ggml_mul(ctx0, cur, gamma);                                          // broadcast over n_tokens
-        cur = ggml_reshape_2d(ctx0, cur, 3*d, n_tokens);                           // free, back
-        cb(cur, "fc_norm_out", -1);
-    }
+    cur = build_inp_embd_enc();
 
     // RMSNorm on the fused target features before fc
     if (hparams.norm_before_fc) {
@@ -359,6 +321,16 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
+}
 
-    ggml_build_forward_expand(gf, cur);
+std::unique_ptr<llm_graph_context> llama_model_eagle3::build_arch_graph(const llm_graph_params & params) const {
+    switch (params.gtype) {
+        case LLM_GRAPH_TYPE_ENCODER:
+            return std::make_unique<graph<true>>(*this, params);
+        case LLM_GRAPH_TYPE_DEFAULT:
+        case LLM_GRAPH_TYPE_DECODER:
+            return std::make_unique<graph<false>>(*this, params);
+        default:
+            GGML_ABORT("invalid graph type");
+    };
 }

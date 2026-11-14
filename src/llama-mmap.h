@@ -6,6 +6,9 @@
 #include <vector>
 #include <cstdio>
 
+// staging buffer size for direct I/O reads, 64MB works well for NVMe drives
+#define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
+
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;
@@ -54,10 +57,6 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
-
-    // Keep a range on disk: no read-ahead, drop it from the page cache.
-    // For lookup tables with random access (FLE_PLE_NVME).
-    void keep_on_disk(size_t first, size_t last, int fd);
 
     static const bool SUPPORTED;
 

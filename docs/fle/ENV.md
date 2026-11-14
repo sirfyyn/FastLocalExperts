@@ -1,298 +1,57 @@
-# FLE environment variables and flags
+# FLE environment variables (v1.3.0, dense line)
 
-This page lists every `FLE_*` environment variable read by the code (including `ggml/`) and the command line flags the
-fork adds. FLE features are opt-in: with none of these set the fork behaves like the llama.cpp it is based on.
+v1.3.0 is FLE's dense line: upstream llama.cpp `344846b4f` (2026-10-30) plus the changes that run Katy and Kate
+(Qwen3.8-27B fine-tunes with Gated DeltaNet layers) with the DSpine draft head. Every change listed here is off unless
+its variable is set; with none set, the engine behaves like upstream at the same commit, except for the n-gram table
+(see `--spec-type ngram-mod` below) and the DSpine model type, which upstream cannot load.
 
-How to read the tables:
+The MoE switches of v1.2.x (`FLE_MOE_*`, expert store, split experts, `--moe-expert-cache*`, `/fle/status`) are **not**
+part of v1.3.0. For DeepSeek V4.1 Flash, Rin and Qwen3.8-Flash-Next use
+[v1.2.6](https://github.com/sirfyyn/FastLocalExperts/tree/v1.2.6) and its
+[ENV.md](https://github.com/sirfyyn/FastLocalExperts/blob/v1.2.6/docs/fle/ENV.md).
 
-- **Default** is the behaviour when the variable is unset. "off" means the feature is disabled.
-- **Ref.** is the value used in the reference configuration (the setup used for the measurements in the technical
-  report, <https://sirfyyn.github.io/FastLocalExperts/>). "-" means it is not set there.
-- Flag-like variables ("on") are usually enabled by any non-empty value that does not start with `0`; where the code
-  checks existence only, the table says "set". Numeric variables are parsed with `atoi`/`atoll`/`atof`.
-- Variables marked **experimental** are research switches that may change or disappear. **Obsolete** variables were
-  superseded or measured as not useful and are kept only so old scripts keep working. **Debug** variables print or dump
-  diagnostics and have no effect on results.
-- Deprecated aliases: the pre-release German names of some variables are still read as a fallback (the new name is read
-  first). They are listed in the last section and will be removed in a future release.
+The run IDs (k28, k30, ...) are the paired A-B-B-A measurements in the Kate/Katy report (Appendix C); all were measured
+on one RTX PRO 4500 Blackwell (32 GB) with Katy (IQ4_XS) and the DSpine b16 head, n-max 15.
 
-## GPU expert cache (`src/llama-moecache.cpp`)
+## Verify rounds in hybrid models
 
-The cache keeps hot MoE experts of host-resident layers in VRAM slots next to the router. It is enabled by
-`--moe-expert-cache N` (fixed slots per layer) **or** by a byte budget (`FLE_MOE_CACHE_BUDGET_MIB`); the budget alone is
-enough.
-
-| Variable | Default | Meaning | Ref. |
-|----------|---------|---------|------|
-| `FLE_MOE_CACHE_BUDGET_MIB` | off (0) | Global byte budget (MiB) for the cache slot tensors (up + gate + down) of all layers. Slots per layer are planned from the budget instead of using a fixed count: every layer pays for its fixed part first, gets a floor of `FLE_MOE_CACHE_FLOOR_PCT` percent of the uniform slot count, and the rest goes to the experts with the most routed hits per byte (from the profile, otherwise spread evenly). Counts the slot tensors only; the I32 tables and bias vector come on top. | 17035 |
-| `FLE_MOE_CACHE_BUDGET_FIT` | off | `1`: add the budget to the margin of device 0 in the `-fit` step (see [`--fit-target`](#--fit-target-and-the-cache-budget)), so the fit leaves the budget free. | 1 |
-| `FLE_MOE_CACHE_FLOOR_PCT` | 10 | Per-layer floor of the budget plan, in percent of the uniform slot count (at least one slot while the budget allows). | - |
-| `FLE_MOE_CACHE_SLOTS_MAX` | 0 (= number of experts) | Cap on the usable slots of one layer. | - |
-| `FLE_MOE_PROFILE` | off (unset) | Path of the expert-usage profile. If the file exists and matches the model it is loaded before allocation: the budget plan uses its counts, the cache is pre-filled with the most frequent experts (warm start) and the admission counters are seeded. The file is updated while running and at shutdown. A missing file means cold start (created at the first save); a file that does not match the model is rejected and left untouched (since v1.2.5 it is never overwritten). | `<file>` |
-| `FLE_MOE_PROFILE_READONLY` | 0 (off) | Read the profile, never write it: every run starts from the same cache and store state, and a profile cannot be overwritten by another run (v1.2.5). Greedy output is not yet guaranteed byte-identical from run to run (a late divergence remains; under investigation). | 1 |
-| `FLE_MOE_PROFILE_UNION` | 0 (off) | Record mode: count an expert once per call (per speculative verify round), not once per token, for a static cache filled by how often an expert is in a round's union. Needs `FLE_MOE_OBS_MAXTOK` >= the verify batch. Experimental: a short recording (10k tokens) was clearly worse than a long token profile. | - |
-| `FLE_DRAFT_UBATCH` | 0 (off) | Caps `n_ubatch` and `n_batch` of the speculative drafter's context. With `-ub 4096` the drafter's compute buffer takes about 1.45 GiB that the expert cache can use instead; with 512 and `FLE_MOE_CACHE_BUDGET_MIB=15500` the v1.2.5 package gave 50.6 t/s median (n=3) on DeepSeek-V4.1 ISTA with DSpark. Exact (the drafter only proposes tokens). | - |
-| `FLE_TOPK_UNSORTED` | 0 (off) | CUDA top-k as upstream: `cub::DeviceTopK` (CCCL >= 3.2, CUDA 13) with its run-to-run varying order. Off: the same `DeviceTopK` on unique keys (ties pick the smaller index), the k indices sorted ascending, so the same prompt gives the same answer. `FLE_TOPK_ARGSORT=1` takes the argsort path of CUDA 12 builds instead (slower on DeepSeek-V4.1). | - |
-| `FLE_MOE_STORE_VERIFY` | 0 (off) | Diagnostic: compares every expert the RAM store hands out with the model file's bytes and prints mismatches. Slow (decode at a few tok/s). | - |
-| `FLE_MOE_STORE_NOEVICT` | 0 (off) | Diagnostic: the RAM store never gives a slot up once it is full; experts outside it come from the model file. | - |
-| `FLE_TRACE_FUSED` | 0 (off) | Diagnostic: one line per call of the fused CPU MoE op with hashes of its input, the expert ids and the result. | - |
-| `FLE_NODE_HASH` | unset | Diagnostic: comma-separated name parts; every graph node whose name contains one is hashed (`[fle-node]` lines, at most `FLE_NODE_HASH_CAP`, default 40000). Two runs diffed give the first node that differs. Observing nodes splits the graph, so it runs slower. | - |
-| `FLE_MOE_PROFILE_SAVE_SEC` | 600 | Seconds between profile saves; `0` = only at shutdown. | 600 |
-| `FLE_MOE_PROFILE_MAX_OBS` | 134217728 (2^27) | Per-layer observation total at which the counts are halved (aging, so old runs do not dominate forever). | - |
-| `FLE_MOE_ADMIT_FREQ` | 0 (off) | `> 0`: admission by aged request frequency; the counters are halved every this many observations per layer. Decides which miss is admitted and which slot is evicted. | 2000 |
-| `FLE_MOE_EVICT_OLDEST` | 0 (off) | `>= 2`: evict the least frequent of the N oldest slots instead of the oldest one. | 32 |
-| `FLE_MOE_OBS_MAXTOK` | 4 | Batches with more tokens than this are not observed by the LRU/frequency bookkeeping (prefill must not pollute it). | 8 |
-| `FLE_MOE_CACHE_MAXTOK` | 8 | The cache graph is built for ubatches of up to this many tokens (decode and draft verification). With `FLE_MOE_POOL` it is also the size up to which the CPU pool computes the uncached experts (hybrid prefill); at least `FLE_PREFILL_WINDOW`. | - |
-| `FLE_PREFILL_WINDOW` | 0 (off) | A call of 2 to `FLE_PREFILL_WINDOW_MAX` tokens runs in ubatches of this many tokens through the decode path (GPU expert cache, CPU pool, MMVQ, CUDA graphs): only the routed experts are read. Recommended 8 (MMVQ path). v1.2.4 computed wrong rows for the zero slot with windows above 8 (fixed in v1.2.5; 16 measured about as fast as 8). Measured 03.11.2026, ISTA IQ2_XXS: 59 tokens 1.45 s instead of 17.2 s, about 45 t/s at any length up to 2.8k. Exact. | - |
-| `FLE_PREFILL_WINDOW_MAX` | 768 | Longest call that goes through prefill windows; above it the large ubatch streams the experts. Recommended 2047 (below `FLE_UBATCH_LEND_MIN`, so the 1024-token ubatch that ran out of VRAM is not used). | - |
-| `FLE_MOE_CACHE_BATCH` | unset | `off`: restore the old guard (cache only for single-token batches). | - |
-| `FLE_MOE_CACHE_BIAS` | value of `--moe-cache-bias` (0) | Additive routing bonus (probability units) for experts resident in the cache; steers selection only, the weights stay unbiased. Environment overrides the flag; the MTP context always uses 0. qwen4exp and deepseek41 (before this build the bonus had no effect on deepseek41). ISTA: 0.1 on layers 15-42 (with `FLE_MOE_CACHE_BIAS_LAYERS=0-14:0`) = +11 %, KL +0.003. | 0.001 (Rhea), 0.1 (ISTA) |
-| `FLE_MOE_CACHE_BIAS_LAYERS` | unset | Per-layer override of the bias, `"from-to:value,layer:value"` (for example `0-3:0.002,4-45:0.001`); layers without an entry keep the global value. ISTA: the early layers route flat and pay most of the distortion, so they get none. | `0-14:0` (ISTA) |
-| `FLE_MC_OVERLAP` | 0 (off) | Overlap of GPU cache hits and CPU misses. `1`: the hit chain is placed in the graph before the CPU chain and its first node is marked; the scheduler then fetches the inputs of the CPU part before queueing the hit chain, so the GPU computes the hits while the CPU computes the misses. `2` (qwen4exp, deepseek41): additionally the shared expert is moved into the early chain (deepseek41/ISTA: 5 % slower, use `1`). Read in `src/llama-graph.cpp`, `src/models/qwen4exp.cpp` and `ggml/src/ggml-backend.cpp`. | 2 |
-| `FLE_MOE_PCIE_FRAC` | 0 (off) | Experimental (Patch 47, needs `FLE_MC_OVERLAP`). Share (0-1) of the misses of every layer call that is copied over PCIe into a small ring of extra slots and computed by the GPU hit chain instead of the CPU. The copies are enqueued on the hit chain's stream after the routed ids are known and before the hit chain starts; ring entries stay valid until their slot is reused. Evidence line `[fle-pcie]` every 512 steps. | - |
-| `FLE_MOE_PCIE_RING` | 2 | Ring slots per layer for `FLE_MOE_PCIE_FRAC` (1-16), placed after the zero slot and paid out of the cache budget like the shadow slots. | - |
-| `FLE_UBATCH_LEND` | 0 (off) | Experimental (Patch 48, after Strata's prefill). `-ub` becomes the large prefill ubatch: compute buffers are sized for `FLE_UBATCH_SMALL`, and a decode call with at least `FLE_UBATCH_LEND_MIN` tokens frees whole expert-cache layers (last layer first) for the larger buffer, runs with `-ub`, and the next short call gives the memory back and refills those layers from host memory. A lent layer has no cache (the CPU computes all of its experts). Needs one cache device (not with `FLE_MOECACHE_DEV1_SHARE`). Evidence lines `[fle-lend]`. | - |
-| `FLE_UBATCH_SMALL` | 1024 | Ubatch outside a lend (`FLE_UBATCH_LEND`). | - |
-| `FLE_UBATCH_LEND_MIN` | 2048 | Tokens per decode call from which the large ubatch is used (`FLE_UBATCH_LEND`). | - |
-| `FLE_UBATCH_LEND_RESERVE_MIB` | 512 | Extra MiB lent on top of the measured compute-buffer difference (CUDA pool growth at the large ubatch). | - |
-| `FLE_UBATCH_PREFETCH` | 0 (off) | Patch 49, needs `FLE_UBATCH_LEND`. During a lend the context also lends a ring of staging slots, each the size of the largest expert tensor in host memory; while one expert weight split computes, a second stream on the same device copies the whole weights of the next splits into the free slots, and each split only copies slot -> compute buffer on the device (no wait for its routed ids). Evidence: `[fle-prefetch] ON` at start, `prefetch on` in the `[fle-lend]` line, prefetched weights in the `FLE_TRANSFER_TIMING` output. | 1 |
-| `FLE_UBATCH_PREFETCH_SLOTS` | 3 | Number of staging slots in the ring (1-8). One slot reaches only one split ahead; three cover one layer (up, gate, down). Each slot costs the size of the largest host expert tensor (FLE-IQ3_M: 450 MiB), lent from the expert cache together with the large ubatch. | 3 |
-| `FLE_MOECACHE_SHADOW` | off (set to enable) | Experimental. Adds `2 * max_inserts` shadow slots per layer, so that an upload never goes into an occupied slot. Costs one slot of VRAM per shadow slot and layer. | - |
-| `FLE_ADMIT_FREQUENT` | off (set to enable) | Experimental. Admit the most requested miss of a step instead of the latest. | - |
-| `FLE_BUDGET_GLOBAL` | off (set to enable) | Experimental. The unused insert budget of a layer carries over to the next layer instead of expiring. | - |
-| `FLE_MOECACHE_DEV1_SHARE` | 0 | Experimental. Percentage (0-100) of the layers whose cache lives on the second GPU; the distribution is per layer, never per expert. | - |
-| `FLE_MOECACHE_DEV1_BLOCK` | off (set to enable) | Experimental. Give the second GPU a contiguous block of layers instead of distributing round-robin (only with `FLE_MOECACHE_DEV1_SHARE`). Measured as irrelevant without peer access. | - |
-| `FLE_MOECACHE_PEER` | off | Experimental (`ggml/src/ggml-cuda/ggml-cuda.cu`). Request peer access for the second GPU's cache. | - |
-| `FLE_UPLOAD_ASYNC` | off | Experimental. Bundle the slot copies of a step. | - |
-| `FLE_UPLOAD_COUNTERS` | 0 (off) | Debug. Print upload counters every N calls. | - |
-| `FLE_SLOWDOWN_UPLOAD_US` | 0 | Experiment. Artificially lengthen every slot copy by this many microseconds to find out whether the copy time lies in series with decoding. | - |
-| `FLE_SLOWDOWN_TABLE_US` | 0 | Experiment. The same question for the table synchronization. | - |
-
-## Host-side experts: RAM and NVMe (`src/llama-moecache.cpp`, `src/llama-mmap.cpp`)
-
-For models whose CPU-side experts do not fit in RAM (DeepSeek-V4.1 ISTA: about 130 GB of experts plus a 111 GB Engram table on a
-120 GB machine). Measured on titan (RTX PRO 4500 32 GB, 120 GB DDR5, NVMe), 2026-11-01/02.
-
-| Variable | Default | Meaning | ISTA |
+| Variable | Default | What it does | Measured |
 |---|---|---|---|
-| `FLE_MOE_HOT_MLOCK_GB` | 0 (off) | With `FLE_MOE_PROFILE`: `mlock` the gate/up/down slices of the most-routed CPU-side experts (after the ones the GPU cache takes) up to this many GB, so prefill and other processes cannot evict them. Needs `RLIMIT_MEMLOCK` (for example `prlimit --memlock=unlimited:unlimited`). 30 GB: +8 %, 60 GB: +6 % over 30 GB, 75 GB: slower (the page cache for the rest gets too small). | 60 |
-| `FLE_MOE_HOT_BIAS` | 0 (off) | With `FLE_MOE_CACHE_BIAS > 0` and `FLE_MOE_HOT_MLOCK_GB`: smaller routing bonus for experts held in RAM by the hot lock, so the router prefers them over experts that would come from the SSD. Changes the output like the cache bias. | 0.02 |
-| `FLE_SCHED_ASYNC_CPU` | 0 (off) | Asynchronous CPU subgraphs: the scheduler copies the inputs of a CPU part into pinned host memory with async D2H copies, a host function on the GPU stream hands the part to a worker thread, and the next GPU part waits in the stream (host function) before its async H2D copies. No host synchronization per subgraph, the GPU runs ahead while the CPU computes the experts. Needs CUDA and pinned (`CUDA_Host`) buffers; otherwise the old path is taken. Exact (same results). Code in `ggml/src/ggml-backend.cpp` (`fle_async_*`). | 1 |
-| `FLE_ASYNC_PROF` | 0 (off) | With `FLE_SCHED_ASYNC_CPU`: every N jobs one line `[fle-async]` with the mean queue time (submit to start), compute time of the CPU part and the time the GPU stream waited for it. Diagnosis. | - |
-| `FLE_ASYNC_SPIN` | 0 (off) | With `FLE_SCHED_ASYNC_CPU`: the worker spins on its queue instead of sleeping (no wake-up per job, one busy core while a graph runs). Not measured yet. | - |
-| `FLE_MMAP_NO_RANDOM` | off | Keep the kernel read-ahead on the lazily loaded host expert ranges (no `MADV_RANDOM`). | 1 |
-| `FLE_MOE_WILLNEED_NOW` | off | When a layer's CPU experts are known, `madvise(WILLNEED)` the slices of the routed experts not in the GPU cache, on a worker thread. | 1 |
-| `FLE_MOE_WILLNEED_THREADS` | 1 | Workers for `FLE_MOE_WILLNEED_NOW`. 32 or 64 workers were slower (the request comes too late to help: an expert takes ~10 ms from NVMe, a layer ~0.6 ms). | - |
-| `FLE_MOE_WILLNEED_CHUNK_KB` | 0 (whole slice) | Cut the slices into chunks of this size for the workers. | - |
-| `FLE_ENGRAM_COLD` | off | deepseek41: `MADV_COLD` the Engram rows of the previous decode step. No gain measured (−3 %). | - |
-| `FLE_MOE_STORE_GB` | 0 (off) | Expert store (`src/llama-expertstore.cpp`, after Strata's ds4_store): a RAM arena of this size with one slot per expert (gate, up and down in one block). Experts are read whole with unbuffered reads (O_DIRECT, past the page cache), the hottest from `FLE_MOE_PROFILE` at load, the others when a layer routes to them (least-frequently-used slot given up, counts halved every 8192 layer calls). The CPU `mul_mat_id` reads them through `ggml_set_moe_data_callback`; the file and offset of each tensor come from `/proc/self/maps` (Windows since v1.2.5, experimental: `FILE_FLAG_NO_BUFFERING` reads, mapped file via `VirtualQuery`/`GetMappedFileName`). Failed reads are never published (the expert stays on the mmap path). Use instead of `FLE_MOE_HOT_MLOCK_GB`, not together. Evidence lines `[fle-store]`. | 90 |
-| `FLE_MOE_STORE_THREADS` | 8 | Unbuffered readers of the expert store. | - |
-| `FLE_MOE_DEFER` | 0 (off) | Expert deferral (deepseek41, needs the expert cache and `FLE_MC_OVERLAP`): the CPU part of a layer's routed experts is added one layer later, so the CPU computes layer L while the GPU computes layer L+1. Changes the output (KL 0.2 on ISTA) and was slower; experimental. Code in `src/llama-graph.cpp` (`fle_defer_*`) and `src/models/deepseek41.cpp`. | - |
-| `FLE_MOE_DEFER_N` | 0 | With `FLE_MOE_DEFER`: defer only the d weakest ranks of the CPU-side experts (KL 0.012 for d=1, 0.02 for d=2 on ISTA); still slower than no deferral. | - |
-| `FLE_MOE_STORE_UPLOAD` | 0 (off) | With `FLE_MOE_STORE_GB`: the large prefill ubatch uploads an expert the RAM store holds from there instead of from the mmap (the store reads past the page cache). 59 tokens: 9.1 s instead of 17.2 s. Exact. | - |
-| `FLE_MOE_STORE_CHUNK_KB` | 0 (whole reads) | Splits each expert read into chunks so several readers fetch one expert. Measured without gain (33.0-33.3 t/s against 33.1). | - |
-| `FLE_MOE_STORE_ASYNC` | 0 (off) | With `FLE_MOE_STORE_GB`: a missing expert's reads go to the front of the read queue and the layer does not wait for them; `mul_mat_id` computes the experts already in RAM first and waits per expert for the rest (Strata's order). Exact. | - |
-| `FLE_MOE_STORE_NOHUGE` / `FLE_MOE_STORE_POPULATE` | 0 | Expert store diagnosis: no transparent huge pages for the arena / pre-fault the arena at start. | - |
-| `FLE_MOE_STORE_READER_CPUS` | unset | Expert store: CPU list for the read threads (for example the SMT siblings `16-31`). | - |
-| `FLE_MOE_PREFETCH` | 0 (off) | deepseek41: the next layer's router on this layer's FFN input; with the expert store the predicted CPU-side experts of the next layer are read ahead (depth adapts to the hit rate). Costs one router per layer on the GPU. | - |
-| `FLE_MOE_FUSED_CPU` | 0 (off) | deepseek41: the CPU part of a layer's experts (gate, up, clamped SwiGLU, down) as one custom op. Same kernels and arithmetic as the four-op chain. On its own neutral on ISTA; with `FLE_MOE_POOL` the base of the pool path. | - |
-| `FLE_MOE_POOL` | 0 (off) | With `FLE_MOE_FUSED_CPU` (decode, up to 8 tokens): the fused op hands its work to an own worker pool pinned to physical cores, spinning between layers, jobs of (expert, 64 rows) claimed with one atomic ticket, two sections a layer (after Strata's lane pool, MIT); the async worker runs that CPU subgraph on one ggml thread. ISTA IQ2_XXS exact with the expert store: 31 instead of 29.5 tok/s. Since v1.2.5 the workers sleep after 20 ms without work (an idle server no longer holds the cores). | 1 (ISTA) |
-| `FLE_MOE_POOL_CPUS` | `2-15` | Cores of the pool (one worker each); the first two stay free for the threads that feed the GPU. | - |
-| `FLE_MOE_POOL_RESTORE` | 16 | ggml threads for the CPU subgraphs without the fused op while the pool is on. | - |
-| `FLE_MMID_PROF` | 0 (off) | Every N calls of the CPU `mul_mat_id` (thread 0) one line `[fle-mmid]` with the phase times (routing/observer/store, experts in RAM, experts still being read) and time and GB/s by number of CPU-side experts. Diagnosis. | - |
-| `FLE_ENGRAM_PREVIEW` | 0 (off) | deepseek41: after each decode step, read the Engram rows of the k most likely next tokens ahead. Measured neutral. | - |
-| `FLE_MOE_SHARE_EVERY` | 0 (off) | Every N layer calls one line `[fle-moe-share]` with the share of routed experts served by the GPU cache (decode). Diagnosis. | - |
-| `FLE_IQ512` | 1 (on where built) | AVX-512 VNNI paths (built with AVX512BW+VNNI+BMI2, IQ2 also VPOPCNTDQ+VL, e.g. `-march=native` on Zen 4/5) for the CPU dot products IQ1_S, IQ1_M, IQ2_XXS and IQ2_XS x Q8_K, after Strata's kernels (MIT). Same integer sums; KL against the AVX2 path at noise level. `0` takes the AVX2 path. Code in `ggml/src/ggml-cpu/arch/x86/quants.c`. | 1 |
+| `FLE_RS_WINDOW` | off | The short causal convolution in front of each Gated DeltaNet layer keeps its last inputs as a window addressed by an index input, so rolling a rejected draft back moves the index instead of copying buffers. Needs `--parallel 1`. Prints one line at start saying whether it took effect. | +1.2 % (+1.1…+1.3), k28; recurrent state 35.6 instead of 90 MiB; bit-identical on 30 of 30 tasks |
+| `FLE_GDN_REPLAY` | off | Needs `FLE_RS_WINDOW`. Instead of one recurrent-state snapshot per drafted position, a verify round keeps one saved level and replays the accepted tokens through the DeltaNet update. Only layers on CUDA; layers on the CPU keep snapshots. | +4.6 % (+4.5…+4.7) over the window, k30; recurrent state 348 instead of 2,340 MiB; bit-identical 30/30. With less VRAM the freed memory matters more: +23.7 % at 20 GB (k32), +16.6 % at 16 GB (k33) |
+| `FLE_RS_SEQ` | off | `<n>`: deeper recurrent rollback than the draft model needs, so n-gram drafts of up to n tokens roll back through the recurrent state instead of a checkpoint. Cheap with `FLE_GDN_REPLAY`, expensive with snapshots. | not in the production setup |
 
-**ISTA recipe** (DeepSeek-V4.1-Flash-1017 GSQ-RCO IQ2_XXS, one 32 GB GPU, 120 GB RAM), measured 2026-11-02 on prompts outside
-the expert profile: 26.8 tok/s decode exact, **29.7 tok/s with the standard bonus** (0.1 on layers 15-42, Max 2026-11-02), prefill
-74–83 tok/s:
+## Speculative decoding
 
-```bash
-FLE_MOE_CACHE_BUDGET_FIT=1 FLE_MOE_CACHE_BUDGET_MIB=22000 FLE_MOE_PROFILE=<file> FLE_MOE_HOT_MLOCK_GB=60 \
-FLE_MMAP_NO_RANDOM=1 FLE_MOE_WILLNEED_NOW=1 FLE_MC_OVERLAP=1 FLE_SCHED_ASYNC_CPU=1 \
-FLE_MOE_CACHE_BIAS=0.1 FLE_MOE_CACHE_BIAS_LAYERS=0-14:0 \
-FLE_UBATCH_LEND=1 FLE_UBATCH_PREFETCH=1 FLE_UBATCH_PREFETCH_SLOTS=3 FLE_PREFILL_LEAN=1 FLE_HC_FUSED=1 \
-prlimit --memlock=unlimited:unlimited llama-server -m <ISTA-00001-of-00006.gguf> -c 16384 --jinja -ngl 99 -cmoe -t <physical cores> \
-  -ctk q8_0 -ctv q8_0 -fit on --fit-target 1115 --moe-expert-cache-inserts 1 -b 4096 -ub 4096
-```
+| Variable / flag | Default | What it does | Measured |
+|---|---|---|---|
+| DSpine model type | - | Loads DSpine block-diffusion draft heads (for example `tencent/Qwen3.8-27B-DSpine-b16` as GGUF) with `--spec-type draft-dflash -md <head>.gguf`. Adds the GGUF conversion in `conversion/qwen.py`. | DSpine b16, n-max 15: +34.4 % (+25.9…+43.2) over DFlash2, k6; +19.0 % at temperature 1.0, k7 |
+| `--spec-type ngram-mod` | - | FLE's n-gram table v2: tagged buckets (4 ways), age-based replacement instead of the global reset at 25 % occupancy, same flags as upstream. **Always active with `ngram-mod`**, there is no switch back to upstream's table. | +19.8 % with a pre-warmed table at temperature 1.0, k10 |
+| `FLE_NGRAM_MOD_FILE` | off | `<file>`: the n-gram table is loaded from this file at start (warm start) and saved to it in the background (written to `<file>.tmp`, then renamed). A file for another `n_match` or size is ignored. A warm table makes benchmark runs depend on what ran before: measure with a cold or frozen table. | - |
+| `FLE_DRAFT_TEMP` | 1 | Factor on the target's temperature for the draft head's own sampling with `--spec-draft-sampling probabilistic`. | 0.7: +3.5 % (−3.3…+11.4), unclear, k44/k66 |
+| `FLE_DFT_ROLLBACK` | off | `1`: after every verify round, remove the rows of rejected positions from the draft head's KV cache (after upstream PR #32045). | −0.5 %, noise, k65 |
+| `LLAMA_DFLASH_DEV` | off | Upstream #31506 (cherry-picked): copy the hidden features for DFlash/DSpine with device copies instead of through the host. Stays on the host path while `FLE_MITSCHNITT` records. | +0.8 %, noise, k64 |
+| `FLE_MITSCHNITT` | off | `<file>`: records the target's hidden states and verify outcomes of accepted rows for training a draft head on your own traffic (format in `common/speculative.cpp`). A path that cannot be opened is reported and the server runs without recording. **Records your prompts' hidden states: only use it on traffic you may store.** | −1.7 % (−1.8…−1.6) while recording, k39 |
+| `FLE_MITSCHNITT_ALLES` | off | With `FLE_MITSCHNITT`: also write rows of chunks without a verify step (prefill). | - |
+| `FLE_MITSCHNITT_MAX_GB` | off | With `FLE_MITSCHNITT`: stop recording when the file reaches this size. | - |
 
-The bias changes the output only in the layers that get it. Measured KL against an unbiased run (two unbiased runs differ by
-0.004–0.005; the quantization itself is about 0.17): bias 0.1 on layers 0-14 alone 0.020, on 15-28 alone 0.0066, on 29-42 alone
-0.0057, on 15-42 0.0084 (+0.003, about 1.7 % of the quantization error, accepted as standard). Bias 0.1 on all layers gives
-35–36 tok/s at KL 0.021 and is not the standard. `FLE_MOE_CACHE_BIAS=0` gives the exact 26.8. The DSpark drafter no longer pays
-with a 22 GB cache (its memory comes out of the cache).
+## Sampler
 
-## MoE routing at decode time (qwen4exp)
+| Variable | Default | What it does | Measured |
+|---|---|---|---|
+| `FLE_SAMPLE_TOPK` | off | `1`: when no sampler before top-k needs the full vocabulary (no penalties, no DRY, no logit bias, no mirostat, top-k between 1 and 128), build only the top-k candidates in one pass over the logits, skipping blocks of 64 whose maximum is below the current k-th best. A grammar still checks the drawn token and falls back to the full list on rejection; while a reasoning budget forces tokens, the full list is used. | Decode +2.6 % (+1.9…+3.1) agent, +2.2 % (+1.6…+3.2) code, k77; host time per 16-wide verify round 0.82 → 0.29 ms; outputs bit-identical, tool calls included |
+| `FLE_SAMPLE_ZEIT` | off | `<n>`: log where the sampler's host time goes, every n calls (diagnostics). | - |
+| `FLE_RUNDEN_ZEIT` | off | `1`: log the host time per verify round, averaged over 200 rounds (`<n>` > 1: every n rounds). Diagnostics. | - |
 
-These are environment overrides of the `--moe-active-*` flags below; the environment wins over the flag.
+## CUDA
 
-| Variable | Default | Meaning | Ref. |
-|----------|---------|---------|------|
-| `FLE_MOE_K1` | flag value (0 = trained k) | Routed experts per token while decoding. | - |
-| `FLE_MOE_K2` | flag value | Reference set of the renormalisation denominator (default: the trained k). | - |
-| `FLE_MOE_SCALE` | flag value (0 = off) | Fixed factor on the renormalised expert weights. | - |
-| `FLE_MOE_K_MAXTOK` | flag value (8) | Ubatches of at most this many tokens use the reduced routing; prefill keeps the trained routing. | - |
-| `FLE_MOE_KL` | flag value | Per-layer k, `"from-to:k,layer:k"`. | - |
+| Variable | Default | What it does | Measured |
+|---|---|---|---|
+| `FLE_GRAPH_FORMEN` | off | `1`: one CUDA graph per batch shape instead of one graph that is rebuilt when the shape changes (draft, verify and prefill alternate). Technique from Infernix. | +0.5 %, noise, k72 |
+| `FLE_IQ4_MMA` | off | `1`: Tensor Core verify kernel for IQ4_XS, Q4_K and Q5_K at 9 to 16 columns (weights stay packed, F16 activations, `mma.sync m16n8k16`, cp.async double buffering, deterministic split-K). Technique from Infernix. KLD is slightly better because activations stay in F16. | **slower in decode**: −7.1 % (−15.1…−0.9) agent, k73c; KLD −0.0015 / −0.0004 / −0.0003, k76. Leave off |
+| `FLE_IQ4_MMA_Q6` | off | With `FLE_IQ4_MMA`: the same kernel for Q6_K. Slower than the stock path on our card. | - |
 
-## MTP speculative decoding and prefill
+## What we run
 
-| Variable | Default | Meaning | Ref. |
-|----------|---------|---------|------|
-| `FLE_MTP_VOCAB` | off (unset) | File with one token id per line (`#` comments allowed): the vocabulary list for the MTP head. The head is evaluated only for these tokens; EOG, control, user-defined and unknown tokens are always added. A missing or unreadable file switches the list off. Also enables `FLE_MTP_ARGMAX` unless that is set explicitly. | `<file>` |
-| `FLE_MTP_VOCAB_N` | whole list | Use only the first N entries of the list file. | 32768 |
-| `FLE_MTP_ARGMAX` | on if `FLE_MTP_VOCAB` is set, else off | Greedy draft by a single block-maximum pass instead of the sampler chain (same token; for exactly equal logits the smallest id). Needs `--no-spec-draft-backend-sampling`. | - |
-| `FLE_MTP_PENALTIES` | on | Apply the repetition, frequency and presence penalties of the main sampler to the draft logits as well, so that fewer drafted tokens are penalized away by the main path. Changes only which tokens are drafted, not the output. `0` turns it off. Needs `--no-spec-draft-backend-sampling`. | 1 |
-| `FLE_MTP_PSTOP` | off (0) | Adaptive draft length: end the draft when the product of the draft probabilities falls below `p` (0 < p < 1). Greedy path only. | - |
-| `FLE_PREFILL_LEAN` | off | Lean prefill: caps the physical ubatch of the MTP context (`FLE_MTP_UBATCH`) so that its compute buffer stays small and `-fit` can measure it, and computes the QSA indexer of large ubatches in token blocks (`FLE_QSA_CHUNK`) so that one `[n_kv, n_batch]` mask less is allocated. | 1 |
-| `FLE_MTP_UBATCH` | 512 | Ubatch cap of the MTP context with `FLE_PREFILL_LEAN`. | - |
-| `FLE_QSA_CHUNK` | 256 | Token block size of the QSA indexer with `FLE_PREFILL_LEAN` (minimum 16). | - |
-| `FLE_HC_FUSED` | off | `1`: fused kernels for the hyper-connection gate mean and combine instead of a chain of primitive ops (bit-identical). | 1 |
-| `FLE_HC_LR` | off | Low-rank hyper-connection kernels for small batches (needs `FLE_HC_FUSED`; Q8_0 weights, not bit-identical to the mul_mat chain). | - |
-| `FLE_GDN_L2` | reference | `old`: use `ggml_l2_norm` in the gated delta net instead of the reference normalisation, to measure both variants in one build. | - |
-| `FLE_DSPARK_CTX` | - | Experimental. `zero`: use zeroed instead of captured context for the DSpark drafter. | - |
-| `FLE_DSPARK_AUX` | off | Experimental. Capture auxiliary layer features for the DSpark drafter. | - |
-| `FLE_PLE_NVME` | off | Comma-separated list of tensor name fragments (matched as substrings) to keep on disk instead of pulling them into RAM with `MAP_POPULATE`. Intended for huge lookup tables with small rows (per-layer token embeddings), for which read-ahead and residency are both wrong. | - |
-
-## Server (`tools/server`)
-
-| Variable | Default | Meaning | Ref. |
-|----------|---------|---------|------|
-| `FLE_SLOT_EARLY_SAVE` | off | `1`: when a slot is freed its content is saved into the host-RAM prompt cache immediately, instead of when a later request needs the slot. | 1 |
-| `FLE_CACHE_GUARD_SLOT` | unset | Slot id whose prompt-cache entries are evicted last. Without the guard, short automated prompts can evict a long interactive context just because it is the oldest entry. | 0 |
-| `FLE_CKPT_TAIL` | n_ubatch | Distance (tokens) from the end of the prompt of the second-to-last context checkpoint. By default it equals `n_ubatch`, which with a large `-ub` makes a follow-up request with the same prefix recompute up to `n_ubatch` tokens. | 512 |
-| `FLE_SPEC_ADAPTIVE` | off (set to enable) | Experimental. Adaptive speculation gate: skip the draft during cold accept streaks, before the expensive verify. | - |
-| `FLE_SPEC_COLD_N` | 4 | With `FLE_SPEC_ADAPTIVE`: length of the cold streak that triggers skipping. | - |
-| `FLE_SPEC_SKIP_M` | 8 | With `FLE_SPEC_ADAPTIVE`: number of steps to skip. | - |
-| `FLE_SPEC_PREFILL_SKIP` | off | Experimental. Skip the draft-context prefill while no slot is generating. | - |
-| `FLE_PHASE_CLOCK` | 0 (off) | Debug. Print a split report (draft / verify / process) every N target decodes. | - |
-
-## Sampling and loading
-
-| Variable | Default | Meaning | Ref. |
-|----------|---------|---------|------|
-| `FLE_SAMPLER_NO_PREFILTER` | off (set to disable) | Disable the exact top-k prefilter of the sampler (to compare against the old path). | - |
-| `FLE_GGUF_LENIENT_OFFSETS` | off (set to enable) | Instead of rejecting a GGUF whose tensor offsets differ from the expected layout, recompute the offsets cumulatively and warn (for files assembled by other tools that omitted the per-row metadata of the `IQ*_KT` types). | - |
-| `FLE_PAGER_VRAM_MB`, `FLE_PAGER_VRAM_MB1` | off | Enable the CUDA pager buffer type with the given VRAM pool (MiB) on device 0 / 1; tensors are bound with `-ot <pattern>=PAGER` (`PAGER1` for the second device). See the pager section. | - |
-
-## Diagnostics and debug
-
-None of these changes results unless noted. They are meant for developers.
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `FLE_TIME_PROFILE` | off | Per-node-name time profile through the eval callback; value = report interval in calls (default 20000 when set but empty). |
-| `FLE_NAN_GUARD`, `FLE_NAN_GUARD_CAP` | off, 3 | Report the first tensor that contains NaN together with its inputs; cap on the number of reports. |
-| `FLE_TRACE_WRITE=<file>` / `FLE_TRACE_READ=<file>` | off | Two-run tracer: one known-good run writes name and L2 norm of every F32 tensor; a second run compares step by step and stops cleanly at the first deviation. |
-| `FLE_TRACE_TOLERANCE` | 0.02 | Relative deviation above which the tracer counts a break. |
-| `FLE_TRACE_DISTRIBUTION` | off | Collect all deviations instead of stopping at the first break. |
-| `FLE_TRACE_CTX` | 262144 | Context budget used for the deviation check. |
-| `FLE_DUMP_MOE`, `FLE_DUMP_MOE_CAP` | off, 4000 | Dump MoE top-k selections; cap on the number of dumps. |
-| `FLE_DUMP_ROUTER_W` | off | Print the router weights per layer (`[ROUTER-W] <layer> w1,...,wk`). |
-| `FLE_DUMP_FFN_DENSITY` | off | Activation density statistics of the MoE FFN intermediates (cap via `FLE_DUMP_MOE_CAP`). |
-| `FLE_DUMP_MTP`, `FLE_DUMP_MTP_CAP` | off, 12 | Dump MTP tensors; cap on the number of dumps. |
-| `FLE_DSPARK_AUX_DUMP`, `FLE_DSPARK_AUX_TRACE` | off | Dump / trace the DSpark auxiliary features. |
-| `FLE_CAPTURE_DIAG` | off | Always print the layer-capture diagnostic (otherwise only when it fails). |
-| `FLE_REUSE_REASON` | off | Count why the compute graph could not be reused. |
-| `FLE_SPEC_TRACE` | off | Trace KV-cache slot searches and speculative positions. |
-| `FLE_SPEC_DEBUG`, `FLE_SPEC_DEBUG_DUMP_DIR` | off | EAGLE3/MTP draft debug output. With `FLE_SPEC_DEBUG_DUMP_DIR=<dir>` the first engine calls (tokens and aux features) are additionally written to `<dir>/eagle3_engine_call<N>.bin`; without the directory nothing is written. |
-| `FLE_SPEC_FEATDIAG` | off | Count non-finite values in the captured features. |
-| `FLE_SPEC_TIMINGS` | off | Time shares of the draft step. |
-| `FLE_KLD_DUMP=<file>` | off | `llama-perplexity`: write KL divergence and delta-p per token for paired comparisons. |
-| `FLE_META_LEAF_DEBUG`, `FLE_META_MM_DEBUG`, `FLE_META_SPLIT_DEBUG` | off | Print split-state decisions of the meta backend (value = maximum number of lines). |
-| `FLE_SPLIT_EVENTS` | off | Experimental (`ggml/src/ggml-backend.cpp`). Use stream events as markers for the pre-queued expert copies of the next layer. |
-| `FLE_TRANSFER_TIMING` | 0 (off) | Wall-clock time around the synchronization points between backends; value = report interval. |
-| `GGML_BACKEND_BUF_TRACE` | off | Log every backend buffer allocation with size and buffer type (`ggml/src/ggml-backend.cpp`). |
-| `GGML_CUDA_POOL_TRACE` | off | Log every CUDA pool allocation with pointer, requested and actual size (`ggml/src/ggml-cuda/common.cuh`). |
-
-## CUDA hybrid pager (`ggml/src/ggml-cuda/fle/pager_buffer.cu`)
-
-The pager is a research path: stacked expert tensors live in pinned host memory, a compact VRAM pool serves as staging
-target, and misses are either staged over PCIe or computed on the CPU. It is off unless `FLE_PAGER_VRAM_MB` is set. All
-pager variables are **experimental** unless marked otherwise; none of them is part of the reference configuration.
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `FLE_PAGER_VRAM_MB`, `FLE_PAGER_VRAM_MB1` | off | VRAM pool size (MiB) for device 0 / 1; enables the pager. |
-| `FLE_PAGER_REGIONS`, `FLE_PAGER_REGIONS1` | 160 | Number of regions of the pool (per device). |
-| `FLE_PAGER_SCRATCH_MB`, `FLE_PAGER_SCRATCH_MB1` | 2048 | Scratch area (MiB), capped at half of the pool. |
-| `FLE_PAGER_SWAP_MB`, `FLE_PAGER_SWAP_MB1` | 0 | Swap arena (MiB) at the end of the pool, capped at 25 %. |
-| `FLE_PAGER_CPU_MISS` | off | Compute missed experts on the CPU instead of staging them over PCIe (only the activation crosses the bus). |
-| `FLE_PAGER_CPU_MISS_FREQ_T` | off | Hybrid mode with `FLE_PAGER_CPU_MISS`: experts requested at least this often are staged to the GPU, colder ones run on the CPU. |
-| `FLE_PAGER_CPU_MISS_KEEP_STAGE` | off | Debug. Stage and override at the same time. |
-| `FLE_PAGER_CPU_THREADS` | 0 (default pool) | Thread count of the CPU miss path. |
-| `FLE_PAGER_SPLIT`, `FLE_PAGER_SPLIT_MIN_N` | off, 64 | Split the misses between the PCIe and CPU branches by measured throughput; minimum samples per side. |
-| `FLE_PAGER_ASYNC_STAGE` | off | Stage misses on a dedicated copy stream. |
-| `FLE_PAGER_BOUNCE` | off | Force a bounce copy through a pinned buffer. |
-| `FLE_PAGER_PREFETCH` | off | Prefetch the experts of the last token during the current compute. |
-| `FLE_PAGER_EVICT_FREQ` | off | Frequency-aware eviction (protects recurrently hot experts). |
-| `FLE_PAGER_DEVICE_REMAP` | off | Remap expert ids with a device kernel instead of a host round trip. |
-| `FLE_PAGER_NO_UVA` | off | Abort instead of silently reading host memory over UVA. |
-| `FLE_PAGER_NO_PIN`, `FLE_PAGER_MMAP_FILE` | off | Use pageable instead of pinned host memory / back the host tier with a file. |
-| `FLE_PAGER_HOST_REGISTER`, `FLE_PAGER_HOST_REGISTER_MB` | off | Register existing host memory with CUDA (optionally only the first N MiB). |
-| `FLE_PAGER_BW` | off | Debug. Bandwidth statistics of the PCIe and CPU paths. |
-| `FLE_PAGER_STAT_EVERY` | 1024 | Debug. Statistics window in calls. |
-| `FLE_PAGER_RESET_FILE` | unset | Debug. If this file exists at a statistics point it is removed and the counters are reset (to drop warm-up). |
-| `FLE_PAGER_FREQ_DUMP`, `FLE_PAGER_TRACE_FILE` | off | Debug. Dump the expert frequency distribution / the routing trace for offline simulation. |
-| `FLE_PAGER_PHASES`, `FLE_PAGER_LEDGER`, `FLE_PAGER_WALKTHROUGH`, `FLE_PAGER_WALKTHROUGH_DECODE` | off | Debug. Phase timing, transfer ledger, and step-by-step comparison of the pager against the unpaged result. |
-| `FLE_PAGER_VERIFY`, `FLE_PAGER_VERIFY_CAP`, `FLE_PAGER_VALIDATE`, `FLE_PAGER_IDSYNC`, `FLE_PAGER_DUMP_SHAPES`, `FLE_PAGER_S3_DEBUG` | off | Debug. Consistency checks and dumps of the staging path. |
-| `FLE_PAGER_PROCYON`, `FLE_PAGER_PROCYON_ACC`, `FLE_PAGER_PROCYON_TOPN`, `FLE_PAGER_PROCYON_DEBUG`, `FLE_PROCYON_RAW_BIAS` | off | **Obsolete.** Routing prediction for the next layer; measured prediction accuracy was close to chance, so the path is kept only for reproducibility and has known multi-GPU issues. |
-
-## Tools
-
-| Variable | Used by | Meaning |
-|----------|---------|---------|
-| `FLE_BENCH_CORPUS`, `FLE_BENCH_M` (1), `FLE_BENCH_STEPS` (300), `FLE_BENCH_WARM` (150), `FLE_BENCH_PREFILL` (512), `FLE_BENCH_STRIDE` (6000) | `fle-step-bench` | Cost curve of verifying m tokens per step with the expert cache. |
-| `FLE_KB_ITERS` (300), `FLE_KB_TOKENS` (1), `FLE_KB_TYPES` | `fle-kernel-bench` | Iterations, tokens per call and quantization types of the expert kernel benchmark. |
-
-## Command line flags added by the fork
-
-| Flag | Meaning |
-|------|---------|
-| `--moe-expert-cache N` | GPU cache slots per host-resident MoE expert layer; 0 = disabled (default). Not needed when `FLE_MOE_CACHE_BUDGET_MIB` is set. Env: `LLAMA_ARG_MOE_EXPERT_CACHE`. |
-| `--moe-expert-cache-inserts N` | Maximum expert uploads per layer and decode step (default 2). `0` = no uploads while decoding: the cache stays as the profile filled it (since v1.2.5; before, 0 meant the default 2). With a good profile `0` is faster: ISTA IQ2_XXS exact 37.7 instead of 33.9 tok/s (A3B3). Env: `LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS`. |
-| `--moe-cache-bias G` | Routing bonus for cached experts, see `FLE_MOE_CACHE_BIAS` (default 0). |
-| `--moe-active-experts K1[,K2]`, `--moe-active-scale S`, `--moe-active-max-tokens N`, `--moe-active-layers SPEC` | Reduced routing while decoding (qwen4exp); see the routing table above. |
-| `-lm`, `--load-mode none` | `--load-mode` is upstream; the reference configuration uses `none`: tensors are read into allocated host buffers instead of being memory-mapped (no mmap, mlock or direct I/O). Only without mmap can the backend place CPU-resident expert weights in its own (pinned) host buffers, which is what makes cache uploads and CPU/GPU overlap fast. |
-| `-cmoed`, `--spec-draft-cpu-moe` (`--cpu-moe-draft`) | Keep all MoE weights of the draft model (for example the MTP head) on the CPU. `-ncmoed N` does the same for the first N layers. |
-| `--no-spec-draft-backend-sampling` | Disable offloading of draft sampling to the backend (default: enabled). Required for the host-side draft paths `FLE_MTP_ARGMAX` and `FLE_MTP_PENALTIES`, which are skipped while a backend sampler chain is active. |
-| `--spec-type draft-mtp`, `-md FNAME` | Upstream flags used to run MTP speculative decoding with a separate MTP head file. |
-
-### `--fit-target` and the cache budget
-
-`-fit` (on by default) sizes the context and layer placement so that `--fit-target MiB[,MiB...]` of free memory remains
-on each device. The expert cache is allocated after the fit, from whatever the fit leaves free. Without help the fit
-would therefore fill the memory the cache needs.
-
-With `FLE_MOE_CACHE_BUDGET_FIT=1` and `FLE_MOE_CACHE_BUDGET_MIB=B`, the budget `B` is added to the margin of device 0
-(`fit_target[0] += B`; the added amount is logged). `--fit-target` then keeps its meaning of "free memory besides the
-cache", and the cache is guaranteed to find its budget free. Without `FLE_MOE_CACHE_BUDGET_FIT` the margin is exactly
-`--fit-target`. Devices are not split: the cache of a layer sits next to its router, which is device 0 in the usual
-single-GPU setup.
-
-## Deprecated aliases
-
-The following pre-release names are still read when the new name is unset. Use the new names in new scripts.
-
-| Deprecated name | Current name |
-|-----------------|--------------|
-| `FLE_SLOT_FRUEH` | `FLE_SLOT_EARLY_SAVE` |
-| `FLE_PREFILL_SCHLANK` | `FLE_PREFILL_LEAN` |
-| `FLE_MTP_STRAFEN` | `FLE_MTP_PENALTIES` |
-| `FLE_CACHE_SCHUTZ_SLOT` | `FLE_CACHE_GUARD_SLOT` |
-| `FLE_MOECACHE_SCHATTEN` | `FLE_MOECACHE_SHADOW` |
-| `FLE_UEBERGANGSZEIT` | `FLE_TRANSFER_TIMING` |
-| `FLE_BREMSE` | `FLE_SLOWDOWN_UPLOAD_US` |
-| `FLE_BREMSE_TABELLE` | `FLE_SLOWDOWN_TABLE_US` |
-| `FLE_UPLOAD_ZAEHLER` | `FLE_UPLOAD_COUNTERS` |
-| `FLE_ZULASSUNG_HAEUFIG` | `FLE_ADMIT_FREQUENT` |
-| `FLE_MOECACHE_DEV1_ANTEIL` | `FLE_MOECACHE_DEV1_SHARE` |
-| `FLE_NAN_WACHE`, `FLE_NAN_WACHE_CAP` | `FLE_NAN_GUARD`, `FLE_NAN_GUARD_CAP` |
-| `FLE_SPUR_SCHREIBEN`, `FLE_SPUR_LESEN`, `FLE_SPUR_TOLERANZ`, `FLE_SPUR_VERTEILUNG`, `FLE_SPUR_KONTEXT` | `FLE_TRACE_WRITE`, `FLE_TRACE_READ`, `FLE_TRACE_TOLERANCE`, `FLE_TRACE_DISTRIBUTION`, `FLE_TRACE_CTX` |
-| `FLE_ZEITPROFIL` | `FLE_TIME_PROFILE` |
-| `FLE_SPEC_ZEITEN` | `FLE_SPEC_TIMINGS` |
-| `FLE_REUSE_GRUND` | `FLE_REUSE_REASON` |
-| `FLE_PAGER_PHASEN`, `FLE_PAGER_BILANZ`, `FLE_PAGER_DURCHZUG`, `FLE_PAGER_DURCHZUG_DECODE`, `FLE_PROCYON_BIAS_ROH` | `FLE_PAGER_PHASES`, `FLE_PAGER_LEDGER`, `FLE_PAGER_WALKTHROUGH`, `FLE_PAGER_WALKTHROUGH_DECODE`, `FLE_PROCYON_RAW_BIAS` |
-| `GGML_BACKEND_BUF_BELEG`, `GGML_CUDA_POOL_BELEG` | `GGML_BACKEND_BUF_TRACE`, `GGML_CUDA_POOL_TRACE` |
-
-Two value aliases are accepted as well: `FLE_GDN_L2=alt` (now `old`) and `FLE_MOE_CACHE_BATCH=aus` (now `off`).
+Katy in production (and Kate, same build): `FLE_RS_WINDOW=1 FLE_GDN_REPLAY=1 LLAMA_DFLASH_DEV=1 FLE_SAMPLE_TOPK=1`,
+optionally `FLE_NGRAM_MOD_FILE`. The command line is in the [README](../../README.md#kate-and-katy).

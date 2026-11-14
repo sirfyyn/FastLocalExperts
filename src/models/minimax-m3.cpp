@@ -23,7 +23,12 @@ void llama_model_minimax_m3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,         hparams.indexer_top_k);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,    hparams.indexer_block_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,  hparams.indexer_local_blocks);
-    msa_p = { (int) hparams.indexer_block_size, (int) hparams.indexer_top_k, (int) hparams.indexer_local_blocks };
+
+    msa_p = {
+        /*.blk          =*/ (int) hparams.indexer_block_size,
+        /*.topk_blocks  =*/ (int) hparams.indexer_top_k,
+        /*.local        =*/ (int) hparams.indexer_local_blocks,
+    };
 
     GGML_ASSERT(hparams.indexer_block_size > 0); // avoid div by zero
 
@@ -191,7 +196,7 @@ ggml_tensor * llama_model_minimax_m3::graph::build_attn_msa_fa(
 
     ggml_tensor * o = ggml_flash_attn_ext(ctx0, q, k, v, mask, kq_scale,
                                           hparams.f_max_alibi_bias, 0.0f);
-    ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+    ggml_prec_set_acc(o, GGML_PREC_F32);
     cb(o, "msa_fattn", il);
 
     // [D, Gp, R, C] -> [D, Gp, C, R] -> [n_embd, T]
@@ -353,12 +358,12 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ik, inp_attn->get_k_idxs_idx(), il));
                 ggml_tensor * ik_kv = mctx_idx->get_k(ctx0, il);
 
-                if (inp_attn->self_k_rot) {
-                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot);
-                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+                if (inp_attn->self_k_rot[il]) {
+                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot[il]);
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
                 }
-                if (inp_attn->self_v_rot) {
-                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+                if (inp_attn->self_v_rot[il]) {
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
                 }
 
                 // Main branch: store K/V, take cache views
@@ -389,7 +394,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     ggml_tensor * iq4 = ggml_reshape_4d(ctx0, iq, n_idx_dim, Hd, 1, ns);
                     ggml_tensor * sc  = ggml_mul_mat(ctx0,
                             ggml_reshape_4d(ctx0, ikp, n_idx_dim, n_ps, 1, ns), iq4);
-                    ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+                    ggml_prec_set_acc(sc, GGML_PREC_F32);
                     // unmapped positions come out -inf, so they can never rank into the top-k
                     sc = ggml_add_inplace(ctx0, sc,
                             ggml_reshape_4d(ctx0, msa->pos_mask, n_ps, 1, 1, ns));
@@ -471,7 +476,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         ggml_tensor * sc = ggml_mul_mat(ctx0, ikp,
                                 ggml_reshape_2d(ctx0, iq_s, n_idx_dim, Hd*n_tps));
                         // indexer scores run in F32
-                        ggml_mul_mat_set_prec(sc, GGML_PREC_F32);
+                        ggml_prec_set_acc(sc, GGML_PREC_F32);
                         sc = ggml_reshape_3d(ctx0, sc, n_ps, Hd, n_tps);
                         // unmapped positions (holes, padding, empty cells) come out -inf
                         sc = ggml_add_inplace(ctx0, sc, pm_s);
@@ -521,8 +526,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                         cur = ggml_concat(ctx0, cur, outs[st], 1);
                     }
                 }
-                if (inp_attn->self_v_rot) {
-                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot);
+                if (inp_attn->self_v_rot[il]) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot[il]);
                 }
                 cb(cur, "kqv_out", il);
                 if (model.layers[il].wo) {
@@ -545,9 +550,9 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
         if ((uint32_t) il < hparams.n_layer_dense_lead) {
             // leading dense FFN (swigluoai)
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
                     NULL,
                     LLM_FFN_SWIGLU_OAI_MOE, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
@@ -563,14 +568,17 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     LLM_FFN_SWIGLU_OAI_MOE, hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il, nullptr, nullptr,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s);
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert (swigluoai)
             ggml_tensor * ffn_shexp = build_ffn(cur,
-                    model.layers[il].ffn_up_shexp,   NULL, NULL,
-                    model.layers[il].ffn_gate_shexp, NULL, NULL,
-                    model.layers[il].ffn_down_shexp, NULL, NULL,
+                    model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
+                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                     NULL,
                     LLM_FFN_SWIGLU_OAI_MOE, LLM_FFN_PAR, il);
             cb(ffn_shexp, "ffn_shexp", il);
@@ -598,6 +606,4 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

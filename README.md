@@ -4,7 +4,7 @@
 
 # FLE · Fast Local Experts
 
-**DeepSeek V4.1 Flash (763B) at about 50 tokens/s and an 89 GB Qwen model at ~90 tokens/s, each on one 32 GB GPU.**
+**DeepSeek V4.1 Flash (763B) at about 50 tokens/s, an 89 GB Qwen model at ~90 tokens/s and the dense 27B Kate at about 155 tokens/s, each on one 32 GB GPU.**
 
 *Best performance measured on Linux.*
 
@@ -18,6 +18,8 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 [PDF](https://sirfyyn.github.io/FastLocalExperts/fle-paper.pdf) ·
 [Model files](https://huggingface.co/sirfyyn/Qwen3.8-Flash-Next-FLE-GGUF) ·
 [Rin (DeepSeek V4.1 Flash)](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-FLE-GGUF) ·
+[Kate (27B)](https://huggingface.co/sirfyyn/Kate-Qwen-27B-GGUF-SpedUp-Abliterated) ·
+[Kate and Katy](#kate-and-katy) ·
 [Quick start](#quick-start) ·
 [Films](#making-rhea-fast-eight-short-films) ·
 [Website](https://sirfyyn.de/en/fle/) ·
@@ -36,7 +38,50 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 
 </div>
 
+## Kate and Katy
+
+> **v1.3.0 is the dense line.** It is upstream llama.cpp `344846b4f` (2026-10-30) plus the engine changes that run
+> Katy and Kate, two Qwen3.8-27B fine-tunes, at about 155 tokens/s on one 32 GB card with the DSpine draft head.
+> The MoE features described further down (GPU expert cache, expert store, split experts, `/fle/status`) are **not**
+> in v1.3.0: for DeepSeek V4.1 Flash, Rin and Qwen3.8-Flash-Next use
+> [v1.2.6](https://github.com/sirfyyn/FastLocalExperts/releases/tag/v1.2.6). {{PENDING: how [FLE Link](https://flelink.run)
+> chooses between the two lines per recipe.}}
+
+**[Kate](https://huggingface.co/sirfyyn/Kate-Qwen-27B-GGUF-SpedUp-Abliterated)** is Katy (Swift-1.5-Qwen3.8-27B) with
+the refusal direction removed from the weights, as an IQ4_XS quant whose block scales were healed against its own BF16.
+It no longer refuses requests the original refused for safety reasons: you are responsible for what you do with it.
+**[Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF)** is the same model without abliteration.
+
+| | Katy | Kate |
+|---|---|---|
+| Decode in production (12 Nov, 1,729 agent responses ≥ 64 tokens) | median **154.6 tok/s** (P10 106.5, P90 214.4) | {{PENDING}} |
+| Decode, paired, cold n-gram table (agent / code) | 161.8 / 151.4 tok/s | {{PENDING}} |
+| KL divergence against BF16 | {{PENDING}} | {{PENDING}} |
+| ARC-Challenge / GSM8K | 94.2 % / 96.8 % | {{PENDING}} |
+| Smallest card measured | {{PENDING}} | {{PENDING}} |
+
+One RTX PRO 4500 Blackwell (32 GB), Linux, IQ4_XS, DSpine b16 head (Q4_K_M) with n-max 15 and the n-gram table,
+temperature 1.0. What each engine change gained is in [docs/fle/ENV.md](docs/fle/ENV.md) and the
+[v1.3.0 release notes](docs/fle/RELEASE-v1.3.0.md).
+
+**Run it with FLE Link:** `flelink run kate-27b-dspine` ({{PENDING}}: recipe published). By hand:
+
+```bash
+FLE_RS_WINDOW=1 FLE_GDN_REPLAY=1 LLAMA_DFLASH_DEV=1 FLE_SAMPLE_TOPK=1 \
+./build/bin/llama-server -m kate-27b-IQ4_XS-imat.gguf \
+  -md Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf --spec-type draft-dflash,ngram-mod \
+  --spec-draft-n-max 15 --spec-draft-p-min 0 --spec-draft-ngl all \
+  --spec-ngram-mod-n-min 8 --spec-ngram-mod-n-max 32 --spec-ngram-mod-n-match 16 \
+  -ngl 99 -c 32768 -fa on --parallel 1 --jinja -t 8 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0
+```
+
+`FLE_RS_WINDOW` and `FLE_GDN_REPLAY` need `--parallel 1`. At about 150k tokens of context, `-ctk f16 -ctv f16` decoded
+27.7 % faster than q8_0 (k62) but needs more VRAM; we run 163,840 tokens with f16 on 32 GB.
+
 ## What FLE is
+
+*This section and the ones below up to [Kate and Katy](#kate-and-katy) describe the MoE line (v1.2.x). v1.3.0 is the dense line, see above.*
 
 Large Mixture-of-Experts models use only a few experts per token. Qwen3.8-Flash-Next picks 10 of 512 experts in each of
 its 48 MoE layers, so most of its weights are idle at any moment. FLE splits the model along that line: attention, the
@@ -236,7 +281,7 @@ copied byte for byte.
 
 DeepSeek V4.1 Flash: [Rin - Deepseek V4.1 Flash 1017](https://huggingface.co/sirfyyn/Rin-Deepseek-V4.1-Flash-1017-FLE-GGUF) (a split 2-bit build from ISTA-DASLab's GSQ-RCO quants, MIT, needs FLE v1.2.6 or newer) and the [DSpark draft model](https://huggingface.co/sirfyyn/DeepSeek-V4.1-Flash-1017-DSpark-FLE-GGUF).
 
-A dense 27B model that runs on this engine: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF), IQ4_XS, 15.3 GB, with a DFlash2 draft head. Details and measurements: https://sirfyyn.de/en/katy/
+Dense 27B models for the v1.3.0 line: [Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF) and [Kate](https://huggingface.co/sirfyyn/Kate-Qwen-27B-GGUF-SpedUp-Abliterated), IQ4_XS, with the DSpine b16 draft head (see [Kate and Katy](#kate-and-katy)). Details and measurements: https://sirfyyn.de/en/katy/
 
 | File | Size | KLD vs BF16 (texts E / W / K) | Decode vs FLE-IQ3_M on FLE | In one line |
 |---|---|---|---|---|
@@ -254,8 +299,8 @@ measurements behind this table are on the [model card](https://huggingface.co/si
 
 ## Tools and documentation
 
-- [`tools/fle-kernel-bench/`](tools/fle-kernel-bench/), [`tools/fle-step-bench/`](tools/fle-step-bench/): kernel and decode-step measurement tools (with `llama-bench`, `llama-perplexity`, `llama-batched-bench`).
-- [`docs/fle/ENV.md`](docs/fle/ENV.md): every `FLE_*` variable and every flag the fork adds.
+- [`docs/fle/ENV.md`](docs/fle/ENV.md): every `FLE_*` variable of v1.3.0; the MoE variables of v1.2.x are in [v1.2.6's ENV.md](https://github.com/sirfyyn/FastLocalExperts/blob/v1.2.6/docs/fle/ENV.md).
+- [`docs/fle/RELEASE-v1.3.0.md`](docs/fle/RELEASE-v1.3.0.md): what v1.3.0 changes, with the measured runs.
 - [`docs/fle/fle-paper-v1.0.1.pdf`](docs/fle/fle-paper-v1.0.1.pdf): the technical report as archived with `v1.0.1`.
 
 ## Making Rhea fast: eight short films
@@ -292,17 +337,20 @@ pull requests are the best way to send them.
 
 ## Built on llama.cpp
 
-FLE is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), based on commit `6a1a922d` (2026-09-05) plus
-the upstream changes #28302 (checkpoint eviction), #29599 (`llama_prefetch_rows`) and, partly and adapted, #29761
-(Qwen4Exp MTP). Everything FLE does not change works as in upstream: its README is kept in
+FLE is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT). **v1.3.0** is based on commit `344846b4f`
+(2026-10-30) plus the cherry-picked upstream changes listed in the release notes. **v1.2.x** is based on commit
+`6a1a922d` (2026-09-05) plus the upstream changes #28302 (checkpoint eviction), #29599 (`llama_prefetch_rows`) and,
+partly and adapted, #29761 (Qwen4Exp MTP). Everything FLE does not change works as in upstream: its README is kept in
 [README-llama.cpp.md](README-llama.cpp.md), its documentation in [docs/](docs/).
 
 | Project | What FLE adopted | Notice |
 |---------|------------------|--------|
-| [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (Iwan Kawrakow, MIT) | The trellis-quantized `IQ2_KT`/`IQ3_KT`/`IQ4_KT` tensor types and their decoding kernels, taken essentially verbatim. | [NOTICE-ik_llama.md](NOTICE-ik_llama.md) |
-| [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0, arXiv:2608.16157) | The hybrid pager path and the bandwidth rule for staging experts, re-implemented in the CUDA backend. | [NOTICE-freetoken.md](NOTICE-freetoken.md) |
+| [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (Iwan Kawrakow, MIT) | The trellis-quantized `IQ2_KT`/`IQ3_KT`/`IQ4_KT` tensor types and their decoding kernels, taken essentially verbatim. | [NOTICE-ik_llama.md](https://github.com/sirfyyn/FastLocalExperts/blob/v1.2.6/NOTICE-ik_llama.md) (v1.2.x) |
+| [FreeToken](https://github.com/FlashML-org/FreeToken) (Apache-2.0, arXiv:2608.16157) | The hybrid pager path and the bandwidth rule for staging experts, re-implemented in the CUDA backend. | [NOTICE-freetoken.md](https://github.com/sirfyyn/FastLocalExperts/blob/v1.2.6/NOTICE-freetoken.md) (v1.2.x) |
 | [KTransformers](https://github.com/kvcache-ai/ktransformers) (Apache-2.0) | The idea of running MoE experts on the CPU while attention and shared weights stay on the GPU. No KTransformers code is part of this tree. | - |
-| [Strata](https://github.com/Niko1221/strata) (MIT) | Selected ideas and code from the serving stack, for example the expert pager, prefill in the KV slots and the early slot save. | [NOTICE-strata.md](NOTICE-strata.md) |
+| [Infernix](https://github.com/wallawalla47/infernix) (Apache-2.0) | v1.3.0: the techniques behind `FLE_GRAPH_FORMEN` and `FLE_IQ4_MMA` (both off by default). | [NOTICE-infernix.md](NOTICE-infernix.md) |
+| DSpine patch for llama.cpp (AjHomelab, MIT) | v1.3.0: the DSpine draft model type. | [NOTICE-dspine.md](NOTICE-dspine.md) |
+| [Strata](https://github.com/Niko1221/strata) (MIT) | Selected ideas and code from the serving stack, for example the expert pager, prefill in the KV slots and the early slot save. | [NOTICE-strata.md](https://github.com/sirfyyn/FastLocalExperts/blob/v1.2.6/NOTICE-strata.md) (v1.2.x) |
 
 ## Citation
 

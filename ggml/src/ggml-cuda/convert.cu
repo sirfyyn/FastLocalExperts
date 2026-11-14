@@ -223,252 +223,15 @@ static __global__ void dequantize_block_iq1_m(const void * __restrict__ vx, dst_
 }
 
 template<typename dst_t>
-static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+static __global__ void dequantize_block_iq4_nl(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
     const int64_t i = blockIdx.x;
 
+    const int64_t ib = 8*i + threadIdx.x%8;
+    if (ib >= nb32) {
+        return;
+    }
+
     dequantize_iq4_nl(vx, i, yy + i*QK_K, threadIdx.x);
-}
-
-// ==== IQ_KT CUDA dequant (adapted verbatim from ik_llama.cpp (MIT), https://github.com/ikawrakow/ik_llama.cpp; with fudge factor = GPU serving ground truth) ====
-static const __device__ int8_t fle_iq4k_values[16] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
-static __device__ __forceinline__ int fle_trellis_next_int(uint32_t & val) {
-    val = 0xCBAC1FEDu * val;                       // QTIP 3INST
-    uint32_t s = val & 0x3f3f3f3fu;                // bytes 0..63 -> signed==unsigned
-    const int8_t * p = (const int8_t *)&s;
-    return p[0] + p[1] + p[2] + p[3] - 126;
-}
-template<typename dst_t>
-static __global__ void fle_dequantize_block_iq2_kt(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t n_per_row, int64_t row_size) {
-    int64_t ii  = blockIdx.x;
-    int64_t row = (QK_K * ii) / n_per_row;
-    const char * cx = (const char *)vx + row * row_size;
-    float scale = *(const float *)cx;
-    const block_iq2_kt * x = (const block_iq2_kt *)(cx + sizeof(float));
-    const int64_t i = ii - (row*n_per_row)/QK_K;
-    const int64_t tid = threadIdx.x;
-    const int64_t ib = tid; // 0...31
-    dst_t * y = yy + ii*QK_K + 8*ib;
-    const uint16_t * ql = (const uint16_t *)x[i].ql;
-    uint32_t idx = ql[ib] + 4096;
-    const float dl = scale * fle_iq4k_values[((x[i].scales[(ib/4)%4] >> 4*(ib/16)) & 0xf)] * 1.05f;
-    for (int j = 0; j < 8; ++j) y[j] = dl * fle_trellis_next_int(idx);
-}
-template<typename dst_t>
-static __global__ void fle_dequantize_block_iq3_kt(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t n_per_row, int64_t row_size) {
-    int64_t ii  = blockIdx.x;
-    int64_t row = (QK_K * ii) / n_per_row;
-    const char * cx = (const char *)vx + row * row_size;
-    float scale = *(const float *)cx;
-    const block_iq3_kt * x = (const block_iq3_kt *)(cx + sizeof(float));
-    const int64_t i = ii - (row*n_per_row)/QK_K;
-    const int64_t tid = threadIdx.x;
-    const int64_t ib = tid; // 0...31
-    dst_t * y = yy + ii*QK_K + 8*ib;
-    const uint16_t * ql = (const uint16_t *)x[i].ql;
-    uint32_t idx = ql[ib] + 4096;
-    const float dl = scale * ((x[i].scales[(ib/4)%4] >> 4*(ib/16)) & 0xf) * 1.01f;
-    uint8_t mask = 1 << (ib/4);
-    for (int j = 0; j < 8; ++j)
-        y[j] = dl * abs(fle_trellis_next_int(idx)) * (x[i].qh[(8*ib+j)%32] & mask ? -1.f : 1.f);
-}
-template<typename dst_t>
-static __global__ void fle_dequantize_block_iq4_kt(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t n_per_row, int64_t row_size) {
-    int64_t ii  = blockIdx.x;
-    int64_t row = (QK_K * ii) / n_per_row;
-    const float * dptr = (const float *)((const char *)vx + row * row_size);
-    float scale = dptr[0] * 1.00f;
-    const block_iq4_kt * x = (const block_iq4_kt *)(dptr + 1);
-    const int64_t i = ii - (row*n_per_row)/QK_K;
-    constexpr int kNumGroups = 64;
-    const int64_t tid = threadIdx.x;
-    const int64_t ib = tid; // 0...31
-    dst_t * y = yy + ii*QK_K + 8*ib;
-    const uint32_t * shb = x[i].qs;
-    const uint8_t * ql = (const uint8_t *)(shb + 8);
-    const uint8_t * qh = ql + kNumGroups;
-    const int ib32 = ib/4;
-    const int ig = ib%4;
-    const int jj = ib32*8 + 2*ig;
-    uint32_t offset = shb[ib32] & 1 ? 4096 + 32768 : 4096;
-    uint32_t idx1 = ql[jj+0] + ((qh[(jj+0)%(kNumGroups/2)] << (8 - 4*((jj+0)/(kNumGroups/2)))) & 0xf00) + (((shb[ib32] >> (8 + 6*ig+0)) & 7) << 12) + offset;
-    uint32_t idx2 = ql[jj+1] + ((qh[(jj+1)%(kNumGroups/2)] << (8 - 4*((jj+1)/(kNumGroups/2)))) & 0xf00) + (((shb[ib32] >> (8 + 6*ig+3)) & 7) << 12) + offset;
-    int ls = ((shb[ib32] & 0xff) >> 1) - 64;
-    const float dl = scale * ls;
-    for (int j = 0; j < 4; ++j) { y[j+0] = dl * fle_trellis_next_int(idx1); y[j+4] = dl * fle_trellis_next_int(idx2); }
-}
-// Exported test wrapper: host-in -> device -> launch -> host-out. type: 2/3/4.
-extern "C" int fle_dequant_iqkt_test(int type, const void * h_vx, float * h_y, int64_t n_per_row, int64_t nrows) {
-    const int64_t nbrow = n_per_row / QK_K;
-    int64_t blkbytes = type==2 ? 68 : (type==3 ? 100 : 128);
-    int64_t row_size = 4 + nbrow * blkbytes;
-    int64_t nblocks  = nbrow * nrows;
-    int64_t vxbytes  = row_size * nrows;
-    int64_t ybytes   = (int64_t)n_per_row * nrows * sizeof(float);
-    void * d_vx = nullptr; float * d_y = nullptr;
-    if (cudaMalloc(&d_vx, vxbytes) != cudaSuccess) return 1;
-    if (cudaMalloc(&d_y, ybytes)  != cudaSuccess) { cudaFree(d_vx); return 2; }
-    cudaMemcpy(d_vx, h_vx, vxbytes, cudaMemcpyHostToDevice);
-    if      (type==2) fle_dequantize_block_iq2_kt<float><<<nblocks,32>>>(d_vx, d_y, n_per_row, row_size);
-    else if (type==3) fle_dequantize_block_iq3_kt<float><<<nblocks,32>>>(d_vx, d_y, n_per_row, row_size);
-    else              fle_dequantize_block_iq4_kt<float><<<nblocks,32>>>(d_vx, d_y, n_per_row, row_size);
-    cudaError_t e = cudaDeviceSynchronize();
-    cudaMemcpy(h_y, d_y, ybytes, cudaMemcpyDeviceToHost);
-    cudaFree(d_vx); cudaFree(d_y);
-    return e==cudaSuccess ? 0 : 10;
-}
-
-// ==== IQ2_KT custom matmul kernel (dmmv style, row-meta capable) ====
-// dst[row] = sum_col dequant(W[row])[col] * y[col]. Mirrors fle_dequantize_block_iq2_kt (fudge 1.05f).
-static __global__ void fle_mmv_iq2_kt_kernel(const void * __restrict__ vx, const float * __restrict__ y,
-        float * __restrict__ dst, int ncols, int64_t row_size) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x; // 0..31, each thread = 8 elements per super-block
-    const char * rowp = (const char *)vx + (int64_t)row * row_size;
-    const float rscale = *(const float *)rowp;
-    const block_iq2_kt * x = (const block_iq2_kt *)(rowp + sizeof(float));
-    const int nblocks = ncols / QK_K;
-    float sum = 0.f;
-    for (int ibl = 0; ibl < nblocks; ++ibl) {
-        const int ib = tid; // 0..31
-        const uint16_t * ql = (const uint16_t *)x[ibl].ql;
-        uint32_t idx = ql[ib] + 4096;
-        const float dl = rscale * fle_iq4k_values[((x[ibl].scales[(ib/4)%4] >> 4*(ib/16)) & 0xf)] * 1.05f;
-        const float * yb = y + ibl*QK_K + 8*ib;
-        for (int j = 0; j < 8; ++j) sum += dl * fle_trellis_next_int(idx) * yb[j];
-    }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    if (tid == 0) dst[row] = sum;
-}
-// Test-Launcher: host-in -> device -> launch -> host-out. y = ncols floats, W = nrows*row_size, dst = nrows.
-extern "C" int fle_mmv_iq2_kt_test(const void * h_vx, const float * h_y, float * h_dst, int ncols, int nrows) {
-    const int64_t nbrow = ncols / QK_K;
-    const int64_t row_size = 4 + nbrow * 68;
-    void * d_vx = nullptr; float * d_y = nullptr, * d_dst = nullptr;
-    if (cudaMalloc(&d_vx, row_size*nrows) != cudaSuccess) return 1;
-    if (cudaMalloc(&d_y, (int64_t)ncols*sizeof(float)) != cudaSuccess) { cudaFree(d_vx); return 2; }
-    if (cudaMalloc(&d_dst, (int64_t)nrows*sizeof(float)) != cudaSuccess) { cudaFree(d_vx); cudaFree(d_y); return 3; }
-    cudaMemcpy(d_vx, h_vx, row_size*nrows, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, h_y, (int64_t)ncols*sizeof(float), cudaMemcpyHostToDevice);
-    fle_mmv_iq2_kt_kernel<<<nrows, 32>>>(d_vx, d_y, d_dst, ncols, row_size);
-    cudaError_t e = cudaDeviceSynchronize();
-    cudaMemcpy(h_dst, d_dst, (int64_t)nrows*sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_vx); cudaFree(d_y); cudaFree(d_dst);
-    return e==cudaSuccess ? 0 : 10;
-}
-
-// ==== IQ3_KT custom matmul (mirrors fle_dequantize_block_iq3_kt, fudge 1.01f) ====
-static __global__ void fle_mmv_iq3_kt_kernel(const void * __restrict__ vx, const float * __restrict__ y,
-        float * __restrict__ dst, int ncols, int64_t row_size) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const char * rowp = (const char *)vx + (int64_t)row * row_size;
-    const float rscale = *(const float *)rowp;
-    const block_iq3_kt * x = (const block_iq3_kt *)(rowp + sizeof(float));
-    const int nblocks = ncols / QK_K;
-    float sum = 0.f;
-    for (int ibl = 0; ibl < nblocks; ++ibl) {
-        const int ib = tid;
-        const uint16_t * ql = (const uint16_t *)x[ibl].ql;
-        uint32_t idx = ql[ib] + 4096;
-        const float dl = rscale * ((x[ibl].scales[(ib/4)%4] >> 4*(ib/16)) & 0xf) * 1.01f;
-        const uint8_t mask = 1 << (ib/4);
-        const float * yb = y + ibl*QK_K + 8*ib;
-        for (int j = 0; j < 8; ++j)
-            sum += dl * abs(fle_trellis_next_int(idx)) * (x[ibl].qh[(8*ib+j)%32] & mask ? -1.f : 1.f) * yb[j];
-    }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    if (tid == 0) dst[row] = sum;
-}
-extern "C" int fle_mmv_iq3_kt_test(const void * h_vx, const float * h_y, float * h_dst, int ncols, int nrows) {
-    const int64_t nbrow = ncols / QK_K;
-    const int64_t row_size = 4 + nbrow * 100;
-    void * d_vx=nullptr; float * d_y=nullptr, * d_dst=nullptr;
-    if (cudaMalloc(&d_vx, row_size*nrows)!=cudaSuccess) return 1;
-    if (cudaMalloc(&d_y, (int64_t)ncols*sizeof(float))!=cudaSuccess){cudaFree(d_vx);return 2;}
-    if (cudaMalloc(&d_dst,(int64_t)nrows*sizeof(float))!=cudaSuccess){cudaFree(d_vx);cudaFree(d_y);return 3;}
-    cudaMemcpy(d_vx,h_vx,row_size*nrows,cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y,h_y,(int64_t)ncols*sizeof(float),cudaMemcpyHostToDevice);
-    fle_mmv_iq3_kt_kernel<<<nrows,32>>>(d_vx,d_y,d_dst,ncols,row_size);
-    cudaError_t e=cudaDeviceSynchronize();
-    cudaMemcpy(h_dst,d_dst,(int64_t)nrows*sizeof(float),cudaMemcpyDeviceToHost);
-    cudaFree(d_vx);cudaFree(d_y);cudaFree(d_dst);
-    return e==cudaSuccess?0:10;
-}
-
-// ==== IQ4_KT custom matmul (mirrors fle_dequantize_block_iq4_kt, fudge 1.00f) ====
-static __global__ void fle_mmv_iq4_kt_kernel(const void * __restrict__ vx, const float * __restrict__ y,
-        float * __restrict__ dst, int ncols, int64_t row_size) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    const char * rowp = (const char *)vx + (int64_t)row * row_size;
-    const float rscale = *(const float *)rowp;
-    const block_iq4_kt * x = (const block_iq4_kt *)(rowp + sizeof(float));
-    const int nblocks = ncols / QK_K;
-    constexpr int kNumGroups = 64;
-    float sum = 0.f;
-    for (int ibl = 0; ibl < nblocks; ++ibl) {
-        const int ib = tid;
-        const uint32_t * shb = x[ibl].qs;
-        const uint8_t * ql = (const uint8_t *)(shb + 8);
-        const uint8_t * qh = ql + kNumGroups;
-        const int ib32 = ib/4, ig = ib%4, jj = ib32*8 + 2*ig;
-        uint32_t offset = shb[ib32] & 1 ? 4096 + 32768 : 4096;
-        uint32_t idx1 = ql[jj+0] + ((qh[(jj+0)%(kNumGroups/2)] << (8 - 4*((jj+0)/(kNumGroups/2)))) & 0xf00) + (((shb[ib32] >> (8 + 6*ig+0)) & 7) << 12) + offset;
-        uint32_t idx2 = ql[jj+1] + ((qh[(jj+1)%(kNumGroups/2)] << (8 - 4*((jj+1)/(kNumGroups/2)))) & 0xf00) + (((shb[ib32] >> (8 + 6*ig+3)) & 7) << 12) + offset;
-        const int ls = ((shb[ib32] & 0xff) >> 1) - 64;
-        const float dl = rscale * ls;
-        const float * yb = y + ibl*QK_K + 8*ib;
-        for (int j = 0; j < 4; ++j) {
-            sum += dl * fle_trellis_next_int(idx1) * yb[j+0];
-            sum += dl * fle_trellis_next_int(idx2) * yb[j+4];
-        }
-    }
-    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
-    if (tid == 0) dst[row] = sum;
-}
-extern "C" int fle_mmv_iq4_kt_test(const void * h_vx, const float * h_y, float * h_dst, int ncols, int nrows) {
-    const int64_t nbrow = ncols / QK_K;
-    const int64_t row_size = 4 + nbrow * 128;
-    void * d_vx=nullptr; float * d_y=nullptr, * d_dst=nullptr;
-    if (cudaMalloc(&d_vx, row_size*nrows)!=cudaSuccess) return 1;
-    if (cudaMalloc(&d_y, (int64_t)ncols*sizeof(float))!=cudaSuccess){cudaFree(d_vx);return 2;}
-    if (cudaMalloc(&d_dst,(int64_t)nrows*sizeof(float))!=cudaSuccess){cudaFree(d_vx);cudaFree(d_y);return 3;}
-    cudaMemcpy(d_vx,h_vx,row_size*nrows,cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y,h_y,(int64_t)ncols*sizeof(float),cudaMemcpyHostToDevice);
-    fle_mmv_iq4_kt_kernel<<<nrows,32>>>(d_vx,d_y,d_dst,ncols,row_size);
-    cudaError_t e=cudaDeviceSynchronize();
-    cudaMemcpy(h_dst,d_dst,(int64_t)nrows*sizeof(float),cudaMemcpyDeviceToHost);
-    cudaFree(d_vx);cudaFree(d_y);cudaFree(d_dst);
-    return e==cudaSuccess?0:10;
-}
-
-// ==== ggml-integrated launcher: column loop over ncols_y, reuses the kernels ====
-extern "C" float fle_mmv_iq2_kt_bench(int nrows, int ncols, int iters) {
-    const int64_t row_size = 4 + (int64_t)(ncols/256)*68;
-    void * d_vx=nullptr; float * d_y=nullptr, * d_dst=nullptr;
-    if (cudaMalloc(&d_vx, row_size*nrows)!=cudaSuccess) return -1.f;
-    if (cudaMalloc(&d_y, (int64_t)ncols*4)!=cudaSuccess) { cudaFree(d_vx); return -2.f; }
-    if (cudaMalloc(&d_dst,(int64_t)nrows*4)!=cudaSuccess){ cudaFree(d_vx);cudaFree(d_y); return -3.f; }
-    fle_mmv_iq2_kt_kernel<<<nrows,32>>>(d_vx, d_y, d_dst, ncols, row_size);
-    cudaDeviceSynchronize();
-    cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
-    cudaEventRecord(a);
-    for (int i=0;i<iters;i++) fle_mmv_iq2_kt_kernel<<<nrows,32>>>(d_vx, d_y, d_dst, ncols, row_size);
-    cudaEventRecord(b); cudaEventSynchronize(b);
-    float ms=0; cudaEventElapsedTime(&ms, a, b);
-    cudaEventDestroy(a); cudaEventDestroy(b);
-    cudaFree(d_vx); cudaFree(d_y); cudaFree(d_dst);
-    return ms/iters;
-}
-extern "C" void fle_mmv_kt_launch(int type, const void * vx, const float * vy, float * dst,
-        int ncols, int ncols_y, int nrows, int64_t row_size, cudaStream_t stream) {
-    for (int col = 0; col < ncols_y; ++col) {
-        const float * y = vy + (int64_t)col*ncols;
-        float * d = dst + (int64_t)col*nrows;
-        if      (type==2) fle_mmv_iq2_kt_kernel<<<nrows,32,0,stream>>>(vx, y, d, ncols, row_size);
-        else if (type==3) fle_mmv_iq3_kt_kernel<<<nrows,32,0,stream>>>(vx, y, d, ncols, row_size);
-        else              fle_mmv_iq4_kt_kernel<<<nrows,32,0,stream>>>(vx, y, d, ncols, row_size);
-    }
 }
 
 template<typename dst_t>
@@ -594,8 +357,9 @@ static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t 
 
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb32 = k / QK4_NL;
     const int nb = (k + QK_K - 1) / QK_K;
-    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
+    dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y, nb32);
 }
 
 template<typename dst_t>
@@ -681,6 +445,29 @@ static __global__ void convert_unary(
     }
 }
 
+template <typename T> struct alignas(sizeof(T)*4) cvt_vec4 { T v[4]; };
+
+// four elements per thread, so a warp moves 512B (RDNA) / 1k (CDNA) per load
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec4(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+    cvt_vec4<dst_t> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<dst_t>(xv.v[j]);
+    }
+
+    ((cvt_vec4<dst_t> *) y)[i] = yv;
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -694,6 +481,15 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
 
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const int64_t k4 = k/4;
+        const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
+        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        return;
+    }
+
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 

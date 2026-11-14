@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Iterable, TYPE_CHECKING, cast
@@ -118,10 +117,9 @@ def _e8m0_check(scale_u8: np.ndarray, name: str) -> None:
 @ModelBase.register("DeepseekV41ForCausalLM")
 class DeepseekV41Model(DeepseekV4Model):
     """DeepSeek-V4.1 text model, lossless: FP8 (e4m3, 32x32 ue8m0 blocks) linears dequantized to BF16 (F32 with
-    --outtype f32), routed experts copied bit-exact as MXFP4, Engram tables (e4m3 rows, one e8m0 scale per 32) copied
-    bit-exact as MXFP8 (DSV41_ENGRAM_TYPE=bf16: the exact BF16 lookup, F32 with --outtype f32), router and Engram gate
-    F32. DSpark (mtp.*) is not converted here (--dspark, DeepseekV41DSparkModel); the vision tower goes to an mmproj
-    (--mmproj, DeepseekV41VisionModel).
+    --outtype f32), routed experts copied bit-exact as MXFP4, Engram tables (e4m3 rows, one e8m0 scale per 32) as the
+    exact BF16 lookup (F32 with --outtype f32), router and Engram gate F32. DSpark (mtp.*) is not converted here
+    (--dspark, DeepseekV41DSparkModel); the vision tower goes to an mmproj (--mmproj, DeepseekV41VisionModel).
     The Engram tables of all layers are written as one per_layer_token_embd (rows concatenated in layer order) with
     the PLE keys of qwen4exp: absolute head offsets and bucket counts, so the runtime can read it lazily."""
     model_arch = gguf.MODEL_ARCH.DEEPSEEK41
@@ -133,7 +131,6 @@ class DeepseekV41Model(DeepseekV4Model):
         super().__init__(*args, **kwargs)
         self.hparams.setdefault("num_hash_layers", 0)  # no hash-routed layers in V4.1
         self._f32 = self.ftype == gguf.LlamaFileType.ALL_F32
-        self._engram_mxfp8 = os.environ.get("DSV41_ENGRAM_TYPE", "mxfp8").lower() != "bf16"
         qc = self.hparams.get("quantization_config") or {}
         self._fp8_block = tuple(qc.get("weight_block_size") or (32, 32))
         if qc.get("scale_fmt", "ue8m0") != "ue8m0":
@@ -147,12 +144,6 @@ class DeepseekV41Model(DeepseekV4Model):
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         # num_hidden_layers lives in text_config, which is merged only after indexing; MTP stages are skipped anyway
         return TextModel.index_tensors(self, remote_hf_model_id=remote_hf_model_id)
-
-    @classmethod
-    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
-        if item[0].startswith("vision."):
-            return None
-        return super().filter_tensors(item)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
@@ -230,7 +221,7 @@ class DeepseekV41Model(DeepseekV4Model):
         self.gguf_writer.add_tensor(self.format_tensor_name(key, bid), data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
 
     def _write_engram_tables(self, layer_ids: list[int]) -> None:
-        # official lookup e4m3 * 2^(e8m0 - 127): stored as the source MXFP8 blocks (bit-exact) or as exact BF16
+        # official lookup e4m3 * 2^(e8m0 - 127), exact in BF16
         parts, dim = [], None
         for bid in layer_ids:
             wn, sn = f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"
@@ -244,22 +235,6 @@ class DeepseekV41Model(DeepseekV4Model):
         assert dim is not None
         name = self.format_tensor_name(gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD)
         n_rows = sum(p[2] for p in parts)
-
-        if self._engram_mxfp8:
-            def blocks() -> Iterable[np.ndarray]:
-                from safetensors import safe_open
-                for wn, sn, rows, wpart, spart in parts:
-                    with safe_open(wpart, framework="pt") as fw, safe_open(spart, framework="pt") as fs:
-                        ws, ss = fw.get_slice(wn), fs.get_slice(sn)
-                        for r0 in range(0, rows, 1 << 18):
-                            q = ws[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 32).numpy()
-                            e = ss[r0:r0 + (1 << 18)].view(torch.uint8).reshape(-1, 1).numpy()
-                            if (e == 0xFF).any() or ((q & 0x7F) == 0x7F).any():
-                                raise ValueError(f"{wn}: NaN E8M0 scale or E4M3 code")
-                            yield np.concatenate([e, q], axis=1)
-            data = cast(np.ndarray, _StreamedBytes((n_rows, dim // 32 * 33), blocks))
-            self.gguf_writer.add_tensor(name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
-            return
 
         def chunks() -> Iterable[np.ndarray]:
             from safetensors import safe_open
@@ -301,12 +276,13 @@ class DeepseekV41Model(DeepseekV4Model):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.endswith(".engram.k_weight"):
-            return []  # folded into engram_gate
+            return  # folded into engram_gate
         if name.endswith(".engram.q_weight"):
             # Engram gate weight = q_weight * k_weight (bf16 * bf16 is exact in f32)
             k = self.model_tensors[name.removesuffix("q_weight") + "k_weight"]
-            return [(self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_GATE, bid), data_torch.float() * k().float())]
-        return super().modify_tensors(data_torch, name, bid)
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_GATE, bid), data_torch.float() * k().float()
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if new_name.endswith((".engram_gate.weight", ".ffn_gate_inp.weight")) or name in self._dsv4_f32_tensors:
@@ -430,13 +406,15 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         if name.endswith(".ffn.gate.bias_vl"):
-            return []
+            return
         if name in self._DSPARK_ROOT:
-            return [(self.format_tensor_name(self._DSPARK_ROOT[name], None), data_torch)]
+            yield self.format_tensor_name(self._DSPARK_ROOT[name], None), data_torch
+            return
         m = re.match(r"layers\.\d+\.(main_proj\.weight|main_norm\.weight|norm\.weight)$", name)
         if m is not None:
-            return [(self.format_tensor_name(self._DSPARK_ROOT[m.group(1)], None), data_torch)]
-        return super().modify_tensors(data_torch, name, bid)
+            yield self.format_tensor_name(self._DSPARK_ROOT[m.group(1)], None), data_torch
+            return
+        yield from super().modify_tensors(data_torch, name, bid)
 
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if new_name == "conf_proj.weight":

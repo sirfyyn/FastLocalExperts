@@ -31,9 +31,11 @@ enum class tensor_category {
     ATTENTION_QKV,
     ATTENTION_KV_B,
     ATTENTION_OUTPUT,
+    ATTENTION_GATE,
     FFN_UP,
     FFN_GATE,
     FFN_DOWN,
+    FFN_LATENT,
     OUTPUT,
     OTHER
 };
@@ -123,7 +125,8 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     if (tensor_name_match_token_embd(tensor_name.c_str())) {
         return tensor_category::TOKEN_EMBD;
     }
-    if (tensor_name.find("attn_qkv.weight") != std::string::npos) {
+    // attn_qkv_gate is [attn_qkv | attn_gate] in one weight, the qkv rows decide its type
+    if (tensor_name.find("attn_qkv.weight") != std::string::npos || tensor_name.find("attn_qkv_gate.weight") != std::string::npos) {
         return tensor_category::ATTENTION_QKV;
     }
     if (tensor_name.find("attn_kv_b.weight") != std::string::npos) {
@@ -147,10 +150,22 @@ static tensor_category tensor_get_category(const std::string & tensor_name) {
     if (tensor_name.find("ffn_gate") != std::string::npos) {
         return tensor_category::FFN_GATE;
     }
+    if (tensor_name.find("ffn_latent") != std::string::npos) {
+        return tensor_category::FFN_LATENT;
+    }
+    if (tensor_name.find("attn_gate.weight") != std::string::npos) {
+        return tensor_category::ATTENTION_GATE;
+    }
     if (tensor_name.find("ffn_down") != std::string::npos) {
         return tensor_category::FFN_DOWN;
     }
     return tensor_category::OTHER;
+}
+
+// check if tensor is a MoE expert tensor (used by GGML_OP_MUL_MAT_ID)
+static bool tensor_is_expert(const std::string & tensor_name) {
+    return tensor_name.find("_exps.")   != std::string::npos ||
+           tensor_name.find("_chexps.") != std::string::npos;
 }
 
 // check if category is for attention-v-like tensors (more sensitive to quantization)
@@ -218,7 +233,7 @@ static void llama_tensor_dequantize_impl(
     const size_t nelements, const int nthread
 ) {
     const ggml_type_traits * qtype = ggml_get_type_traits(type);
-    if (ggml_is_quantized(type)) {
+    if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
         if (qtype->to_float == NULL) {
             throw std::runtime_error(format("type %s unsupported for integer quantization: no dequantization available", ggml_type_name(type)));
         }
@@ -232,7 +247,7 @@ static void llama_tensor_dequantize_impl(
             ggml_fp16_to_fp32_row((const ggml_fp16_t *)data, f32_output, nelements);
         } else if (type == GGML_TYPE_BF16) {
             ggml_bf16_to_fp32_row((const ggml_bf16_t *)data, f32_output, nelements);
-        } else if (ggml_is_quantized(type)) {
+        } else if (ggml_is_quantized(type) || type == GGML_TYPE_F8_E4M3) {
             qtype->to_float(data, f32_output, nelements);
         } else {
             GGML_ABORT("fatal error"); // unreachable
@@ -288,7 +303,7 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // trivial checks first -- no string ops needed
     if (params->only_copy)       return false;
 
-    // quantize only 2D and 3D tensors (experts)
+    // quantize only 2D+ tensors (matrices, experts, conv kernels)
     if (ggml_n_dims(tensor) < 2) return false;
 
     const std::string name = ggml_get_name(tensor);
@@ -318,6 +333,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // these are not too big so keep them as it is
     quantize &= name.find("per_layer_model_proj") == std::string::npos;
 
+    // limite: very small gates and dense connection mixers
+    if (arch == LLM_ARCH_LIMITE) {
+        quantize &= name.find("attn_gate.weight")    == std::string::npos;
+        quantize &= name.find("attn_ve_gate.weight") == std::string::npos;
+        quantize &= name.find("mudd_")               == std::string::npos;
+    }
+
     // do not quantize positional embeddings and token types (BERT)
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_POS_EMBD,    "weight");
     quantize &= name != LLM_TN(arch)(LLM_TENSOR_TOKEN_TYPES, "weight");
@@ -327,9 +349,40 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("ssm_conv1d") == std::string::npos;
     quantize &= name.find("shortconv.conv.weight") == std::string::npos;
 
+    // do not quantize LFM3-VL's depthwise conv kernels, CONV_2D_DW takes F32 kernels
+    quantize &= name.find("conv2d_spatial.weight") == std::string::npos;
+
+    // do not quantize LFM3-Audio's encoder convs and codec, the codec output does not survive quantization
+    quantize &= name.rfind("a.conv1d.", 0) != 0;
+    quantize &= name.find("conv_dw") == std::string::npos;
+    quantize &= name.rfind("a.gen.wav.", 0) != 0;
+
     // do not quantize MiniMax's indexer projection weights, they are tiny
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
+
+    // glm5-next
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        quantize &= name.find("hc_")                     == std::string::npos;
+        quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
+        quantize &= name.find("indexer.attn_k")          == std::string::npos;
+        quantize &= name.find("indexer.proj")            == std::string::npos;
+        quantize &= name.find("indexer_compressor_gate") == std::string::npos;
+        quantize &= name.find("indexer_compressor_ape")  == std::string::npos;
+        quantize &= name.find("ssm_f_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_f_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_a.weight")          == std::string::npos;
+        quantize &= name.find("ssm_g_b.weight")          == std::string::npos;
+        quantize &= name.find("ssm_beta.weight")         == std::string::npos;
+        quantize &= name.find("attn_kv_a_mqa.weight")    == std::string::npos;
+        quantize &= name.find("attn_k_b.weight")         == std::string::npos;
+        quantize &= name.find("attn_v_b.weight")         == std::string::npos;
+    }
+
+    // the decision head of vllm-decision2 is small and computed in F32
+    if (arch == LLM_ARCH_VLLM_DECISION2) {
+        quantize &= name.compare(0, 9, "decision.") != 0;
+    }
 
     // do not quantize RWKV's small yet 2D weights
     quantize &= name.find("time_mix_first.weight") == std::string::npos;
@@ -404,10 +457,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
-                    // and the shape is simply not representable; the check below turns it into F16, the
-                    // same answer 256-block types reach when their fallback does not fit. Getting here
-                    // means ncols is not a multiple of 32, e.g. a conv kernel a recipe forgot to pin;
-                    // throwing gave no tensor name or message, making a recipe gap look like corruption.
+                    // the check below turns it into F16, as a 256-block type does when its fallback does not fit
                     return_type = target_type;
                     break;
                 }
@@ -457,6 +507,35 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         return std::make_pair(i_layer, n_layer);
     };
 
+    // by default, for glm5-next, don't let these tensors be quantized below Q8_0
+    if (arch == LLM_ARCH_GLM5_NEXT && (
+        name.find("attn_q_a")      != std::string::npos ||
+        name.find("attn_q_b")      != std::string::npos ||
+        name.find("nextn.eh_proj") != std::string::npos))
+    {
+        switch (new_type) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_BF16:
+            case GGML_TYPE_F16:
+                break;
+            default:
+                return GGML_TYPE_Q8_0;
+        }
+    }
+
+    // bumping to q8_0 is preferred since these tensors are not really big
+    // TODO: nemotron 3 super shares ffn_latent and afmoe, bailingmoe3, dots3note, hy-v4, kimi-k3 and laguna share attn_gate.
+    //       Widening the guard is likely a win there too, but it changes their files, so it wants a perplexity comparison per architecture first.
+    if (arch == LLM_ARCH_MUSE_SPARK &&
+        (category == tensor_category::FFN_LATENT || category == tensor_category::ATTENTION_GATE)) {
+        auto bits_per_weight = [](ggml_type t) {
+            return 8.0 * ggml_type_size(t) / ggml_blck_size(t);
+        };
+        if (ggml_is_quantized(new_type) && bits_per_weight(new_type) < bits_per_weight(GGML_TYPE_Q8_0)) {
+            new_type = GGML_TYPE_Q8_0;
+        }
+    }
+
     // for arches that share the same tensor between the token embeddings and the output, we quantize the token embeddings
     // with the quantization of the output tensor
     if (category == tensor_category::OUTPUT || (qs.has_tied_embeddings && category == tensor_category::TOKEN_EMBD)) {
@@ -484,12 +563,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
-        // MLA projection tensors are also 3D, so match expert tensor roles explicitly.
-        const bool is_bailingmoe3_expert = arch == LLM_ARCH_BAILINGMOE3 &&
-            (category == tensor_category::FFN_UP ||
-             category == tensor_category::FFN_GATE ||
-             category == tensor_category::FFN_DOWN);
-        if (tensor->ne[2] > 1 && (arch != LLM_ARCH_BAILINGMOE3 || is_bailingmoe3_expert)) {
+        if (tensor_is_expert(name)) {
             new_type = GGML_TYPE_MXFP4;
         } else {
             new_type = GGML_TYPE_Q8_0;
@@ -691,10 +765,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         return tensor->type;
     }
     if (params->token_embedding_type < GGML_TYPE_COUNT && tm.category == tensor_category::TOKEN_EMBD) {
-        // per_layer_token_embd shares this category with token_embd.weight and follows
-        // --token-embedding-type by default. But it is a separate table and far from a
-        // rounding error: qwen4exp's is ~46% of a 4-bit file. Let an explicit --tensor-type
-        // name it; nothing changes unless such a pattern is passed.
+        // per_layer_token_embd follows --token-embedding-type by default, but it is a large
+        // separate table, so let an explicit --tensor-type name it
         bool named = false;
         if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
             const std::string tensor_name(tensor->name);
@@ -1252,11 +1324,11 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     if (it == imatrix_data->end()) {
                         LLAMA_LOG_INFO("\n====== %s: did not find weights for %s\n", __func__, tensor->name);
                     } else {
-                        if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]) {
+                        if (it->second.size() == (size_t)tensor->ne[0]*tensor->ne[2]*tensor->ne[3]) {
                             imatrix = it->second.data();
                         } else {
                             LLAMA_LOG_INFO("\n====== %s: imatrix size %d is different from tensor size %d for %s\n", __func__,
-                                    int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name);
+                                    int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]), tensor->name);
 
                             // this can happen when quantizing an old mixtral model with split tensors with a new incompatible imatrix
                             // this is a significant error and it may be good idea to abort the process if this happens,
@@ -1264,7 +1336,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             // tok_embd should be ignored in this case, since it always causes this warning
                             if (!tensor_name_match_token_embd(tensor->name)) {
                                 throw std::runtime_error(format("imatrix size %d is different from tensor size %d for %s",
-                                        int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]), tensor->name));
+                                        int(it->second.size()), int(tensor->ne[0]*tensor->ne[2]*tensor->ne[3]), tensor->name));
                             }
                         }
                     }
@@ -1286,7 +1358,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
                 const int64_t n_per_row = tensor->ne[0];
                 const int64_t nrows_per_expert = tensor->ne[1];
-                const int64_t nrows_total = tensor->ne[1] * tensor->ne[2];
+                const int64_t nrows_total = ggml_nrows(tensor);
 
                 const size_t row_size_src = ggml_row_size(tensor->type, n_per_row);
                 const size_t row_size_dst = ggml_row_size(new_type,     n_per_row);
