@@ -81,7 +81,7 @@ FLE_RS_WINDOW=1 FLE_GDN_REPLAY=1 LLAMA_DFLASH_DEV=1 FLE_SAMPLE_TOPK=1 \
 
 ## What FLE is
 
-*This section and the ones below up to [Kate and Katy](#kate-and-katy) describe the MoE line (v1.2.x). v1.3.0 is the dense line, see above.*
+*From here on this README describes the MoE line (v1.2.x), except where v1.3.0 is named. v1.3.0 is the dense line, see [Kate and Katy](#kate-and-katy) above.*
 
 Large Mixture-of-Experts models use only a few experts per token. Qwen3.8-Flash-Next picks 10 of 512 experts in each of
 its 48 MoE layers, so most of its weights are idle at any moment. FLE splits the model along that line: attention, the
