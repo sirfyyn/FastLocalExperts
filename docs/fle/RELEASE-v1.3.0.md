@@ -1,6 +1,6 @@
 # FLE v1.3.0 (draft release notes)
 
-> Draft. Not tagged, not released, not signed. `{{PENDING}}` marks what is filled in before the tag.
+> Release notes. Commit, workflow run and checksums are filled in from the build.
 
 Portable binary packages of the FLE engine, built from source by GitHub Actions from commit `{{PENDING: sha8}}`, the
 tagged commit. The workflow is [`fle-binaries.yml`](https://github.com/sirfyyn/FastLocalExperts/blob/v1.3.0/.github/workflows/fle-binaries.yml),
@@ -19,11 +19,13 @@ with the DSpine b16 draft head. It is exactly the source of the build Katy has b
 **The MoE features of v1.2.x are not in v1.3.0**: GPU expert cache (`--moe-expert-cache*`, `FLE_MOE_*`), expert store,
 split experts, the MTP vocabulary, the trellis types `IQ*_KT` and `GET /fle/status`. For DeepSeek V4.1 Flash, Rin and
 Qwen3.8-Flash-Next keep using [v1.2.6](https://github.com/sirfyyn/FastLocalExperts/releases/tag/v1.2.6).
-{{PENDING: plan for bringing the two lines together.}}
+The lines come together when the MoE features are ported onto the newer upstream; until then FLE Link picks the line
+per recipe.
 
 Measured on one RTX PRO 4500 Blackwell (32 GB), Ryzen 9 9950X3D, Linux, with Katy (IQ4_XS) and the public DSpine b16
 head (Q4_K_M), n-max 15, temperature 1.0 unless noted. Every number is a paired A-B-B-A run with a 95 % bootstrap
-interval; the run IDs refer to Appendix C of the Kate report ({{PENDING: link}}).
+interval; the run IDs refer to Appendix C of the Kate report (video version: https://youtu.be/Bye6WPpkxA4; model card:
+https://huggingface.co/sirfyyn/Kate-Qwen-27B-GGUF-SpedUp-Abliterated).
 
 | Change | Switch | Effect | 95 % interval | Run |
 |---|---|---|---|---|
@@ -40,7 +42,8 @@ interval; the run IDs refer to Appendix C of the Kate report ({{PENDING: link}})
 
 What we run: `FLE_RS_WINDOW=1 FLE_GDN_REPLAY=1 LLAMA_DFLASH_DEV=1 FLE_SAMPLE_TOPK=1`. In production on 12 November
 Katy decoded a median of 154.6 tok/s over 1,729 real agent responses (P10 106.5, P90 214.4); paired with a cold n-gram
-table 161.8 tok/s on agent tasks and 151.4 on code. Kate: {{PENDING}}.
+table 161.8 tok/s on agent tasks and 151.4 on code. Kate (R1-A, public DSpine head), paired against Katy with its own
+head: 152.6 tok/s on agent tasks (−5.5 %, interval −18.2…+5.5, unclear) and 153.6 on code (+0.9 %, within noise).
 
 ## New
 
@@ -67,7 +70,7 @@ Every variable is documented in [docs/fle/ENV.md](docs/fle/ENV.md).
 - A persistent n-gram table (`FLE_NGRAM_MOD_FILE`) makes runs depend on earlier runs. Benchmark with a cold or frozen
   table; our own +17.3 % for a re-trained head came entirely from this (report §8.1).
 - Two slots with a shared KV cache: one stream −6.5 %, two streams together +27 % throughput (k37).
-- {{PENDING: Windows package tested with Kate?}}
+- The Windows package has not been tested with Kate yet.
 
 ## Requirements
 

@@ -9,6 +9,7 @@ Two optional CUDA paths in FLE v1.3.0 re-implement techniques from Infernix
   that keeps quantized weights packed, expands them to F16 with byte permutes and removes the offsets through
   per-sub-block activation sums (`mma.sync m16n8k16`, cp.async double buffering, deterministic split-K).
 
-{{PENDING: state whether code was copied verbatim or only the technique re-implemented, and Infernix's copyright
-line, before the tag.}} Infernix itself began as a fork of
+No Infernix source code was copied: both paths were written for FLE after reading Infernix's design and source. A
+line-by-line comparison against Infernix a3edb45 finds no shared line apart from the standard PTX `mma.sync`
+instruction. Infernix's licence file names no copyright holder; the project is by wallawalla47. Infernix itself began as a fork of
 NInfer (https://github.com/Neroued/ninfer) by Neroued. Both paths are off by default.

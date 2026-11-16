@@ -44,27 +44,28 @@ cache, computes the rest on the CPU, and drafts with the model's own multi-token
 > Katy and Kate, two Qwen3.8-27B fine-tunes, at about 155 tokens/s on one 32 GB card with the DSpine draft head.
 > The MoE features described further down (GPU expert cache, expert store, split experts, `/fle/status`) are **not**
 > in v1.3.0: for DeepSeek V4.1 Flash, Rin and Qwen3.8-Flash-Next use
-> [v1.2.6](https://github.com/sirfyyn/FastLocalExperts/releases/tag/v1.2.6). {{PENDING: how [FLE Link](https://flelink.run)
-> chooses between the two lines per recipe.}}
+> [v1.2.6](https://github.com/sirfyyn/FastLocalExperts/releases/tag/v1.2.6). [FLE Link](https://flelink.run)
+> chooses the line per recipe: Kate and Katy get the dense line, the MoE recipes stay on v1.2.6.
 
 **[Kate](https://huggingface.co/sirfyyn/Kate-Qwen-27B-GGUF-SpedUp-Abliterated)** is Katy (Swift-1.5-Qwen3.8-27B) with
-the refusal direction removed from the weights, as an IQ4_XS quant whose block scales were healed against its own BF16.
+the refusal direction removed from the weights, as an IQ4_XS quant in bartowski's tensor layout with our own importance matrix (recipe R1-A). Healing the quant was
+tried twice and not shipped: both runs got worse on foreign text.
 It no longer refuses requests the original refused for safety reasons: you are responsible for what you do with it.
 **[Katy](https://huggingface.co/sirfyyn/Katy-27B-GGUF)** is the same model without abliteration.
 
 | | Katy | Kate |
 |---|---|---|
-| Decode in production (12 Nov, 1,729 agent responses ≥ 64 tokens) | median **154.6 tok/s** (P10 106.5, P90 214.4) | {{PENDING}} |
-| Decode, paired, cold n-gram table (agent / code) | 161.8 / 151.4 tok/s | {{PENDING}} |
-| KL divergence against BF16 | {{PENDING}} | {{PENDING}} |
-| ARC-Challenge / GSM8K | 94.2 % / 96.8 % | {{PENDING}} |
-| Smallest card measured | {{PENDING}} | {{PENDING}} |
+| Decode in production (12 Nov, 1,729 agent responses ≥ 64 tokens) | median **154.6 tok/s** (P10 106.5, P90 214.4) | in production since 16 Nov |
+| Decode, paired, cold n-gram table (agent / code) | 161.5 / 152.3 tok/s | 152.6 / 153.6 tok/s (public DSpine head) |
+| KL divergence against own BF16 (Python / German Wikipedia / German Kubernetes docs) | 0.0647 / 0.0128 / 0.0160 | 0.0612 / 0.0112 / 0.0141 |
+| ARC-Challenge / GSM8K | 94.3 % / 97.2 % | 94.2 % / 97.6 % |
+| Smallest card at full speed (memory limit simulated) | not measured on this build | 20 GB (142.7 tok/s; 16 GB: 37.3) |
 
 One RTX PRO 4500 Blackwell (32 GB), Linux, IQ4_XS, DSpine b16 head (Q4_K_M) with n-max 15 and the n-gram table,
 temperature 1.0. What each engine change gained is in [docs/fle/ENV.md](docs/fle/ENV.md) and the
 [v1.3.0 release notes](docs/fle/RELEASE-v1.3.0.md).
 
-**Run it with FLE Link:** `flelink run kate-27b-dspine` ({{PENDING}}: recipe published). By hand:
+**Run it with FLE Link:** `flelink run kate-27b-dspine` (FLE Link with engine lines, 0.1.16 or newer). By hand:
 
 ```bash
 FLE_RS_WINDOW=1 FLE_GDN_REPLAY=1 LLAMA_DFLASH_DEV=1 FLE_SAMPLE_TOPK=1 \
