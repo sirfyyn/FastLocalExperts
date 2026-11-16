@@ -218,14 +218,6 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
-// MXFP8 (OCP MX): 32 E4M3 (fn) values sharing one E8M0 scale, value = e4m3(q[j]) * 2^(e - 127)
-#define QK_MXFP8 32
-typedef struct {
-    uint8_t e;          // E8M0
-    uint8_t qs[QK_MXFP8]; // E4M3 (fn) codes
-} block_mxfp8;
-static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
-
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales
 typedef struct {
@@ -466,25 +458,6 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2, "wrong iq4_xs block size/padding");
-
-// ik_llama trellis quants (QTIP). Per-row float row-scale (row_meta_size=4) precedes these blocks.
-typedef struct {
-    uint8_t  scales[QK_K/64];
-    uint8_t  ql[QK_K/4];
-} block_iq2_kt;
-static_assert(sizeof(block_iq2_kt) == QK_K/4 + QK_K/64, "wrong iq2_kt block size/padding");
-
-typedef struct {
-    uint8_t  scales[QK_K/64];
-    uint8_t  ql[QK_K/4];
-    uint8_t  qh[QK_K/8];
-} block_iq3_kt;
-static_assert(sizeof(block_iq3_kt) == QK_K/4 + QK_K/8 + QK_K/64, "wrong iq3_kt block size/padding");
-
-typedef struct {
-    uint32_t qs[QK_K/8];
-} block_iq4_kt;
-static_assert(sizeof(block_iq4_kt) == QK_K/2, "wrong iq4_kt block size/padding");
 
 #endif // GGML_COMMON_DECL
 #endif // GGML_COMMON_DECL

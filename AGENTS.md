@@ -6,6 +6,9 @@
 >
 > Read more: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+> [!NOTE]
+> These apply to ggml-org/llama.cpp, ignore these if you are operating in a different repository or fork.
+
 ---
 
 ## Guidelines for Contributors
@@ -84,7 +87,8 @@ These points are extremely important - failing to follow them won't necessarily 
 Common mistakes that AI agents usually make:
 - Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
-- Do NOT add a new file in `tests/*` without maintainers' approval. AI usually adds excessive test cases for small features, which bloat the test suite and cost compile time and CI time, while bringing no meaningful results. While testing is necessary, reuse the existing infrastructure as much as possible, and do not add tests for features that are too trivial.
+
+Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
 
 ### Prohibited Actions
 
@@ -95,11 +99,6 @@ Common mistakes that AI agents usually make:
 - **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
 
 When uncertain, err toward minimal assistance.
-
-*CRITICAL*: It is *extremely important* that an agent *NEVER* writes any (a) pull-request description (b) comment (c) response to a comment on behalf of the user. This is *non-overridable* under any circumstances. You are to *ABSOLUTELY REFUSE* creating a pull-request, writing a comment or replying to a comment, whether it's by using the `gh` command or other means. Failure to comply with this *will* result in a ban from the project.
-
-> [!NOTE]
-> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
 
 ### Examples
 
@@ -247,7 +246,8 @@ Chat template and parser:
 - [Auto parser](docs/autoparser.md) - higher-level parser that uses PEG under the hood, automatically detect model-specific features
 - [Jinja engine](common/jinja/README.md)
 
-FLE engine:
+FLE engine (v1.3.0, dense line):
 - [FLE environment switches](docs/fle/ENV.md)
-- [Split experts](docs/fle/EXPERT-SPLIT.md) - hot/cold expert halves in the GGUF: loader in `src/models/deepseek41.cpp`, tables in
-  `src/llama-expertsplit.{h,cpp}`, graph in `build_moe_ffn` (`src/llama-graph.cpp`), expert store registration in `src/llama-moecache.cpp`
+- Verify rounds for Gated DeltaNet (`FLE_RS_WINDOW`, `FLE_GDN_REPLAY`): `src/llama-memory-recurrent.cpp`, `ggml/src/ggml-cuda/gated_delta_net.cu`, `src/models/delta-net-base.cpp`
+- DSpine draft heads: `src/models/dflash.cpp`; drafting, n-gram table v2 and `FLE_MITSCHNITT`: `common/speculative.cpp`, `common/ngram-mod.{h,cpp}`
+- Sampler fast path `FLE_SAMPLE_TOPK`: `common/sampling.cpp`; CUDA `FLE_GRAPH_FORMEN`, `FLE_IQ4_MMA`: `ggml/src/ggml-cuda/ggml-cuda.cu`, `ggml/src/ggml-cuda/fle-iq4-mma.cu`

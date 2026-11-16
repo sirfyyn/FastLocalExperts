@@ -34,13 +34,15 @@ extern "C" {
     // Backend buffer type
     //
 
-    GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
-    GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-    GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
+    GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -68,7 +70,8 @@ extern "C" {
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
     // tensor copy between different backends
-    GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
+    GGML_API void ggml_backend_tensor_copy  (const struct ggml_tensor * src, struct ggml_tensor * dst);
+    GGML_API void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
 
     //
     // Backend (stream)
@@ -93,6 +96,8 @@ extern "C" {
     GGML_API void ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
+    GGML_API void ggml_backend_tensor_set_n (      struct ggml_tensor * const * tensors, const void * data, const size_t * offsets, const size_t * sizes, const size_t * data_offsets, size_t n_tensors);
+    GGML_API void ggml_backend_tensor_get_n (const struct ggml_tensor * const * tensors,       void * data, const size_t * offsets, const size_t * sizes, const size_t * data_offsets, size_t n_tensors);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
@@ -315,6 +320,23 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Callback while copying input weights of a split
+    // if the user returns false the scheduler simply copies the entire weight
+    // the callback is called only for input weights in host buffers
+    // the callback is called after all non-weight inputs of the split have been copied
+    // `src` is the tensor in the previous split
+    // `dst` is the copy of `src` in the split
+    // `graph` is the compute graph of the split
+    typedef bool (*ggml_backend_sched_copy_callback)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst, struct ggml_cgraph * graph, void * user_data);
+
+    // Callback when the buffers reserved for a graph are not sufficient and have to be reserved again
+    // it happens on the graph allocation path and costs a synchronization of the backends
+    // `sched` is the scheduler
+    // `graph` is the compute graph being allocated
+    // `backend_ids_changed` is true if the backend assignment of the graph nodes changed since the last allocation
+    // `graph_size_changed` is true if the graph size changed since the last allocation
+    typedef void (*ggml_backend_sched_realloc_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool backend_ids_changed, bool graph_size_changed, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -353,25 +375,11 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
-    // FLE (FLE_MC_OVERLAP + MoE cache PCIe share): called for a marked GPU hit chain right after the inputs of the following CPU
-    // subgraph were fetched and before the hit chain is enqueued. cpu_node is the first MUL_MAT_ID of that CPU subgraph with a
-    // cache table in src[3] (its src[2] holds the routed ids in host memory), gpu_backend is the backend of the hit chain; work
-    // enqueued on it runs before the hit chain. Process-wide, NULL = off.
-    typedef void (*ggml_backend_fle_mc_hook_t)(struct ggml_tensor * cpu_node, ggml_backend_t gpu_backend, void * user_data);
-    GGML_API void                 ggml_backend_set_fle_mc_hook(ggml_backend_fle_mc_hook_t hook, void * user_data);
+    // Set a callback to be called when the inputs weights of a split are being copied
+    GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
-    // FLE asynchronous CPU subgraphs (FLE_SCHED_ASYNC_CPU=1): enqueue a host function on the stream of a GPU backend (CUDA:
-    // cudaLaunchHostFunc). The scheduler uses it to hand a CPU subgraph to a worker thread once its inputs have arrived and to make
-    // the GPU wait for the worker before it copies the results back, without a host synchronization per subgraph.
-    typedef void (*ggml_backend_fle_host_func_t)(ggml_backend_t backend, void (*fn)(void * ud), void * ud);
-    GGML_API void                 ggml_backend_set_fle_host_func(ggml_backend_fle_host_func_t f);
-
-    // FLE Patch 49: prefetch of offloaded MoE expert weights for large ubatches. bytes > 0 allocates a ring of n_slots staging
-    // slots of that size on backend and a second backend on the same device (its own stream): while one weight split computes,
-    // the whole weights of the next ones (MUL_MAT_ID with at least min_tokens tokens, weight in host memory) are copied into the
-    // slots without waiting for their ids; a split then only copies slot -> scheduler buffer on the device. bytes == 0 frees the
-    // ring (prefetch off). Returns false if the ring could not be allocated; the prefetch then stays off.
-    GGML_API bool                 ggml_backend_sched_fle_prefetch(ggml_backend_sched_t sched, ggml_backend_t backend, size_t bytes, int n_slots, int min_tokens);
+    // Set a callback to be called when the compute buffers of a graph are being reallocated
+    GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
     //
     // Meta backend
@@ -403,6 +411,7 @@ extern "C" {
         //   - most tensors have n_segments == 1 and a contiguous slice of the tensor data
         //   - some tensors have an inhomogenenous data layout along the split axis,
         //     those tensors are divided into segments which are each individually split across devices
+        //     (this usually happens when multiple tensors are fused into a single one)
         //   - ne has one entry per segment and device and that segment repeats nr times,
         //     in total when accounting for repetitions the segments add up to ggml_tensor::ne for that axis,
         //     the outer/inner loops are over segments/devices like [seg0_dev0_r0, seg0_dev1_r0, seg0_dev0_r1, seg0_dev1_r1, seg1_dev0_r0, seg1_dev1_r0],

@@ -38,7 +38,9 @@ MODEL_URLS = (
 MODEL_SHA256 = "66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739"
 
 # options that only exist in the FLE fork
-FLE_OPTIONS = ("--moe-expert-cache", "--moe-active-experts")
+# v1.3.0 (dense line) adds no command-line options: the FLE build is recognised by its FLE_* switches in the libraries
+FLE_OPTIONS = ()
+FLE_MARKERS = (b"FLE_GDN_REPLAY", b"FLE_SAMPLE_TOPK")
 
 # lines of the server log worth showing in the CI log
 INTERESTING = (
@@ -147,7 +149,16 @@ def check_help(server):
     for opt in FLE_OPTIONS:
         if opt not in out:
             fail("%s is missing in --help, this is not the FLE build" % opt)
-    log("OK  --help lists %s (FLE build)" % ", ".join(FLE_OPTIONS))
+    found = set()
+    for p in Path(server).parent.iterdir():
+        lib = p.suffix.lower() in (".so", ".dll") or ".so." in p.name
+        if p.is_file() and lib and "llama" in p.name:
+            data = p.read_bytes()
+            found.update(m for m in FLE_MARKERS if m in data)
+    missing = [m.decode() for m in FLE_MARKERS if m not in found]
+    if missing:
+        fail("%s not found in the libraries, this is not the FLE build" % ", ".join(missing))
+    log("OK  --help runs, libraries carry %s (FLE build)" % ", ".join(m.decode() for m in FLE_MARKERS))
 
 
 # The messages of the backend loader ("load_backend: loaded CPU backend from ...") are library messages: the

@@ -65,9 +65,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
-// FLE: the K largest (id, logit) pairs from n logits (min-heap, unordered); prefilter for the sampler chain, see sampling.cpp
-void common_sampler_topk_scan(const float * x, int n, int K, std::vector<llama_token_data> & out);
-
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
 // generalized version of common_sampler_sample
@@ -87,6 +84,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // returns at least 1 token, up to idxs.size()
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+
+// as above, but verifies by rejection sampling; draft_q holds the draft's candidates per token
+std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first = false);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
@@ -117,6 +117,12 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr);
 
 std::vector<enum common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names);
 std::vector<enum common_sampler_type> common_sampler_types_from_chars(const std::string & chars);
+
+// add the strings that are a single token in the vocab to the preserved tokens
+void common_sampling_add_preserved_tokens(common_params_sampling & sampling, const llama_vocab * vocab, const std::vector<std::string> & tokens);
+
+// add grammar triggers, a trigger word that is a single token becomes a token trigger and must be a preserved token
+void common_sampling_add_grammar_triggers(common_params_sampling & sampling, const llama_vocab * vocab, std::vector<common_grammar_trigger> triggers);
 
 llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
                 const char * grammar_kind, const char * grammar_data);

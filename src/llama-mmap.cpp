@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <climits>
+#include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -322,8 +323,11 @@ struct llama_file::impl {
         off_t offset_from_alignment = offset - aligned_offset;
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
 
+        // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
+        const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
+
         void * raw_buffer = nullptr;
-        int ret = posix_memalign(&raw_buffer, alignment, bytes_to_read);
+        int ret = posix_memalign(&raw_buffer, alignment, buffer_size);
         if (ret != 0) {
             throw std::runtime_error(format("posix_memalign failed with error %d", ret));
         }
@@ -334,10 +338,20 @@ struct llama_file::impl {
         std::unique_ptr<void, aligned_buffer_deleter> buffer(raw_buffer);
 
         seek(aligned_offset, SEEK_SET);
-        read_raw_unsafe(buffer.get(), bytes_to_read);
 
-        uintptr_t actual_data = reinterpret_cast<uintptr_t>(buffer.get()) + offset_from_alignment;
-        memcpy(dest, reinterpret_cast<void *>(actual_data), size);
+        size_t skip   = offset_from_alignment;
+        size_t copied = 0;
+        for (size_t done = 0; done < bytes_to_read; ) {
+            const size_t n = std::min(buffer_size, bytes_to_read - done);
+            read_raw_unsafe(buffer.get(), n);
+
+            const size_t count = std::min(n - skip, size - copied);
+            memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
+
+            copied += count;
+            skip    = 0;
+            done   += n;
+        }
     }
 
     void read_raw(void * ptr, size_t len) {
@@ -501,12 +515,7 @@ struct llama_mmap::impl {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
-        // FLE_MMAP_NO_RANDOM=1: keep the kernel read-ahead on the lazy (host-resident expert) ranges. With MADV_RANDOM a
-        // page fault on an uncached expert slice reads 4 KiB at a time; the CPU MoE then waits on many small NVMe reads.
-        // Measured with FLE_MOE_WILLNEED_NOW on DeepSeek-V4.1 ISTA (titan, 01.11.2026): +7-8 % decode.
-        static const bool fle_no_random = getenv("FLE_MMAP_NO_RANDOM") != nullptr;
         for (const auto & range : lazy_ranges) {
-            if (fle_no_random) { break; }
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");
         }
         if (numa) {
@@ -517,37 +526,6 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
-    }
-
-    // Keep a range on disk. Three measures, each against a different one of the three
-    // places that would otherwise pull it into RAM:
-    //   MADV_RANDOM   against read-ahead on future page faults
-    //   FADV_RANDOM   against the file read-ahead that FADV_SEQUENTIAL doubles
-    //   FADV_DONTNEED drops what MAP_POPULATE has already brought in
-    void keep_on_disk(size_t first, size_t last, int fd) {
-        if (last <= first || last > size) { return; }
-        const size_t page = sysconf(_SC_PAGESIZE);
-        // Round INWARD to page boundaries, otherwise DONTNEED hits neighbouring data
-        // that is supposed to stay in the cache.
-        const size_t begin = (first + page - 1) & ~(page - 1);
-        const size_t end   = last & ~(page - 1);
-        if (end <= begin) { return; }
-        const size_t len = end - begin;
-#ifdef _POSIX_MAPPED_FILES
-        if (posix_madvise((char *) addr + begin, len, POSIX_MADV_RANDOM)) {
-            LLAMA_LOG_WARN("%s: posix_madvise(RANDOM) failed: %s\n", __func__, strerror(errno));
-        }
-#endif
-#ifdef __linux__
-        if (posix_fadvise(fd, begin, len, POSIX_FADV_RANDOM)) {
-            LLAMA_LOG_WARN("%s: posix_fadvise(RANDOM) failed: %s\n", __func__, strerror(errno));
-        }
-        if (posix_fadvise(fd, begin, len, POSIX_FADV_DONTNEED)) {
-            LLAMA_LOG_WARN("%s: posix_fadvise(DONTNEED) failed: %s\n", __func__, strerror(errno));
-        }
-#endif
-        LLAMA_LOG_INFO("[fle-ple] kept on disk: %.2f GiB (offset %zu to %zu)\n",
-                len / 1073741824.0, begin, end);
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -662,13 +640,6 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
-    // FLE: madvise/fadvise have no counterpart here, nothing to keep on disk.
-    void keep_on_disk(size_t first, size_t last, int fd) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
-        GGML_UNUSED(fd);
-    }
-
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -699,13 +670,6 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
-
-    // FLE: nothing to keep on disk without mmap.
-    void keep_on_disk(size_t first, size_t last, int fd) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
-        GGML_UNUSED(fd);
-    }
 #endif
 
     void * addr;
@@ -715,10 +679,6 @@ struct llama_mmap::impl {
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
         const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
 llama_mmap::~llama_mmap() = default;
-
-void llama_mmap::keep_on_disk(size_t first, size_t last, int fd) {
-    pimpl->keep_on_disk(first, last, fd);
-}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
@@ -875,7 +835,7 @@ const bool llama_mlock::SUPPORTED = false;
 #endif
 
 void llama_prefetch(llama_memory_ranges mr) {
-#if defined(__linux__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+#if defined(__linux__) || defined(__APPLE__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     if (mr.empty()) {
         return;
     }
@@ -905,22 +865,7 @@ void llama_prefetch(llama_memory_ranges mr) {
     });
 
     uintptr_t begin = 0, end = 0;
-#if defined(_WIN32)
-    // collect the mr and prefetch them in one call, so the reads can be issued concurrently
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    auto prefetch = [&]() {
-        entries.push_back({ (PVOID) begin, (SIZE_T) (end - begin) });
-        return true;
-    };
-#else
-    auto prefetch = [&]() {
-        if (madvise((void *) begin, end - begin, MADV_WILLNEED) != 0) {
-            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
-            return false;
-        }
-        return true;
-    };
-#endif
+    size_t n_ranges = 0;
     for (const auto & range : mr) {
         if (!range.addr || range.size == 0) {
             continue;
@@ -929,9 +874,7 @@ void llama_prefetch(llama_memory_ranges mr) {
         const uintptr_t first = pointer / page * page;
         const uintptr_t last = (pointer + range.size + page - 1) / page * page;
         if (end && first > end) {
-            if (!prefetch()) {
-                return;
-            }
+            mr[n_ranges++] = { (const void *) begin, end - begin };
             end = 0;
         }
         if (!end) {
@@ -940,12 +883,27 @@ void llama_prefetch(llama_memory_ranges mr) {
         end = std::max(end, last);
     }
     if (end) {
-        prefetch();
+        mr[n_ranges++] = { (const void *) begin, end - begin };
     }
+    mr.resize(n_ranges);
 #if defined(_WIN32)
+    // prefetch the merged ranges in one call, so the reads can be issued concurrently
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+    entries.reserve(mr.size());
+    for (const auto & range : mr) {
+        entries.push_back({ const_cast<PVOID>(range.addr), (SIZE_T) range.size });
+    }
     if (!entries.empty() && !pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0)) {
         LLAMA_LOG_WARN("llama_prefetch: PrefetchVirtualMemory failed: %s\n",
                 llama_format_win_err(GetLastError()).c_str());
+    }
+#else
+    for (const auto & range : mr) {
+        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+        if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
+            LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+            return;
+        }
     }
 #endif
 #else
